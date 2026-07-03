@@ -614,6 +614,95 @@ HudUpdateVisibilityStateFn g_hudUpdateVisibilityState = reinterpret_cast<HudUpda
 using TraitNameToIdFn = UInt32 (*)(const char*);
 TraitNameToIdFn g_traitNameToId = reinterpret_cast<TraitNameToIdFn>(kTraitNameToIdAddress);
 
+// --- Companions (docs/companions-architecture.md) ---------------------------
+// Template pool shipped in our own esp; slots claimed at runtime and configured
+// (name/face/follow) natively. Frozen local formid map — never renumber.
+constexpr char kCompanionsEspName[] = "NVCompanions.esp";
+constexpr UInt32 kCompanionPoolSize = 64;
+constexpr UInt32 kCompanionFemaleSlotStart = 32; // slots 32..63 are female templates
+constexpr UInt32 kCompanionBaseLocalId = 0x000800; // + slot -> NPC_ template
+constexpr UInt32 kCompanionRefLocalId = 0x000900;  // + slot -> persistent ACHR
+constexpr UInt32 kRaceSexMenuType = 1036;          // 0x40C, chargen menu
+constexpr SHORT kCompanionHotkeyVirtualKey = VK_F7; // manual trigger: process queue / face design / summon
+constexpr char kCompanionCommandVersion[] = "CHASM_COMPANION_V1";
+constexpr char kCompanionAckVersion[] = "CHASM_COMPANION_ACK_V1";
+constexpr char kCompanionRegistryVersion[] = "CHASM_COMPANION_REGISTRY_V1";
+constexpr DWORD kCompanionPollIntervalMs = 500;
+constexpr DWORD kCompanionMenuOpenTimeoutMs = 8000;
+// Engine addresses (runtime 1.4.0.525; cross-verified between xNVSE and JIP
+// sources — see docs/companions-architecture.md. The Steam exe is DRM-packed
+// on disk, so CompanionsLogEngineProbes() logs the live bytes at first init
+// for ground-truth diagnostics.)
+constexpr UInt32 kTESNPCCopyAppearanceAddress = 0x00603790;   // thiscall(dest, TESNPC* src)
+constexpr UInt32 kActorBaseDataFlagSetterAddress = 0x0047DD50; // thiscall(&baseData, mask, value, 1)
+constexpr UInt32 kCharacterRebuild3DAddress = 0x008D3FA0;     // thiscall(Character*) — regen incl. facegen head
+constexpr UInt32 kPlayerRaceChangeAddress = 0x0060B240;       // thiscall(playerBaseNPC, TESRace*, 0)
+constexpr UInt32 kLoadFaceGenHeadEGTFilesAddress = 0x011D5AE0; // cached ini bool: runtime facegen tinting
+
+struct CompanionAppearance
+{
+    bool valid = false;
+    float fggs[50]{};
+    float fgga[30]{};
+    float fgts[50]{};
+    std::string raceRef;                 // "Mod.esm:LOCALHEX" strings — load-order safe
+    std::string hairRef;
+    std::string eyesRef;
+    std::vector<std::string> headPartRefs;
+    UInt32 hairColor = 0;
+    float hairLength = 1.0f;
+    float height = 1.0f;
+    float weight = 1.0f;
+    bool female = false;
+};
+
+struct CompanionSlot
+{
+    bool claimed = false;
+    std::string npcKey;        // stable chat identity (slug of name at create)
+    std::string name;          // display name (UTF-8; engine gets ASCII projection)
+    std::string characterName; // chasm character card name
+    std::string voice;         // informational (chasm owns voice mapping)
+    bool female = false;
+    bool faceDesigned = false;
+    bool waiting = false;      // M3 wait-state
+    std::string status = "unclaimed"; // unclaimed|claimed|spawned|dismissed
+    CompanionAppearance appearance;
+};
+
+// Chargen round-trip session (one at a time).
+struct CompanionFaceSession
+{
+    // 0 idle, 1 awaiting focus/conditions, 2 awaiting menu open, 3 menu open, 4 unused
+    int phase = 0;
+    UInt32 slot = 0;
+    std::string requestId;
+    std::string op;
+    bool spawnAfter = false;
+    DWORD menuOpenDeadlineTick = 0;
+    // Alt-tabbing auto-pauses FNV into the Start menu; we close blocking menus
+    // before opening chargen (paced retries, bounded).
+    DWORD nextMenuCloseTick = 0;
+    int menuCloseAttempts = 0;
+    CompanionAppearance playerSnapshot;
+};
+
+struct CompanionsRuntime
+{
+    bool registryLoaded = false;
+    UInt32 rev = 0;
+    CompanionSlot slots[kCompanionPoolSize];
+    CompanionFaceSession face;
+    UInt32 slotBaseFormIds[kCompanionPoolSize]{}; // runtime formids, cached once resolved
+    DWORD nextPollTick = 0;
+    bool engineProbesLogged = false;
+    bool hotkeyDownLastFrame = false;
+};
+CompanionsRuntime g_companions;
+Script* g_companionMoveToTargetScript = nullptr;
+Script* g_companionMoveToHoldScript = nullptr;
+Script* g_companionShowRaceMenuScript = nullptr;
+
 fs::path BridgeDir();
 fs::path VoiceBootstrapStatusPath();
 fs::path SaveStateControlDir();
@@ -694,6 +783,14 @@ void TraceRequestEvent(const std::string& requestId, const std::string& stage,
 bool IsLiveNearbyActorRef(const TESObjectREFR* anchorRef, TESObjectREFR* ref);
 void CollectNearbyMappedNpcAround(const TESObjectREFR* anchorRef, TESObjectREFR* ref, double maxDistanceSquared, bool underCrosshair, std::vector<NearbyNpcCandidate>& candidates);
 std::pair<std::string, std::string> ResolveRefVoiceTypeMetadata(TESObjectREFR* ref);
+// Companions (implementations live in the companions section before HandleNvseMessage).
+void PollCompanionCommands(bool force = false);
+void UpdateCompanionFaceDesignSession();
+void UpdateCompanionHotkey();
+void CompanionsOnDeferredInit();
+void CompanionsOnSessionReady(const char* reason);
+std::optional<std::pair<std::string, std::string>> ResolveCompanionNpcForRef(TESObjectREFR* ref);
+TESForm* ResolveModLocalForm(const char* modName, UInt32 localFormId);
 
 TESForm* LookupFormByIdRuntime(UInt32 refId)
 {
@@ -1425,6 +1522,8 @@ void EnsureBridgeDirectories()
     fs::create_directories(AudioDir());
     fs::create_directories(UserFunctionDir());
     fs::create_directories(ScriptRunnerDir());
+    fs::create_directories(BridgeDir() / "control" / "companions" / "acks");
+    fs::create_directories(BridgeDir() / "companions");
 }
 
 void WriteDiagnostics(const std::string& body)
@@ -3596,6 +3695,14 @@ std::optional<std::pair<std::string, std::string>> ResolveMappedNpcImpl(TESObjec
     if (!ref)
     {
         return std::nullopt;
+    }
+
+    // Companions claim their identity before any static mapping: a ref whose
+    // base is a claimed NVCompanions.esp template resolves to the companion's
+    // stable npc_key/name so chasm binds it to the authored character card.
+    if (auto companion = ResolveCompanionNpcForRef(ref); companion.has_value())
+    {
+        return companion;
     }
 
     const auto makeMatch = [](std::string_view key, std::string_view display) {
@@ -11156,6 +11263,19 @@ void DrainChunksToStreamingVoice()
                 && SUCCEEDED(g_state.streamBuffer->GetCurrentPosition(&playPos, &writePos))
                 && playPos < g_state.streamWriteCursor)
             {
+                static DWORD s_lastWaitTraceTick = 0;
+                const DWORD waitNow = GetTickCount();
+                if (waitNow - s_lastWaitTraceTick > 1000)
+                {
+                    s_lastWaitTraceTick = waitNow;
+                    TraceRequestEvent(front.requestId, "stream_chunk_waiting_other_speaker",
+                        {},
+                        {
+                            { "chunk_index", static_cast<double>(front.chunkIndex) },
+                            { "chunk_speaker_ref", static_cast<double>(speaker.refId) },
+                            { "stream_speaker_ref", static_cast<double>(g_state.streamSpeaker.refId) },
+                        });
+                }
                 break;
             }
         }
@@ -11164,13 +11284,25 @@ void DrainChunksToStreamingVoice()
         g_state.pendingAudioChunks.pop_front();
         if (!fs::exists(chunk.wavPath))
         {
+            TraceRequestEvent(chunk.requestId, "stream_chunk_wav_missing",
+                { { "wav", chunk.wavPath.filename().string() } },
+                { { "chunk_index", static_cast<double>(chunk.chunkIndex) } });
             continue;
         }
         auto wav = LoadWavFile(chunk.wavPath);
         if (!wav.has_value())
         {
+            TraceRequestEvent(chunk.requestId, "stream_chunk_wav_unreadable",
+                { { "wav", chunk.wavPath.filename().string() } },
+                { { "chunk_index", static_cast<double>(chunk.chunkIndex) } });
             continue;
         }
+        TraceRequestEvent(chunk.requestId, "stream_chunk_appended",
+            { { "wav", chunk.wavPath.filename().string() } },
+            {
+                { "chunk_index", static_cast<double>(chunk.chunkIndex) },
+                { "speaker_ref_id", static_cast<double>(speaker.refId) },
+            });
         AppendStreamingChunk(chunk, *wav, speaker);
         // The PCM is now copied into the streaming buffer, so the WAV file is no longer
         // needed — delete it (now a cheap native delete) to keep the audio dir from
@@ -11556,6 +11688,15 @@ void ConsumeAudioChunks()
         const int chunkIndex = std::atoi(Trim(lines[1]).c_str());
         if (requestId != g_state.activeRequestId || chunkIndex <= g_state.lastAudioChunkIndex)
         {
+            TraceRequestEvent(requestId, "audio_chunk_dropped_stale",
+                {
+                    { "file", chunkPath.filename().string() },
+                    { "active_request_id", g_state.activeRequestId },
+                },
+                {
+                    { "chunk_index", static_cast<double>(chunkIndex) },
+                    { "last_audio_chunk_index", static_cast<double>(g_state.lastAudioChunkIndex) },
+                });
             fs::remove(chunkPath, ec);
             continue;
         }
@@ -13527,6 +13668,9 @@ void OnMainGameLoop()
     UpdateVoiceBootstrapStatus();
     LoadDebugConfigIfNeeded(false);
     PollNativeActionCommands();
+    PollCompanionCommands();
+    UpdateCompanionFaceDesignSession();
+    UpdateCompanionHotkey();
     UpdatePersonaCapture();
     // --- perf instrumentation (temporary): time the lip-sync + streaming phases to
     // locate the in-game speech lag, logged via "frame_perf_slow" trace events. ---
@@ -13701,6 +13845,1360 @@ void OnMainGameLoop()
     StartAmbientChatInput();
 }
 
+// ============================================================================
+// Companions — chasm-authored followers on the NVCompanions.esp template pool.
+// Protocol + design: docs/companions-architecture.md. Everything here logs
+// with a "companions:" prefix for in-game diagnosability.
+// ============================================================================
+
+fs::path CompanionCommandDir() { return BridgeDir() / "control" / "companions"; }
+fs::path CompanionAckDir() { return CompanionCommandDir() / "acks"; }
+fs::path CompanionRegistryPath() { return BridgeDir() / "companions" / "registry.txt"; }
+
+std::string HexEncodeBytes(const void* data, size_t length)
+{
+    static const char* digits = "0123456789abcdef";
+    const auto* bytes = static_cast<const unsigned char*>(data);
+    std::string out;
+    out.reserve(length * 2);
+    for (size_t i = 0; i < length; ++i)
+    {
+        out.push_back(digits[bytes[i] >> 4]);
+        out.push_back(digits[bytes[i] & 0x0F]);
+    }
+    return out;
+}
+
+bool HexDecodeBytes(const std::string& hex, void* out, size_t length)
+{
+    if (hex.size() != length * 2)
+    {
+        return false;
+    }
+    auto nibble = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    auto* bytes = static_cast<unsigned char*>(out);
+    for (size_t i = 0; i < length; ++i)
+    {
+        const int hi = nibble(hex[i * 2]);
+        const int lo = nibble(hex[i * 2 + 1]);
+        if (hi < 0 || lo < 0)
+        {
+            return false;
+        }
+        bytes[i] = static_cast<unsigned char>((hi << 4) | lo);
+    }
+    return true;
+}
+
+// "ModName.esm:LOCALHEX" — load-order independent form reference for the registry.
+std::string FormToModLocalRef(TESForm* form)
+{
+    if (!form)
+    {
+        return "";
+    }
+    DataHandler* dataHandler = GetDataHandler();
+    const UInt8 modIndex = static_cast<UInt8>(form->refID >> 24);
+    if (!dataHandler || modIndex >= dataHandler->modList.loadedModCount)
+    {
+        return "";
+    }
+    ModInfo* modInfo = dataHandler->modList.loadedMods[modIndex];
+    if (!modInfo || !modInfo->name[0])
+    {
+        return "";
+    }
+    return std::string(modInfo->name) + ":" + FormIdHex(form->refID & 0x00FFFFFF);
+}
+
+TESForm* ResolveModLocalRefString(const std::string& refString)
+{
+    const size_t colon = refString.rfind(':');
+    if (colon == std::string::npos || colon == 0 || colon + 1 >= refString.size())
+    {
+        return nullptr;
+    }
+    const std::string modName = refString.substr(0, colon);
+    const UInt32 localId = static_cast<UInt32>(strtoul(refString.c_str() + colon + 1, nullptr, 16));
+    return ResolveModLocalForm(modName.c_str(), localId);
+}
+
+TESNPC* ResolveCompanionBase(UInt32 slot)
+{
+    if (slot >= kCompanionPoolSize)
+    {
+        return nullptr;
+    }
+    TESForm* form = ResolveModLocalForm(kCompanionsEspName, kCompanionBaseLocalId + slot);
+    TESNPC* npc = form ? DYNAMIC_CAST(form, TESForm, TESNPC) : nullptr;
+    if (npc)
+    {
+        g_companions.slotBaseFormIds[slot] = npc->refID;
+    }
+    return npc;
+}
+
+TESObjectREFR* ResolveCompanionRef(UInt32 slot)
+{
+    if (slot >= kCompanionPoolSize)
+    {
+        return nullptr;
+    }
+    TESForm* form = ResolveModLocalForm(kCompanionsEspName, kCompanionRefLocalId + slot);
+    return form ? DYNAMIC_CAST(form, TESForm, TESObjectREFR) : nullptr;
+}
+
+std::optional<std::pair<std::string, std::string>> ResolveCompanionNpcForRef(TESObjectREFR* ref)
+{
+    if (!ref || !ref->baseForm || ref->baseForm->typeID != kFormType_TESNPC)
+    {
+        return std::nullopt;
+    }
+    const UInt32 baseId = ref->baseForm->refID;
+    for (UInt32 slot = 0; slot < kCompanionPoolSize; ++slot)
+    {
+        CompanionSlot& entry = g_companions.slots[slot];
+        if (!entry.claimed)
+        {
+            continue;
+        }
+        if (!g_companions.slotBaseFormIds[slot])
+        {
+            ResolveCompanionBase(slot);
+        }
+        if (g_companions.slotBaseFormIds[slot] && g_companions.slotBaseFormIds[slot] == baseId)
+        {
+            return std::make_pair(entry.npcKey, entry.name);
+        }
+    }
+    return std::nullopt;
+}
+
+// Summon: Enable (no-op when already enabled) + MoveTo the player. Despawn:
+// Disable — the vanilla show/hide-actor pattern; the enable state is ref-level
+// and persists in saves. Scripts compile independently so one failing helper
+// can't take down the other path.
+bool EnsureCompanionSummonScript()
+{
+    if (g_companionMoveToTargetScript)
+    {
+        return true;
+    }
+    if (!g_scriptInterface)
+    {
+        LogLine("companions: script interface unavailable.");
+        return false;
+    }
+    constexpr char kSummonScript[] = R"(
+ref rActor
+ref rTarget
+float fIssued
+
+Begin Function { rActor, rTarget }
+    let fIssued := 0
+    if rActor && rTarget
+        rActor.Enable
+        rActor.MoveTo rTarget 96 96 8
+        let fIssued := 1
+    endif
+    SetFunctionValue fIssued
+End
+)";
+    g_companionMoveToTargetScript = g_scriptInterface->CompileScript(kSummonScript);
+    if (!g_companionMoveToTargetScript)
+    {
+        LogLine("companions: failed to compile summon (Enable+MoveTo) helper.");
+    }
+    return g_companionMoveToTargetScript != nullptr;
+}
+
+bool EnsureCompanionDespawnScript()
+{
+    if (g_companionMoveToHoldScript)
+    {
+        return true;
+    }
+    if (!g_scriptInterface)
+    {
+        LogLine("companions: script interface unavailable.");
+        return false;
+    }
+    constexpr char kDespawnScript[] = R"(
+ref rActor
+float fIssued
+
+Begin Function { rActor }
+    let fIssued := 0
+    if rActor
+        rActor.Disable
+        let fIssued := 1
+    endif
+    SetFunctionValue fIssued
+End
+)";
+    g_companionMoveToHoldScript = g_scriptInterface->CompileScript(kDespawnScript);
+    if (!g_companionMoveToHoldScript)
+    {
+        LogLine("companions: failed to compile despawn (Disable) helper.");
+    }
+    return g_companionMoveToHoldScript != nullptr;
+}
+
+// ShowRaceMenu must run as a SCRIPT command (the vanilla chargen quests call
+// it from scripts). The generic console helper only prints to the console, so
+// routing it there silently does nothing — learned the hard way.
+bool CompanionShowRaceMenu(PlayerCharacter* player)
+{
+    if (!player || !g_scriptInterface)
+    {
+        return false;
+    }
+    if (!g_companionShowRaceMenuScript)
+    {
+        constexpr char kShowRaceMenuScript[] = R"(
+Begin Function { }
+    ShowRaceMenu
+End
+)";
+        g_companionShowRaceMenuScript = g_scriptInterface->CompileScript(kShowRaceMenuScript);
+        if (!g_companionShowRaceMenuScript)
+        {
+            LogLine("companions: failed to compile ShowRaceMenu helper.");
+            return false;
+        }
+    }
+    if (!g_scriptInterface->CallFunctionAlt(g_companionShowRaceMenuScript, player, 0))
+    {
+        LogLine("companions: CallFunctionAlt failed for ShowRaceMenu helper.");
+        return false;
+    }
+    return true;
+}
+
+bool CompanionMoveToRef(TESObjectREFR* actorRef, TESObjectREFR* targetRef)
+{
+    if (!actorRef || !targetRef || !EnsureCompanionSummonScript())
+    {
+        return false;
+    }
+    NVSEArrayVarInterface::Element result;
+    const bool callOk = g_scriptInterface->CallFunction(g_companionMoveToTargetScript, actorRef, nullptr, &result, 2, actorRef, targetRef);
+    const bool issued = callOk
+        && result.GetType() == NVSEArrayVarInterface::Element::kType_Numeric
+        && result.GetNumber() != 0.0;
+    if (!issued)
+    {
+        LogLine("companions: MoveTo helper failed for %08X -> %08X (call_ok=%d).", actorRef->refID, targetRef->refID, callOk ? 1 : 0);
+    }
+    return issued;
+}
+
+bool CompanionMoveToHold(TESObjectREFR* actorRef)
+{
+    if (!actorRef || !EnsureCompanionDespawnScript())
+    {
+        return false;
+    }
+    NVSEArrayVarInterface::Element result;
+    const bool callOk = g_scriptInterface->CallFunction(g_companionMoveToHoldScript, actorRef, nullptr, &result, 1, actorRef);
+    const bool issued = callOk
+        && result.GetType() == NVSEArrayVarInterface::Element::kType_Numeric
+        && result.GetNumber() != 0.0;
+    if (!issued)
+    {
+        LogLine("companions: despawn (Disable) helper failed for %08X (call_ok=%d).", actorRef->refID, callOk ? 1 : 0);
+    }
+    return issued;
+}
+
+void CompanionApplyName(UInt32 slot)
+{
+    CompanionSlot& entry = g_companions.slots[slot];
+    TESNPC* base = ResolveCompanionBase(slot);
+    if (!base || entry.name.empty())
+    {
+        return;
+    }
+    const std::string engineName = ToUiAscii(entry.name);
+    base->fullName.name.Set(engineName.c_str());
+    LogLine("companions: slot %u named '%s'.", slot, engineName.c_str());
+}
+
+// Read the appearance-relevant fields from a TESNPC into a blob. The facegen
+// coefficient buffers are flat float arrays behind FaceGenData::values
+// (50/30/50 floats — FGGS/FGGA/FGTS); counts are clamped defensively.
+bool CaptureAppearanceFromNpc(TESNPC* npc, CompanionAppearance& out)
+{
+    if (!npc)
+    {
+        return false;
+    }
+    out = CompanionAppearance{};
+
+    struct FgSpec { UInt32 index; float* dest; UInt32 expected; };
+    const FgSpec specs[] = {
+        { 0, out.fggs, 50 },
+        { 1, out.fgga, 30 },
+        { 2, out.fgts, 50 },
+    };
+    for (const FgSpec& spec : specs)
+    {
+        const auto& fg = npc->faceGenData[spec.index];
+        const float* values = reinterpret_cast<const float*>(fg.values);
+        if (!values)
+        {
+            LogLine("companions: facegen[%u] has no values on %08X; capture aborted.", spec.index, npc->refID);
+            return false;
+        }
+        const UInt32 count = fg.count ? fg.count : spec.expected;
+        if (count != spec.expected)
+        {
+            LogLine("companions: facegen[%u] count %u != expected %u on %08X (clamping).", spec.index, count, spec.expected, npc->refID);
+        }
+        memcpy(spec.dest, values, sizeof(float) * min(count, spec.expected));
+    }
+
+    out.raceRef = FormToModLocalRef(npc->race.race);
+    out.hairRef = FormToModLocalRef(npc->hair);
+    out.eyesRef = FormToModLocalRef(npc->eyes);
+    for (auto iter = npc->headPart.Begin(); !iter.End(); ++iter)
+    {
+        if (*iter)
+        {
+            out.headPartRefs.push_back(FormToModLocalRef(*iter));
+        }
+    }
+    out.hairColor = npc->hairColor;
+    out.hairLength = npc->hairLength;
+    out.height = npc->height;
+    out.weight = npc->weight;
+    out.female = npc->baseData.IsFemale();
+    out.valid = true;
+    return true;
+}
+
+void CompanionSetSex(TESNPC* npc, bool female)
+{
+    if (!npc || npc->baseData.IsFemale() == female)
+    {
+        return;
+    }
+    // Engine change-tracked flag setter on TESActorBaseData (mask 1 = Female).
+    ThisStdCall<void>(kActorBaseDataFlagSetterAddress, &npc->baseData, 1u, female ? 1u : 0u, 1u);
+    LogLine("companions: set sex female=%d on %08X (now female=%d).", female ? 1 : 0, npc->refID, npc->baseData.IsFemale() ? 1 : 0);
+}
+
+// Write a stored appearance blob onto a TESNPC — the manual mirror of
+// TESNPC::CopyAppearance (JIP appearance-undo pattern): copy float contents,
+// assign shared form pointers, rebuild the owned head-part list.
+bool ApplyAppearanceToNpc(TESNPC* npc, const CompanionAppearance& app, bool isPlayerBase)
+{
+    if (!npc || !app.valid)
+    {
+        return false;
+    }
+
+    CompanionSetSex(npc, app.female);
+
+    TESForm* raceForm = ResolveModLocalRefString(app.raceRef);
+    TESRace* race = raceForm ? DYNAMIC_CAST(raceForm, TESForm, TESRace) : nullptr;
+    if (race && npc->race.race != race)
+    {
+        if (isPlayerBase)
+        {
+            LogLine("companions: player race restore via 0x60B240 (%s).", app.raceRef.c_str());
+            ThisStdCall<void>(kPlayerRaceChangeAddress, npc, race, 0);
+        }
+        else
+        {
+            npc->race.race = race;
+        }
+    }
+    else if (!race && !app.raceRef.empty())
+    {
+        LogLine("companions: could not resolve race %s; keeping current.", app.raceRef.c_str());
+    }
+
+    struct FgSpec { UInt32 index; const float* src; UInt32 expected; };
+    const FgSpec specs[] = {
+        { 0, app.fggs, 50 },
+        { 1, app.fgga, 30 },
+        { 2, app.fgts, 50 },
+    };
+    for (const FgSpec& spec : specs)
+    {
+        auto& fg = npc->faceGenData[spec.index];
+        float* values = reinterpret_cast<float*>(fg.values);
+        if (!values)
+        {
+            LogLine("companions: facegen[%u] has no values on %08X; apply skipped.", spec.index, npc->refID);
+            continue;
+        }
+        const UInt32 count = fg.count ? fg.count : spec.expected;
+        memcpy(values, spec.src, sizeof(float) * min(count, spec.expected));
+    }
+
+    if (TESForm* hairForm = ResolveModLocalRefString(app.hairRef))
+    {
+        if (TESHair* hair = DYNAMIC_CAST(hairForm, TESForm, TESHair))
+        {
+            npc->hair = hair;
+        }
+    }
+    if (TESForm* eyesForm = ResolveModLocalRefString(app.eyesRef))
+    {
+        if (TESEyes* eyes = DYNAMIC_CAST(eyesForm, TESForm, TESEyes))
+        {
+            npc->eyes = eyes;
+        }
+    }
+    if (!app.headPartRefs.empty())
+    {
+        std::vector<BGSHeadPart*> parts;
+        for (const std::string& partRef : app.headPartRefs)
+        {
+            TESForm* partForm = ResolveModLocalRefString(partRef);
+            BGSHeadPart* part = partForm ? DYNAMIC_CAST(partForm, TESForm, BGSHeadPart) : nullptr;
+            if (part)
+            {
+                parts.push_back(part);
+            }
+            else
+            {
+                LogLine("companions: could not resolve head part %s.", partRef.c_str());
+            }
+        }
+        if (!parts.empty())
+        {
+            npc->headPart.RemoveAll();
+            for (BGSHeadPart* part : parts)
+            {
+                npc->headPart.Append(part);
+            }
+        }
+    }
+    npc->hairColor = app.hairColor;
+    npc->hairLength = app.hairLength;
+    npc->height = app.height;
+    npc->weight = app.weight;
+    return true;
+}
+
+// Regenerate a loaded actor's 3D (incl. the facegen head). No-op when the ref
+// has no 3D — the engine builds the head from current base data on next load.
+void CompanionRefreshActor3D(TESObjectREFR* ref, const char* reason)
+{
+    if (!ref)
+    {
+        return;
+    }
+    if (!ref->GetNiNode())
+    {
+        LogLine("companions: 3D refresh skipped for %08X (%s): no loaded 3D.", ref->refID, reason);
+        return;
+    }
+    *reinterpret_cast<bool*>(kLoadFaceGenHeadEGTFilesAddress) = true;
+    ThisStdCall<void>(kCharacterRebuild3DAddress, ref);
+    LogLine("companions: 3D refreshed for %08X (%s).", ref->refID, reason);
+}
+
+void SaveCompanionRegistry()
+{
+    ++g_companions.rev;
+    std::ostringstream out;
+    out << kCompanionRegistryVersion << "\r\n";
+    out << "rev=" << g_companions.rev << "\r\n";
+    for (UInt32 slot = 0; slot < kCompanionPoolSize; ++slot)
+    {
+        const CompanionSlot& entry = g_companions.slots[slot];
+        const std::string prefix = "slot" + std::to_string(slot) + ".";
+        out << prefix << "claimed=" << (entry.claimed ? 1 : 0) << "\r\n";
+        if (!entry.claimed)
+        {
+            continue;
+        }
+        out << prefix << "npc_key=" << entry.npcKey << "\r\n";
+        out << prefix << "name_base64=" << EncodeBase64(reinterpret_cast<const unsigned char*>(entry.name.c_str()), entry.name.size()) << "\r\n";
+        out << prefix << "character_base64=" << EncodeBase64(reinterpret_cast<const unsigned char*>(entry.characterName.c_str()), entry.characterName.size()) << "\r\n";
+        out << prefix << "voice=" << entry.voice << "\r\n";
+        out << prefix << "female=" << (entry.female ? 1 : 0) << "\r\n";
+        // Game-neutral body id for chasm (chasm never interprets the female flag;
+        // body ids are declared by the game profile's companions block).
+        out << prefix << "body=" << (entry.female ? "female" : "male") << "\r\n";
+        out << prefix << "face_designed=" << (entry.faceDesigned ? 1 : 0) << "\r\n";
+        out << prefix << "waiting=" << (entry.waiting ? 1 : 0) << "\r\n";
+        out << prefix << "status=" << entry.status << "\r\n";
+        const CompanionAppearance& app = entry.appearance;
+        out << prefix << "app.valid=" << (app.valid ? 1 : 0) << "\r\n";
+        if (app.valid)
+        {
+            out << prefix << "app.female=" << (app.female ? 1 : 0) << "\r\n";
+            out << prefix << "app.race=" << app.raceRef << "\r\n";
+            out << prefix << "app.hair=" << app.hairRef << "\r\n";
+            out << prefix << "app.eyes=" << app.eyesRef << "\r\n";
+            std::string headParts;
+            for (const std::string& part : app.headPartRefs)
+            {
+                if (!headParts.empty())
+                {
+                    headParts += ",";
+                }
+                headParts += part;
+            }
+            out << prefix << "app.head_parts=" << headParts << "\r\n";
+            out << prefix << "app.hair_color=" << FormIdHex(app.hairColor) << "\r\n";
+            out << prefix << "app.hair_length=" << app.hairLength << "\r\n";
+            out << prefix << "app.height=" << app.height << "\r\n";
+            out << prefix << "app.weight=" << app.weight << "\r\n";
+            out << prefix << "app.fggs=" << HexEncodeBytes(app.fggs, sizeof(app.fggs)) << "\r\n";
+            out << prefix << "app.fgga=" << HexEncodeBytes(app.fgga, sizeof(app.fgga)) << "\r\n";
+            out << prefix << "app.fgts=" << HexEncodeBytes(app.fgts, sizeof(app.fgts)) << "\r\n";
+        }
+    }
+
+    EnsureBridgeDirectories();
+    const fs::path finalPath = CompanionRegistryPath();
+    const fs::path tempPath = finalPath.string() + ".tmp";
+    {
+        std::ofstream file(tempPath, std::ios::binary | std::ios::trunc);
+        if (!file)
+        {
+            LogLine("companions: could not write registry temp file.");
+            return;
+        }
+        file << out.str();
+    }
+    std::error_code ec;
+    fs::rename(tempPath, finalPath, ec);
+    if (ec)
+    {
+        LogLine("companions: registry rename failed: %s", ec.message().c_str());
+    }
+}
+
+void LoadCompanionRegistry()
+{
+    g_companions.registryLoaded = true;
+    std::ifstream in(CompanionRegistryPath(), std::ios::binary);
+    if (!in)
+    {
+        LogLine("companions: no registry yet (fresh install).");
+        return;
+    }
+    std::vector<std::string> lines;
+    std::string line;
+    while (std::getline(in, line))
+    {
+        if (!line.empty() && line.back() == '\r')
+        {
+            line.pop_back();
+        }
+        lines.push_back(line);
+    }
+    if (lines.empty() || Trim(lines[0]) != kCompanionRegistryVersion)
+    {
+        LogLine("companions: registry has unknown header; ignoring.");
+        return;
+    }
+    const auto fields = ParseKeyValueLines(lines, 1);
+    g_companions.rev = static_cast<UInt32>(atoi(GetField(fields, "rev").c_str()));
+
+    auto decodeText = [&fields](const std::string& key) -> std::string {
+        const auto decoded = DecodeBase64String(GetField(fields, key.c_str()), 4096);
+        return decoded.has_value() ? *decoded : std::string();
+    };
+
+    UInt32 claimedCount = 0;
+    for (UInt32 slot = 0; slot < kCompanionPoolSize; ++slot)
+    {
+        const std::string prefix = "slot" + std::to_string(slot) + ".";
+        CompanionSlot& entry = g_companions.slots[slot];
+        entry = CompanionSlot{};
+        if (GetField(fields, (prefix + "claimed").c_str()) != "1")
+        {
+            continue;
+        }
+        entry.claimed = true;
+        entry.npcKey = GetField(fields, (prefix + "npc_key").c_str());
+        entry.name = decodeText(prefix + "name_base64");
+        entry.characterName = decodeText(prefix + "character_base64");
+        entry.voice = GetField(fields, (prefix + "voice").c_str());
+        entry.female = GetField(fields, (prefix + "female").c_str()) == "1";
+        entry.faceDesigned = GetField(fields, (prefix + "face_designed").c_str()) == "1";
+        entry.waiting = GetField(fields, (prefix + "waiting").c_str()) == "1";
+        entry.status = GetField(fields, (prefix + "status").c_str());
+        if (entry.status.empty())
+        {
+            entry.status = "claimed";
+        }
+        CompanionAppearance& app = entry.appearance;
+        if (GetField(fields, (prefix + "app.valid").c_str()) == "1")
+        {
+            app.female = GetField(fields, (prefix + "app.female").c_str()) == "1";
+            app.raceRef = GetField(fields, (prefix + "app.race").c_str());
+            app.hairRef = GetField(fields, (prefix + "app.hair").c_str());
+            app.eyesRef = GetField(fields, (prefix + "app.eyes").c_str());
+            std::istringstream partStream(GetField(fields, (prefix + "app.head_parts").c_str()));
+            std::string part;
+            while (std::getline(partStream, part, ','))
+            {
+                part = Trim(part);
+                if (!part.empty())
+                {
+                    app.headPartRefs.push_back(part);
+                }
+            }
+            app.hairColor = static_cast<UInt32>(strtoul(GetField(fields, (prefix + "app.hair_color").c_str()).c_str(), nullptr, 16));
+            app.hairLength = static_cast<float>(atof(GetField(fields, (prefix + "app.hair_length").c_str()).c_str()));
+            app.height = static_cast<float>(atof(GetField(fields, (prefix + "app.height").c_str()).c_str()));
+            app.weight = static_cast<float>(atof(GetField(fields, (prefix + "app.weight").c_str()).c_str()));
+            const bool floatsOk =
+                HexDecodeBytes(GetField(fields, (prefix + "app.fggs").c_str()), app.fggs, sizeof(app.fggs))
+                && HexDecodeBytes(GetField(fields, (prefix + "app.fgga").c_str()), app.fgga, sizeof(app.fgga))
+                && HexDecodeBytes(GetField(fields, (prefix + "app.fgts").c_str()), app.fgts, sizeof(app.fgts));
+            app.valid = floatsOk;
+            if (!floatsOk)
+            {
+                LogLine("companions: slot %u appearance floats corrupt; face will use template default.", slot);
+            }
+        }
+        ++claimedCount;
+    }
+    LogLine("companions: registry loaded (rev=%u, %u claimed).", g_companions.rev, claimedCount);
+}
+
+void WriteCompanionAck(const std::string& requestId, bool ok, const std::string& error,
+    const std::string& op, int slot, const std::string& npcKey)
+{
+    if (requestId.empty())
+    {
+        return;
+    }
+    EnsureBridgeDirectories();
+    const fs::path finalPath = CompanionAckDir() / (requestId + ".txt");
+    const fs::path tempPath = finalPath.string() + ".tmp";
+    {
+        std::ofstream file(tempPath, std::ios::binary | std::ios::trunc);
+        file << kCompanionAckVersion << "\r\n";
+        file << "request_id=" << requestId << "\r\n";
+        file << "ok=" << (ok ? 1 : 0) << "\r\n";
+        file << "error=" << error << "\r\n";
+        file << "op=" << op << "\r\n";
+        file << "slot=" << slot << "\r\n";
+        file << "npc_key=" << npcKey << "\r\n";
+    }
+    std::error_code ec;
+    fs::rename(tempPath, finalPath, ec);
+    LogLine("companions: ack %s op=%s ok=%d slot=%d %s", requestId.c_str(), op.c_str(), ok ? 1 : 0, slot, error.c_str());
+}
+
+// Summon = teleport to the player and recruit. Follow comes from the esp
+// package (CTDA GetPlayerTeammate == 1); the teammate flag persists in saves.
+bool CompanionSummon(UInt32 slot, std::string& outError)
+{
+    TESObjectREFR* ref = ResolveCompanionRef(slot);
+    PlayerCharacter* player = GetPlayer();
+    if (!ref || !player)
+    {
+        outError = ref ? "no_player" : "companion_ref_unresolved";
+        return false;
+    }
+    if (!CompanionMoveToRef(ref, player))
+    {
+        outError = "move_failed";
+        return false;
+    }
+    if (!SetActorPlayerTeammate(ref, true, "companion_summon_teammate"))
+    {
+        outError = "teammate_failed";
+        return false;
+    }
+    EvaluateActorPackage(ref);
+    g_companions.slots[slot].status = "spawned";
+    RememberNpcTarget(g_companions.slots[slot].npcKey, g_companions.slots[slot].name, CaptureSpeakerSnapshot(ref));
+    return true;
+}
+
+bool CompanionStopFollowing(UInt32 slot, std::string& outError)
+{
+    TESObjectREFR* ref = ResolveCompanionRef(slot);
+    if (!ref)
+    {
+        outError = "companion_ref_unresolved";
+        return false;
+    }
+    SetActorPlayerTeammate(ref, false, "companion_dismiss_teammate");
+    EvaluateActorPackage(ref);
+    return true;
+}
+
+bool CompanionDespawn(UInt32 slot, std::string& outError)
+{
+    TESObjectREFR* ref = ResolveCompanionRef(slot);
+    if (!ref)
+    {
+        outError = "companion_ref_unresolved";
+        return false;
+    }
+    SetActorPlayerTeammate(ref, false, "companion_despawn_teammate");
+    if (!CompanionMoveToHold(ref))
+    {
+        outError = "move_to_hold_failed";
+        return false;
+    }
+    EvaluateActorPackage(ref);
+    g_companions.slots[slot].status = "dismissed";
+    return true;
+}
+
+bool StartCompanionFaceSession(UInt32 slot, const std::string& requestId, const std::string& op, bool spawnAfter, std::string& outError)
+{
+    if (g_companions.face.phase != 0)
+    {
+        outError = "face_design_busy";
+        return false;
+    }
+    if (!ResolveCompanionBase(slot))
+    {
+        outError = "companion_base_unresolved";
+        return false;
+    }
+    g_companions.face = CompanionFaceSession{};
+    g_companions.face.phase = 1;
+    g_companions.face.slot = slot;
+    g_companions.face.requestId = requestId;
+    g_companions.face.op = op;
+    g_companions.face.spawnAfter = spawnAfter;
+    LogLine("companions: face design queued for slot %u (spawn_after=%d) — waiting for game focus.", slot, spawnAfter ? 1 : 0);
+    return true;
+}
+
+void AbortCompanionFaceSession(const char* reason)
+{
+    if (g_companions.face.phase == 0)
+    {
+        return;
+    }
+    LogLine("companions: face session aborted (%s).", reason);
+    WriteCompanionAck(g_companions.face.requestId, false, reason, g_companions.face.op,
+        static_cast<int>(g_companions.face.slot), g_companions.slots[g_companions.face.slot].npcKey);
+    g_companions.face = CompanionFaceSession{};
+}
+
+void FinalizeCompanionFaceSession()
+{
+    CompanionFaceSession& session = g_companions.face;
+    const UInt32 slot = session.slot;
+    CompanionSlot& entry = g_companions.slots[slot];
+
+    PlayerCharacter* player = GetPlayer();
+    TESNPC* playerBase = (player && player->baseForm && player->baseForm->typeID == kFormType_TESNPC)
+        ? static_cast<TESNPC*>(player->baseForm)
+        : nullptr;
+    TESNPC* slotBase = ResolveCompanionBase(slot);
+    if (!playerBase || !slotBase)
+    {
+        AbortCompanionFaceSession(playerBase ? "companion_base_unresolved" : "player_base_unresolved");
+        return;
+    }
+
+    // 1) Companion <- player (post-menu face): sex + race first, then the
+    //    engine's own appearance copy (facegen arrays, hair, eyes, head parts).
+    const bool designedFemale = playerBase->baseData.IsFemale();
+    CompanionSetSex(slotBase, designedFemale);
+    slotBase->race.race = playerBase->race.race;
+    ThisStdCall<void>(kTESNPCCopyAppearanceAddress, slotBase, playerBase);
+    LogLine("companions: CopyAppearance player -> slot %u done.", slot);
+
+    entry.female = designedFemale;
+    if (!CaptureAppearanceFromNpc(slotBase, entry.appearance))
+    {
+        LogLine("companions: WARNING — appearance blob capture failed; face will not survive reload.");
+    }
+
+    // 2) Player <- pre-menu snapshot (manual field restore + 3D rebuild).
+    if (session.playerSnapshot.valid)
+    {
+        ApplyAppearanceToNpc(playerBase, session.playerSnapshot, true);
+        CompanionRefreshActor3D(player, "player_restore");
+    }
+    else
+    {
+        LogLine("companions: WARNING — no player snapshot; player keeps designed face!");
+    }
+
+    // 3) Refresh the companion if their 3D is loaded (usually not yet spawned).
+    CompanionRefreshActor3D(ResolveCompanionRef(slot), "companion_face_applied");
+
+    entry.faceDesigned = true;
+    std::string error;
+    bool ok = true;
+    if (session.spawnAfter)
+    {
+        ok = CompanionSummon(slot, error);
+    }
+    SaveCompanionRegistry();
+    WriteCompanionAck(session.requestId, ok, error, session.op, static_cast<int>(slot), entry.npcKey);
+    ShowHudMessage(entry.name.empty() ? "Companion face saved." : (ToUiAscii(entry.name) + " joined you."));
+    g_companions.face = CompanionFaceSession{};
+}
+
+void UpdateCompanionFaceDesignSession()
+{
+    CompanionFaceSession& session = g_companions.face;
+    if (session.phase == 0)
+    {
+        return;
+    }
+    if (!g_state.loadedIntoGame)
+    {
+        return;
+    }
+
+    if (session.phase == 1)
+    {
+        if (!GameWindowHasFocus() || IsTextInputMenuActive() || IsMenuVisible(kRaceSexMenuType))
+        {
+            return;
+        }
+        PlayerCharacter* player = GetPlayer();
+        TESNPC* playerBase = (player && player->baseForm && player->baseForm->typeID == kFormType_TESNPC)
+            ? static_cast<TESNPC*>(player->baseForm)
+            : nullptr;
+        if (!playerBase)
+        {
+            AbortCompanionFaceSession("player_base_unresolved");
+            return;
+        }
+
+        // Alt-tabbing back in lands in the auto-pause Start menu (and the user
+        // may have others open) — chargen can't open over a menu, and there is
+        // no reliable native "close all menus". Wait for gamemode and nudge the
+        // user; the pause menu closes the moment they hit Continue.
+        UInt32 blockingMenu = 0;
+        for (UInt32 menuType = kMenuType_Min; menuType <= kMenuType_Max; ++menuType)
+        {
+            if (menuType == kMenuType_HUDMain)
+            {
+                continue;
+            }
+            if (IsMenuVisible(menuType))
+            {
+                blockingMenu = menuType;
+                break;
+            }
+        }
+        if (blockingMenu)
+        {
+            const DWORD now = GetTickCount();
+            if (now >= session.nextMenuCloseTick)
+            {
+                session.nextMenuCloseTick = now + 5000;
+                LogLine("companions: waiting for menu %u to close before chargen.", blockingMenu);
+                ShowHudMessage("Close the menu to design your companion's face.");
+            }
+            return;
+        }
+
+        if (!CaptureAppearanceFromNpc(playerBase, session.playerSnapshot))
+        {
+            AbortCompanionFaceSession("player_snapshot_failed");
+            return;
+        }
+        ShowHudMessage("Design your companion's face, then confirm to continue.");
+        if (!CompanionShowRaceMenu(player))
+        {
+            AbortCompanionFaceSession("showracemenu_failed");
+            return;
+        }
+        session.phase = 2;
+        session.menuOpenDeadlineTick = GetTickCount() + kCompanionMenuOpenTimeoutMs;
+        LogLine("companions: ShowRaceMenu issued for slot %u.", session.slot);
+        return;
+    }
+
+    if (session.phase == 2)
+    {
+        if (IsMenuVisible(kRaceSexMenuType))
+        {
+            session.phase = 3;
+            LogLine("companions: RaceSexMenu open.");
+            return;
+        }
+        if (GetTickCount() > session.menuOpenDeadlineTick)
+        {
+            AbortCompanionFaceSession("menu_never_opened");
+        }
+        return;
+    }
+
+    if (session.phase == 3)
+    {
+        if (IsMenuVisible(kRaceSexMenuType))
+        {
+            return;
+        }
+        LogLine("companions: RaceSexMenu closed; finalizing face design.");
+        FinalizeCompanionFaceSession();
+    }
+}
+
+std::string MakeCompanionNpcKey(const std::string& name, UInt32 slot)
+{
+    std::string key = Slugify(name);
+    if (key.empty())
+    {
+        key = "companion";
+    }
+    for (UInt32 other = 0; other < kCompanionPoolSize; ++other)
+    {
+        if (other != slot && g_companions.slots[other].claimed && g_companions.slots[other].npcKey == key)
+        {
+            key += "_" + std::to_string(slot + 1);
+            break;
+        }
+    }
+    return key;
+}
+
+void HandleCompanionCommand(const fs::path& path)
+{
+    std::ifstream in(path, std::ios::binary);
+    if (!in)
+    {
+        LogLine("companions: command file unreadable: %s", path.filename().string().c_str());
+        return;
+    }
+    std::vector<std::string> lines;
+    std::string line;
+    while (std::getline(in, line))
+    {
+        if (!line.empty() && line.back() == '\r')
+        {
+            line.pop_back();
+        }
+        lines.push_back(line);
+    }
+    in.close();
+    if (lines.empty() || Trim(lines[0]) != kCompanionCommandVersion)
+    {
+        LogLine("companions: ignoring command %s (bad header).", path.filename().string().c_str());
+        return;
+    }
+    const auto fields = ParseKeyValueLines(lines, 1);
+    std::string requestId = Trim(GetField(fields, "request_id"));
+    if (requestId.empty())
+    {
+        requestId = path.stem().string();
+    }
+    const std::string op = ToLowerAscii(Trim(GetField(fields, "op")));
+    auto decodeText = [&fields](const char* key) -> std::string {
+        const auto decoded = DecodeBase64String(GetField(fields, key), 4096);
+        return decoded.has_value() ? Trim(*decoded) : std::string();
+    };
+    LogLine("companions: command %s op=%s", requestId.c_str(), op.c_str());
+
+    if (op == "create")
+    {
+        // Prefer the game-neutral body id; the legacy female flag is the fallback.
+        const std::string body = ToLowerAscii(Trim(GetField(fields, "body")));
+        const bool female = body.empty() ? (GetField(fields, "female") == "1") : (body == "female");
+        std::string name = decodeText("name_base64");
+        if (name.empty())
+        {
+            name = Trim(GetField(fields, "name"));
+        }
+        if (name.empty())
+        {
+            WriteCompanionAck(requestId, false, "missing_name", op, -1, "");
+            return;
+        }
+        // Dedup: a re-create for an already-claimed character reuses its slot
+        // (retries otherwise claim one slot per attempt).
+        std::string characterName = decodeText("character_base64");
+        if (characterName.empty())
+        {
+            characterName = name;
+        }
+        int slot = -1;
+        for (UInt32 i = 0; i < kCompanionPoolSize; ++i)
+        {
+            if (g_companions.slots[i].claimed
+                && _stricmp(g_companions.slots[i].characterName.c_str(), characterName.c_str()) == 0)
+            {
+                slot = static_cast<int>(i);
+                LogLine("companions: create for '%s' reuses claimed slot %d.", characterName.c_str(), slot);
+                break;
+            }
+        }
+        if (slot < 0)
+        {
+            const UInt32 first = female ? kCompanionFemaleSlotStart : 0;
+            const UInt32 last = female ? kCompanionPoolSize : kCompanionFemaleSlotStart;
+            for (UInt32 i = first; i < last; ++i)
+            {
+                if (!g_companions.slots[i].claimed)
+                {
+                    slot = static_cast<int>(i);
+                    break;
+                }
+            }
+        }
+        if (slot < 0)
+        {
+            WriteCompanionAck(requestId, false, "no_free_slot", op, -1, "");
+            return;
+        }
+        if (!ResolveCompanionBase(static_cast<UInt32>(slot)))
+        {
+            WriteCompanionAck(requestId, false, "esp_missing_or_disabled", op, slot, "");
+            return;
+        }
+
+        CompanionSlot& entry = g_companions.slots[slot];
+        const bool reusedSlot = entry.claimed;
+        if (!reusedSlot)
+        {
+            entry = CompanionSlot{};
+            entry.claimed = true;
+            entry.female = female;
+        }
+        entry.name = name;
+        entry.characterName = characterName;
+        entry.voice = Trim(GetField(fields, "voice"));
+        if (entry.status.empty() || entry.status == "unclaimed")
+        {
+            entry.status = "claimed";
+        }
+        if (entry.npcKey.empty())
+        {
+            entry.npcKey = MakeCompanionNpcKey(name, static_cast<UInt32>(slot));
+        }
+        CompanionApplyName(static_cast<UInt32>(slot));
+
+        const bool wantFaceDesign = GetField(fields, "face_design") == "1";
+        std::string error;
+        bool ok = true;
+        if (wantFaceDesign)
+        {
+            ok = StartCompanionFaceSession(static_cast<UInt32>(slot), requestId, op, true, error);
+            SaveCompanionRegistry();
+            if (!ok)
+            {
+                WriteCompanionAck(requestId, false, error, op, slot, entry.npcKey);
+            }
+            // success: ack deferred until the face session finishes in-game
+            return;
+        }
+        ok = CompanionSummon(static_cast<UInt32>(slot), error);
+        SaveCompanionRegistry();
+        WriteCompanionAck(requestId, ok, error, op, slot, entry.npcKey);
+        if (ok)
+        {
+            ShowHudMessage(ToUiAscii(entry.name) + " joined you.");
+        }
+        return;
+    }
+
+    // Remaining ops address an existing slot.
+    const int slot = atoi(GetField(fields, "slot").c_str());
+    if (slot < 0 || slot >= static_cast<int>(kCompanionPoolSize) || !g_companions.slots[slot].claimed)
+    {
+        WriteCompanionAck(requestId, false, "slot_not_claimed", op, slot, "");
+        return;
+    }
+    CompanionSlot& entry = g_companions.slots[slot];
+    std::string error;
+    bool ok = false;
+
+    if (op == "face_design")
+    {
+        const bool spawnAfter = entry.status != "spawned";
+        ok = StartCompanionFaceSession(static_cast<UInt32>(slot), requestId, op, spawnAfter, error);
+        if (!ok)
+        {
+            WriteCompanionAck(requestId, false, error, op, slot, entry.npcKey);
+        }
+        return; // ack deferred on success
+    }
+    if (op == "rename")
+    {
+        const std::string name = decodeText("name_base64");
+        if (name.empty())
+        {
+            WriteCompanionAck(requestId, false, "missing_name", op, slot, entry.npcKey);
+            return;
+        }
+        entry.name = name;
+        // The display name IS the card binding (chasm resolves the character
+        // card by npc_name), so the character mapping follows the rename.
+        entry.characterName = name;
+        CompanionApplyName(static_cast<UInt32>(slot));
+        SaveCompanionRegistry();
+        WriteCompanionAck(requestId, true, "", op, slot, entry.npcKey);
+        return;
+    }
+    if (op == "summon")
+    {
+        ok = CompanionSummon(static_cast<UInt32>(slot), error);
+    }
+    else if (op == "dismiss")
+    {
+        ok = CompanionStopFollowing(static_cast<UInt32>(slot), error);
+    }
+    else if (op == "despawn")
+    {
+        ok = CompanionDespawn(static_cast<UInt32>(slot), error);
+    }
+    else if (op == "release")
+    {
+        std::string despawnError;
+        CompanionDespawn(static_cast<UInt32>(slot), despawnError); // best effort
+        const std::string npcKey = entry.npcKey;
+        entry = CompanionSlot{};
+        SaveCompanionRegistry();
+        WriteCompanionAck(requestId, true, "", op, slot, npcKey);
+        return;
+    }
+    else
+    {
+        error = "unknown_op";
+    }
+    SaveCompanionRegistry();
+    WriteCompanionAck(requestId, ok, error, op, slot, entry.npcKey);
+}
+
+void PollCompanionCommands(bool force)
+{
+    if (!g_state.loadedIntoGame || !g_companions.registryLoaded)
+    {
+        return; // leave command files queued until a game session is live
+    }
+    const DWORD now = GetTickCount();
+    if (!force && now < g_companions.nextPollTick)
+    {
+        return;
+    }
+    g_companions.nextPollTick = now + kCompanionPollIntervalMs;
+
+    const fs::path directory = CompanionCommandDir();
+    std::error_code iterEc;
+    if (!fs::exists(directory, iterEc))
+    {
+        return;
+    }
+    for (const auto& dirEntry : fs::directory_iterator(directory, iterEc))
+    {
+        if (iterEc)
+        {
+            break;
+        }
+        std::error_code fileEc;
+        if (!dirEntry.is_regular_file(fileEc))
+        {
+            continue;
+        }
+        if (ToLowerAscii(dirEntry.path().extension().string()) != ".txt")
+        {
+            continue;
+        }
+        HandleCompanionCommand(dirEntry.path());
+        std::error_code removeEc;
+        fs::remove(dirEntry.path(), removeEc);
+        if (removeEc)
+        {
+            LogLine("companions: failed to remove command %s: %s", dirEntry.path().filename().string().c_str(), removeEc.message().c_str());
+        }
+    }
+}
+
+// F7: the manual companion trigger. Processes any queued companion commands
+// immediately, else starts face design / summons the first claimed-but-idle
+// slot, else tells the user nothing is pending. Always gives HUD feedback so
+// a press is never silent.
+void UpdateCompanionHotkey()
+{
+    const bool keyDown = (GetAsyncKeyState(kCompanionHotkeyVirtualKey) & 0x8000) != 0;
+    const bool pressedNow = keyDown && !g_companions.hotkeyDownLastFrame;
+    g_companions.hotkeyDownLastFrame = keyDown;
+    if (!pressedNow || !g_state.loadedIntoGame || !GameWindowHasFocus() || IsTextInputMenuActive())
+    {
+        return;
+    }
+
+    LogLine("companions: hotkey pressed.");
+    if (g_companions.face.phase != 0)
+    {
+        ShowHudMessage("Companion face design already in progress.");
+        return;
+    }
+
+    // 1) Anything queued from chasm? Process it right now.
+    bool hadQueued = false;
+    std::error_code iterEc;
+    for (const auto& dirEntry : fs::directory_iterator(CompanionCommandDir(), iterEc))
+    {
+        std::error_code fileEc;
+        if (!iterEc && dirEntry.is_regular_file(fileEc)
+            && ToLowerAscii(dirEntry.path().extension().string()) == ".txt")
+        {
+            hadQueued = true;
+            break;
+        }
+    }
+    if (hadQueued)
+    {
+        ShowHudMessage("Processing pending companion request...");
+        PollCompanionCommands(true);
+        return;
+    }
+
+    // 2) A claimed slot that never made it in-world? Resume it.
+    for (UInt32 slot = 0; slot < kCompanionPoolSize; ++slot)
+    {
+        CompanionSlot& entry = g_companions.slots[slot];
+        if (!entry.claimed || entry.status == "spawned")
+        {
+            continue;
+        }
+        std::string error;
+        if (!entry.faceDesigned)
+        {
+            const std::string requestId = "hotkey_face_slot" + std::to_string(slot);
+            if (StartCompanionFaceSession(slot, requestId, "face_design", true, error))
+            {
+                ShowHudMessage("Opening the character creator for " + ToUiAscii(entry.name) + "...");
+            }
+            else
+            {
+                ShowHudMessage("Companion face design could not start: " + error);
+            }
+            return;
+        }
+        if (CompanionSummon(slot, error))
+        {
+            SaveCompanionRegistry();
+            ShowHudMessage(ToUiAscii(entry.name) + " joined you.");
+        }
+        else
+        {
+            ShowHudMessage("Companion summon failed: " + error);
+            LogLine("companions: hotkey summon failed for slot %u: %s", slot, error.c_str());
+        }
+        return;
+    }
+
+    ShowHudMessage("No companion pending. Create one on chasm's Companions page.");
+}
+
+void CompanionsLogEngineProbes()
+{
+    if (g_companions.engineProbesLogged)
+    {
+        return;
+    }
+    g_companions.engineProbesLogged = true;
+    const struct { const char* label; UInt32 address; } probes[] = {
+        { "CopyAppearance", kTESNPCCopyAppearanceAddress },
+        { "FlagSetter", kActorBaseDataFlagSetterAddress },
+        { "Rebuild3D", kCharacterRebuild3DAddress },
+        { "PlayerRaceChange", kPlayerRaceChangeAddress },
+    };
+    for (const auto& probe : probes)
+    {
+        unsigned char bytes[8]{};
+        memcpy(bytes, reinterpret_cast<const void*>(probe.address), sizeof(bytes));
+        LogLine("companions: engine probe %s@%08X = %s", probe.label, probe.address, HexEncodeBytes(bytes, sizeof(bytes)).c_str());
+    }
+    LogLine("companions: bLoadFaceGenHeadEGTFiles(cached)@%08X was %d; forcing 1 for runtime facegen tints.",
+        kLoadFaceGenHeadEGTFilesAddress, *reinterpret_cast<bool*>(kLoadFaceGenHeadEGTFilesAddress) ? 1 : 0);
+}
+
+void CompanionsOnDeferredInit()
+{
+    CompanionsLogEngineProbes();
+    // Runtime facegen tinting (the ini-less bLoadFaceGenHeadEGTFiles=1): copied
+    // faces render with correct skin tints without shipping pregen assets.
+    *reinterpret_cast<bool*>(kLoadFaceGenHeadEGTFilesAddress) = true;
+    if (!g_companions.registryLoaded)
+    {
+        LoadCompanionRegistry();
+    }
+}
+
+// Re-apply session-only base-form state (name, face) after every load/new-game;
+// ref-level state (position, teammate flag, inventory) persists in the save.
+void CompanionsOnSessionReady(const char* reason)
+{
+    if (!g_companions.registryLoaded)
+    {
+        LoadCompanionRegistry();
+    }
+    if (g_companions.face.phase > 1)
+    {
+        AbortCompanionFaceSession("session_interrupted_by_load");
+    }
+    *reinterpret_cast<bool*>(kLoadFaceGenHeadEGTFilesAddress) = true;
+    UInt32 applied = 0;
+    for (UInt32 slot = 0; slot < kCompanionPoolSize; ++slot)
+    {
+        CompanionSlot& entry = g_companions.slots[slot];
+        if (!entry.claimed)
+        {
+            continue;
+        }
+        TESNPC* base = ResolveCompanionBase(slot);
+        if (!base)
+        {
+            LogLine("companions: slot %u base unresolved on %s (esp missing?).", slot, reason);
+            continue;
+        }
+        CompanionApplyName(slot);
+        if (entry.appearance.valid)
+        {
+            ApplyAppearanceToNpc(base, entry.appearance, false);
+            CompanionRefreshActor3D(ResolveCompanionRef(slot), "session_ready_reapply");
+        }
+        ++applied;
+    }
+    if (applied)
+    {
+        LogLine("companions: re-applied %u companion(s) on %s.", applied, reason);
+        // Rewrite the registry so on-disk format upgrades (new fields) propagate
+        // without waiting for the next state change.
+        SaveCompanionRegistry();
+    }
+
+    // Normalize UNCLAIMED slots: a save from before a `release` may still have
+    // the template following (the teammate flag lives in the save). Clear it
+    // and send the ref home so freed slots never trail the player.
+    for (UInt32 slot = 0; slot < kCompanionPoolSize; ++slot)
+    {
+        if (g_companions.slots[slot].claimed)
+        {
+            continue;
+        }
+        // Only bother when the esp is present (base resolves) — otherwise the
+        // pool doesn't exist in this load order at all.
+        if (!ResolveCompanionBase(slot))
+        {
+            continue;
+        }
+        TESObjectREFR* ref = ResolveCompanionRef(slot);
+        if (!ref)
+        {
+            continue;
+        }
+        SetActorPlayerTeammate(ref, false, "companion_unclaimed_normalize");
+        CompanionMoveToHold(ref);
+    }
+}
+
 void HandleNvseMessage(NVSEMessagingInterface::Message* msg)
 {
     switch (msg->type)
@@ -13709,6 +15207,7 @@ void HandleNvseMessage(NVSEMessagingInterface::Message* msg)
     case NVSEMessagingInterface::kMessage_PostLoad:
         EnsureBridgeDirectories();
         MaybeRequestBridgeStackStartup("plugin_init");
+        CompanionsOnDeferredInit();
         LogLine("FNV bridge native plugin initialized.");
         break;
 
@@ -13732,6 +15231,7 @@ void HandleNvseMessage(NVSEMessagingInterface::Message* msg)
         MaybeRequestBridgeStackStartup("new_game");
         g_state.pendingLoadSavePath.clear();
         DispatchSaveStateEvent("new_game", "", true);
+        CompanionsOnSessionReady("new_game");
         LogLine("Game session ready.");
         break;
 
@@ -13785,6 +15285,7 @@ void HandleNvseMessage(NVSEMessagingInterface::Message* msg)
         }
         g_state.pendingLoadSavePath.clear();
         DispatchSaveStateEvent("load", savePath, true);
+        CompanionsOnSessionReady("post_load_game");
         LogLine("Game session ready.");
         break;
     }

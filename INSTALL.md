@@ -25,6 +25,17 @@ Everything below is free. Allow ~20–30 minutes the first time.
 
 ---
 
+## Companions (NVCompanions.esp)
+
+The NVBridge mod ships `NVCompanions.esp` — the template pool behind chasm's
+**Companions** feature (create a character in chasm, design their face with the
+in-game character creator, and they spawn as a voiced follower). After
+installing/updating the mod, **tick `NVCompanions.esp` once in MO2's right-hand
+Plugins list** — companions cannot spawn until it is enabled. Details:
+`docs/companions-architecture.md`.
+
+---
+
 ## Step 1 — Install Mod Organizer 2 (MO2)
 
 MO2 keeps your mods separate from the game so nothing gets messy.
