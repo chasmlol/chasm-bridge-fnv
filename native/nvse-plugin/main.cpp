@@ -17,6 +17,7 @@
 #include <mutex>
 #include <optional>
 #include <deque>
+#include <set>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -56,6 +57,7 @@ NVSEInterface* g_nvse = nullptr;
 NVSEMessagingInterface* g_messaging = nullptr;
 NVSEScriptInterface* g_scriptInterface = nullptr;
 NVSESerializationInterface* g_serialization = nullptr;
+NVSEEventManagerInterface* g_eventManager = nullptr;
 extern const _FormHeap_Free FormHeap_Free;
 
 namespace
@@ -850,6 +852,16 @@ void CompanionsOnDeferredInit();
 void CompanionsOnSessionReady(const char* reason);
 std::optional<std::pair<std::string, std::string>> ResolveCompanionNpcForRef(TESObjectREFR* ref);
 TESForm* ResolveModLocalForm(const char* modName, UInt32 localFormId);
+// Game event log (extraction + aggregation; see the GAME EVENT LOG section).
+fs::path GameEventsDir();
+void RegisterGameEventHandlers();
+void ResetGameEventRuntime(const char* reason);
+void QueueGameEvent(const char* type, const std::string& summary,
+    const std::vector<std::pair<std::string, std::string>>& actors = {},
+    const std::string& locationOverride = std::string());
+void FlushGameEvents(bool force);
+void UpdateGameEventLog();
+void NoteConversationRequestForEventLog(const std::string& npcKey, const std::string& npcName);
 
 TESForm* LookupFormByIdRuntime(UInt32 refId)
 {
@@ -1001,6 +1013,11 @@ fs::path SaveStateAcksDir()
 fs::path NativeActionCommandDir()
 {
     return SaveStateControlDir() / "actions";
+}
+
+fs::path GameEventsDir()
+{
+    return SaveStateControlDir() / "gameevents";
 }
 
 std::string SafeEventStem(std::string value)
@@ -1584,6 +1601,7 @@ void EnsureBridgeDirectories()
     fs::create_directories(SaveStateEventsDir());
     fs::create_directories(SaveStateAcksDir());
     fs::create_directories(NativeActionCommandDir());
+    fs::create_directories(GameEventsDir());
     fs::create_directories(TraceDir());
     fs::create_directories(AudioDir());
     fs::create_directories(UserFunctionDir());
@@ -8965,6 +8983,9 @@ void CancelHttpTurn()
 bool WriteRequest(const std::string& npcKey, const std::string& npcName, const std::string& text, const LocationSnapshot& location, const std::string& metadataJson, bool clearSpeechSidecar, const std::vector<BYTE>* httpVoiceWav, bool nonPositionalHint)
 {
     EnsureBridgeDirectories();
+    // Event log: one conversation marker per NPC per window (the transcript
+    // itself already lives in chasm — this is just the "we talked" beat).
+    NoteConversationRequestForEventLog(npcKey, npcName);
     StopSpeechAnimation();
     ClearDialogSubtitle();
     g_state.activeRequestId = GenerateRequestId();
@@ -14251,6 +14272,1096 @@ void UpdateActiveSong()
     }
 }
 
+// ===========================================================================
+// GAME EVENT LOG — extract notable gameplay events, aggregate away the noise,
+// and drop JSONL batches into control/gameevents/ for the bridge to relay to
+// chasm's save-aware event store (POST /event-log/events).
+//
+// Sources:
+//   * xNVSE EventManager native handlers (ondeath, onstartcombat, oncombatend,
+//     onhit, onadd, onactorequip) — registered at DeferredInit.
+//   * A 1 Hz slow poll in the main loop for everything the engine has no event
+//     for: cell/worldspace travel, game-day change, level-ups, karma class,
+//     teammate roster, quest objectives, and the vanilla DialogMenu.
+//   * WriteRequest marks chasm conversations (one marker per NPC per window).
+//
+// Noise rules: hits/kills collapse into ONE combat-encounter event; pickups
+// aggregate into an 8s loot window (notables called out, junk counted); travel
+// only fires on NAMED place changes; every poll-derived event needs a primed
+// baseline (nothing fires on load); nothing is emitted per frame.
+// ===========================================================================
+
+constexpr UInt32 kGameTimeGlobalsAddress = 0x011DE7B8;
+constexpr DWORD kEventFlushIntervalMs = 2500;
+constexpr size_t kEventFlushBatchSize = 20;
+constexpr size_t kEventPendingHardCap = 200;
+constexpr DWORD kEventSlowPollMs = 1000;
+constexpr DWORD kCombatQuietCloseMs = 4000;
+constexpr DWORD kLootWindowQuietMs = 8000;
+constexpr DWORD kEquipDedupMs = 10 * 60 * 1000;
+constexpr DWORD kConversationMarkerDedupMs = 3 * 60 * 1000;
+constexpr double kEventNearbyDistance = 70.0 * kGameUnitsPerMeter; // 70 m
+constexpr UInt32 kFormFlagQuestItem = 0x400;
+constexpr UInt32 kActorValueKarma = 23;
+
+// JIP-documented calendar globals (year/month/day/hour as TESGlobal floats).
+struct GameTimeGlobalsLayout
+{
+    TESGlobal* year;
+    TESGlobal* month;
+    TESGlobal* day;
+    TESGlobal* hour;
+    TESGlobal* daysPassed;
+    TESGlobal* timeScale;
+};
+
+struct GameEventLogState
+{
+    std::mutex pendingMutex;             // pending is touched from the HTTP worker too
+    std::vector<std::string> pending;    // serialized JSON lines awaiting flush
+    UInt32 eventSerial = 0;
+    UInt32 batchSerial = 0;
+    DWORD lastFlushTick = 0;
+    bool handlersRegistered = false;
+    std::unordered_set<std::string> loggedHookFirstFire;
+
+    // Slow-poll baselines. Nothing emits until primed (set on the first poll
+    // after a load), so loading a save never replays state as fresh events.
+    bool primed = false;
+    std::string lastCellName;
+    std::string lastWorldspaceName;
+    bool lastCellWasInterior = false;
+    int lastGameDay = -1;
+    int lastGameMonth = -1;
+    int lastGameYear = -1;
+    UInt16 lastPlayerLevel = 0;
+    int lastKarmaClass = 99;
+    std::unordered_map<UInt32, std::string> knownTeammates;
+    std::map<unsigned long long, UInt32> questObjectiveStatus;
+    DWORD lastSlowPollTick = 0;
+
+    // Combat encounter aggregation.
+    bool combatActive = false;
+    DWORD combatStartTick = 0;
+    DWORD combatLastActivityTick = 0;
+    std::string combatPlace;
+    std::map<UInt32, std::string> combatParticipants; // refId -> display name
+    std::set<UInt32> combatTeammates;                 // participants who were allies
+    std::vector<std::string> combatKills;
+    int combatHits = 0;
+    bool combatPlayerInvolved = false;
+
+    // Loot window aggregation.
+    DWORD lootFirstTick = 0;
+    DWORD lootLastTick = 0;
+    std::map<std::string, int> lootCounts;            // display name -> count
+    std::vector<std::string> lootNotables;
+
+    // Equip dedup + conversation markers.
+    std::unordered_map<UInt32, DWORD> recentEquips;   // item formId -> tick
+    std::string lastConversationNpcKey;
+    DWORD lastConversationTick = 0;
+    bool dialogMenuWasOpen = false;
+    DWORD dialogMenuOpenTick = 0;
+    std::string dialogMenuPartner;
+};
+
+GameEventLogState g_eventLog;
+
+GameTimeGlobalsLayout* GetGameTimeGlobals()
+{
+    return reinterpret_cast<GameTimeGlobalsLayout*>(kGameTimeGlobalsAddress);
+}
+
+std::string CurrentGameTimeString()
+{
+    const GameTimeGlobalsLayout* globals = GetGameTimeGlobals();
+    if (!globals || !globals->year || !globals->month || !globals->day || !globals->hour)
+    {
+        return "";
+    }
+    static const char* kMonthNames[] = {
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
+    };
+    const int year = static_cast<int>(globals->year->data);
+    const int month = static_cast<int>(globals->month->data);
+    const int day = static_cast<int>(globals->day->data);
+    const float hourFloat = globals->hour->data;
+    const int hour = static_cast<int>(hourFloat);
+    const int minute = static_cast<int>((hourFloat - static_cast<float>(hour)) * 60.0f);
+    const char* monthName = (month >= 1 && month <= 12) ? kMonthNames[month - 1] : "?";
+    char buffer[48]{};
+    std::snprintf(buffer, sizeof(buffer), "%02d:%02d, %d %s %d", hour, minute, day, monthName, year);
+    return buffer;
+}
+
+// A short, human place string for an event row. Uses the full location scan
+// (map markers) — events are rare, so the cost is fine here; the 1 Hz travel
+// poll below deliberately does NOT use this.
+std::string ComposeEventPlace()
+{
+    const LocationSnapshot location = CapturePlayerLocation();
+    if (!location.cell.empty())
+    {
+        return location.cell;
+    }
+    if (!location.minor.empty())
+    {
+        return location.minor;
+    }
+    if (!location.major.empty())
+    {
+        return location.major;
+    }
+    return location.worldspace;
+}
+
+void LogHookFirstFire(const char* hook)
+{
+    if (g_eventLog.loggedHookFirstFire.insert(hook).second)
+    {
+        LogLine("event-log: hook %s fired for the first time this session.", hook);
+    }
+}
+
+// Queue one event as a serialized JSON line. Thread-safe (WriteRequest can run
+// off the main thread); everything else in the event log is main-thread only.
+void QueueGameEvent(const char* type, const std::string& summary,
+    const std::vector<std::pair<std::string, std::string>>& actors,
+    const std::string& locationOverride)
+{
+    if (!type || summary.empty())
+    {
+        return;
+    }
+    const std::string place = locationOverride.empty() ? ComposeEventPlace() : locationOverride;
+    const std::string gameTime = CurrentGameTimeString();
+
+    std::ostringstream json;
+    json << "{\"id\":\"e" << static_cast<unsigned long>(GetTickCount()) << "-" << ++g_eventLog.eventSerial << "\"";
+    json << ",\"type\":" << JsonEscape(type);
+    json << ",\"summary\":" << JsonEscape(summary);
+    json << ",\"realTime\":" << JsonEscape(NowIsoUtc());
+    if (!gameTime.empty())
+    {
+        json << ",\"gameTime\":" << JsonEscape(gameTime);
+    }
+    if (!place.empty())
+    {
+        json << ",\"location\":" << JsonEscape(place);
+    }
+    if (!actors.empty())
+    {
+        json << ",\"actors\":[";
+        bool first = true;
+        for (const auto& actor : actors)
+        {
+            if (!first)
+            {
+                json << ",";
+            }
+            first = false;
+            json << "{\"name\":" << JsonEscape(actor.first);
+            if (!actor.second.empty())
+            {
+                json << ",\"id\":" << JsonEscape(actor.second);
+            }
+            json << "}";
+        }
+        json << "]";
+    }
+    json << "}";
+
+    {
+        std::lock_guard<std::mutex> lock(g_eventLog.pendingMutex);
+        if (g_eventLog.pending.size() >= kEventPendingHardCap)
+        {
+            g_eventLog.pending.erase(g_eventLog.pending.begin());
+        }
+        g_eventLog.pending.push_back(json.str());
+    }
+    LogLine("event-log: [%s] %s", type, summary.c_str());
+}
+
+void FlushGameEvents(bool force)
+{
+    std::vector<std::string> lines;
+    {
+        std::lock_guard<std::mutex> lock(g_eventLog.pendingMutex);
+        if (g_eventLog.pending.empty())
+        {
+            return;
+        }
+        const DWORD now = GetTickCount();
+        if (!force
+            && g_eventLog.pending.size() < kEventFlushBatchSize
+            && g_eventLog.lastFlushTick
+            && (now - g_eventLog.lastFlushTick) < kEventFlushIntervalMs)
+        {
+            return;
+        }
+        lines.swap(g_eventLog.pending);
+        g_eventLog.lastFlushTick = now;
+    }
+
+    EnsureBridgeDirectories();
+    char name[80]{};
+    std::snprintf(name, sizeof(name), "evt_%lu_%u.txt",
+        static_cast<unsigned long>(GetTickCount()), ++g_eventLog.batchSerial);
+    // Write behind a "__" prefix (the bridge skips those), then rename into
+    // place so a half-written batch is never picked up.
+    const fs::path finalPath = GameEventsDir() / name;
+    const fs::path tempPath = GameEventsDir() / (std::string("__") + name);
+    {
+        std::ofstream out(tempPath, std::ios::binary | std::ios::trunc);
+        if (!out)
+        {
+            LogLine("event-log: failed to open batch file %s; dropping %zu event(s).",
+                tempPath.string().c_str(), lines.size());
+            return;
+        }
+        for (const std::string& line : lines)
+        {
+            out << line << "\n";
+        }
+    }
+    std::error_code ec;
+    fs::rename(tempPath, finalPath, ec);
+    if (ec)
+    {
+        LogLine("event-log: failed to publish batch %s (%s).", name, ec.message().c_str());
+        fs::remove(tempPath, ec);
+        return;
+    }
+    LogLine("event-log: flushed %zu event(s) to %s.", lines.size(), name);
+}
+
+bool IsPlayerRef(const TESObjectREFR* ref)
+{
+    return ref && ref == static_cast<const TESObjectREFR*>(GetPlayer());
+}
+
+bool IsNearPlayerForEvents(TESObjectREFR* ref)
+{
+    PlayerCharacter* player = GetPlayer();
+    if (!player || !ref)
+    {
+        return false;
+    }
+    if (ref == player)
+    {
+        return true;
+    }
+    return DistanceSquared3D(player, ref) <= (kEventNearbyDistance * kEventNearbyDistance);
+}
+
+std::string EventActorName(TESObjectREFR* ref)
+{
+    if (!ref)
+    {
+        return "";
+    }
+    if (IsPlayerRef(ref))
+    {
+        return "You";
+    }
+    return GetFormNameSafe(ref);
+}
+
+bool IsKnownTeammateRefId(UInt32 refId)
+{
+    return g_eventLog.knownTeammates.find(refId) != g_eventLog.knownTeammates.end();
+}
+
+void TouchCombatEncounter(TESObjectREFR* actorRef)
+{
+    const DWORD now = GetTickCount();
+    if (!g_eventLog.combatActive)
+    {
+        g_eventLog.combatActive = true;
+        g_eventLog.combatStartTick = now;
+        g_eventLog.combatPlace = ComposeEventPlace();
+        g_eventLog.combatParticipants.clear();
+        g_eventLog.combatTeammates.clear();
+        g_eventLog.combatKills.clear();
+        g_eventLog.combatHits = 0;
+        g_eventLog.combatPlayerInvolved = false;
+        LogHookFirstFire("combat_encounter_open");
+    }
+    g_eventLog.combatLastActivityTick = now;
+    if (!actorRef)
+    {
+        return;
+    }
+    if (IsPlayerRef(actorRef))
+    {
+        g_eventLog.combatPlayerInvolved = true;
+        return;
+    }
+    const std::string name = EventActorName(actorRef);
+    if (name.empty())
+    {
+        return;
+    }
+    g_eventLog.combatParticipants[actorRef->refID] = name;
+    if (IsKnownTeammateRefId(actorRef->refID))
+    {
+        g_eventLog.combatTeammates.insert(actorRef->refID);
+        g_eventLog.combatPlayerInvolved = true;
+    }
+}
+
+void EmitCombatEncounterEvent()
+{
+    if (!g_eventLog.combatActive)
+    {
+        return;
+    }
+    g_eventLog.combatActive = false;
+
+    // Ignore encounters the player never touched (distant NPC squabbles).
+    if (!g_eventLog.combatPlayerInvolved && g_eventLog.combatKills.empty())
+    {
+        return;
+    }
+
+    // Group foes by display name ("Powder Ganger x3"), allies listed by name.
+    std::map<std::string, int> foeCounts;
+    std::vector<std::string> allies;
+    for (const auto& entry : g_eventLog.combatParticipants)
+    {
+        if (g_eventLog.combatTeammates.count(entry.first))
+        {
+            allies.push_back(entry.second);
+        }
+        else
+        {
+            foeCounts[entry.second] += 1;
+        }
+    }
+
+    std::string foes;
+    int foeNames = 0;
+    for (const auto& entry : foeCounts)
+    {
+        if (foeNames == 3)
+        {
+            foes += " and others";
+            break;
+        }
+        if (foeNames)
+        {
+            foes += ", ";
+        }
+        foes += entry.first;
+        if (entry.second > 1)
+        {
+            char suffix[16]{};
+            std::snprintf(suffix, sizeof(suffix), " x%d", entry.second);
+            foes += suffix;
+        }
+        ++foeNames;
+    }
+
+    std::string summary = foes.empty() ? "A fight broke out" : ("Fought " + foes);
+    if (!allies.empty())
+    {
+        summary += " alongside ";
+        for (size_t i = 0; i < allies.size() && i < 3; ++i)
+        {
+            if (i)
+            {
+                summary += ", ";
+            }
+            summary += allies[i];
+        }
+    }
+    if (!g_eventLog.combatKills.empty())
+    {
+        summary += " — ";
+        for (size_t i = 0; i < g_eventLog.combatKills.size(); ++i)
+        {
+            if (i == 4)
+            {
+                summary += "; …";
+                break;
+            }
+            if (i)
+            {
+                summary += "; ";
+            }
+            summary += g_eventLog.combatKills[i];
+        }
+    }
+    else
+    {
+        summary += " — no one died";
+    }
+
+    std::vector<std::pair<std::string, std::string>> actors;
+    for (const auto& entry : g_eventLog.combatParticipants)
+    {
+        if (actors.size() >= 8)
+        {
+            break;
+        }
+        actors.emplace_back(entry.second, FormIdHex(entry.first));
+    }
+    QueueGameEvent("combat", summary, actors, g_eventLog.combatPlace);
+}
+
+// --- xNVSE EventManager native handlers (params = void*[2] {source, object},
+// per EventManager's classic-event dispatch) --------------------------------
+
+void OnDeathEventHandler(TESObjectREFR* /*thisObj*/, void* parameters)
+{
+    LogHookFirstFire("ondeath");
+    if (!parameters)
+    {
+        return;
+    }
+    void** params = static_cast<void**>(parameters);
+    auto* dying = static_cast<TESObjectREFR*>(params[0]);
+    auto* killerForm = static_cast<TESForm*>(params[1]);
+    if (!dying)
+    {
+        return;
+    }
+    auto* killerRef = reinterpret_cast<TESObjectREFR*>(killerForm);
+    const bool killerIsPlayer = killerForm && killerRef == static_cast<TESObjectREFR*>(GetPlayer());
+    const bool victimIsPlayer = IsPlayerRef(dying);
+    const bool victimIsTeammate = IsKnownTeammateRefId(dying->refID);
+
+    // Off-screen deaths with no player stake are noise.
+    if (!victimIsPlayer && !victimIsTeammate && !killerIsPlayer && !IsNearPlayerForEvents(dying))
+    {
+        return;
+    }
+
+    const std::string victimName = EventActorName(dying);
+    std::string killerName = killerForm ? GetFormNameSafe(killerForm) : "";
+    if (killerIsPlayer)
+    {
+        killerName = "You";
+    }
+
+    std::string kill;
+    if (killerIsPlayer)
+    {
+        kill = "You killed " + victimName;
+        TESObjectWEAP* weapon = GetPlayer() ? GetPlayer()->GetEquippedWeapon() : nullptr;
+        const std::string weaponName = weapon ? GetDisplayNameSafe(weapon) : "";
+        if (!weaponName.empty())
+        {
+            kill += " with " + weaponName;
+        }
+    }
+    else if (!killerName.empty() && killerName != victimName)
+    {
+        kill = killerName + " killed " + victimName;
+    }
+    else
+    {
+        kill = victimName + " died";
+    }
+
+    // High-stakes deaths surface immediately; everything else folds into the
+    // running combat encounter (or a lone death event outside combat).
+    if (victimIsPlayer)
+    {
+        QueueGameEvent("death", killerName.empty() ? "You died" : ("You were killed by " + killerName));
+        return;
+    }
+    if (victimIsTeammate)
+    {
+        QueueGameEvent("death", "Companion " + victimName + " was killed"
+            + (killerName.empty() ? "" : (" by " + killerName)));
+        TouchCombatEncounter(dying);
+        return;
+    }
+    if (g_eventLog.combatActive)
+    {
+        TouchCombatEncounter(dying);
+        if (g_eventLog.combatKills.size() < 12)
+        {
+            g_eventLog.combatKills.push_back(kill);
+        }
+        return;
+    }
+    if (killerIsPlayer)
+    {
+        QueueGameEvent("death", kill,
+            { { victimName, FormIdHex(dying->refID) } });
+    }
+}
+
+void OnStartCombatEventHandler(TESObjectREFR* /*thisObj*/, void* parameters)
+{
+    LogHookFirstFire("onstartcombat");
+    if (!parameters)
+    {
+        return;
+    }
+    void** params = static_cast<void**>(parameters);
+    auto* actor = static_cast<TESObjectREFR*>(params[0]);
+    auto* target = reinterpret_cast<TESObjectREFR*>(static_cast<TESForm*>(params[1]));
+    const bool relevant = IsPlayerRef(actor) || IsPlayerRef(target)
+        || IsNearPlayerForEvents(actor);
+    if (!relevant)
+    {
+        return;
+    }
+    TouchCombatEncounter(actor);
+    if (target)
+    {
+        TouchCombatEncounter(target);
+    }
+}
+
+void OnCombatEndEventHandler(TESObjectREFR* /*thisObj*/, void* parameters)
+{
+    LogHookFirstFire("oncombatend");
+    if (!g_eventLog.combatActive || !parameters)
+    {
+        return;
+    }
+    // Just mark activity; the slow poll closes the encounter once the player
+    // is out of combat and things have been quiet.
+    g_eventLog.combatLastActivityTick = GetTickCount();
+}
+
+void OnHitEventHandler(TESObjectREFR* /*thisObj*/, void* parameters)
+{
+    LogHookFirstFire("onhit");
+    if (!parameters)
+    {
+        return;
+    }
+    void** params = static_cast<void**>(parameters);
+    auto* victim = static_cast<TESObjectREFR*>(params[0]);
+    auto* attacker = reinterpret_cast<TESObjectREFR*>(static_cast<TESForm*>(params[1]));
+    const bool relevant = IsPlayerRef(victim) || IsPlayerRef(attacker)
+        || IsNearPlayerForEvents(victim);
+    if (!relevant)
+    {
+        return;
+    }
+    // Hits NEVER emit events — they only feed the encounter aggregate.
+    TouchCombatEncounter(victim);
+    if (attacker)
+    {
+        TouchCombatEncounter(attacker);
+    }
+    g_eventLog.combatHits += 1;
+}
+
+bool IsNotableInventoryForm(TESForm* form)
+{
+    if (!form)
+    {
+        return false;
+    }
+    if (form->flags & kFormFlagQuestItem)
+    {
+        return true;
+    }
+    return form->typeID == kFormType_TESObjectWEAP
+        || form->typeID == kFormType_TESObjectARMO
+        || form->typeID == kFormType_TESObjectBOOK;
+}
+
+void RecordPlayerItemPickup(TESForm* itemForm)
+{
+    const std::string name = GetDisplayNameSafe(itemForm);
+    if (name.empty())
+    {
+        return;
+    }
+    const DWORD now = GetTickCount();
+    if (!g_eventLog.lootFirstTick)
+    {
+        g_eventLog.lootFirstTick = now;
+    }
+    g_eventLog.lootLastTick = now;
+    g_eventLog.lootCounts[name] += 1;
+    if (IsNotableInventoryForm(itemForm)
+        && std::find(g_eventLog.lootNotables.begin(), g_eventLog.lootNotables.end(), name)
+            == g_eventLog.lootNotables.end())
+    {
+        g_eventLog.lootNotables.push_back(name);
+    }
+}
+
+void EmitLootWindowEvent()
+{
+    if (!g_eventLog.lootFirstTick)
+    {
+        return;
+    }
+    int total = 0;
+    for (const auto& entry : g_eventLog.lootCounts)
+    {
+        total += entry.second;
+    }
+    std::string summary;
+    if (total == 1)
+    {
+        summary = "Picked up " + g_eventLog.lootCounts.begin()->first;
+    }
+    else
+    {
+        // Call out notables first, then pad with the most common names.
+        std::vector<std::string> highlights = g_eventLog.lootNotables;
+        for (const auto& entry : g_eventLog.lootCounts)
+        {
+            if (highlights.size() >= 3)
+            {
+                break;
+            }
+            if (std::find(highlights.begin(), highlights.end(), entry.first) == highlights.end())
+            {
+                highlights.push_back(entry.first);
+            }
+        }
+        char head[48]{};
+        std::snprintf(head, sizeof(head), "Picked up %d items", total);
+        summary = head;
+        if (!highlights.empty())
+        {
+            summary += " incl. ";
+            for (size_t i = 0; i < highlights.size() && i < 3; ++i)
+            {
+                if (i)
+                {
+                    summary += ", ";
+                }
+                summary += highlights[i];
+                const auto countIt = g_eventLog.lootCounts.find(highlights[i]);
+                if (countIt != g_eventLog.lootCounts.end() && countIt->second > 1)
+                {
+                    char suffix[16]{};
+                    std::snprintf(suffix, sizeof(suffix), " x%d", countIt->second);
+                    summary += suffix;
+                }
+            }
+        }
+    }
+    g_eventLog.lootFirstTick = 0;
+    g_eventLog.lootLastTick = 0;
+    g_eventLog.lootCounts.clear();
+    g_eventLog.lootNotables.clear();
+    QueueGameEvent("item", summary);
+}
+
+void OnAddEventHandler(TESObjectREFR* /*thisObj*/, void* parameters)
+{
+    if (!parameters)
+    {
+        return;
+    }
+    void** params = static_cast<void**>(parameters);
+    auto* first = static_cast<TESObjectREFR*>(params[0]);
+    auto* second = static_cast<TESForm*>(params[1]);
+    if (g_eventLog.loggedHookFirstFire.insert("onadd").second)
+    {
+        // Defensive: log the raw param orientation once, so the first play
+        // session confirms which side is the item and which the container.
+        LogLine("event-log: hook onadd fired for the first time this session (p0 type=%u, p1 type=%u).",
+            first ? static_cast<unsigned>(first->typeID) : 0,
+            second ? static_cast<unsigned>(second->typeID) : 0);
+    }
+    PlayerCharacter* player = GetPlayer();
+    if (!player)
+    {
+        return;
+    }
+    // Classic OnAdd marks the ITEM ref with the container as the object, but
+    // accept the swapped orientation too.
+    if (second == static_cast<TESForm*>(player) && first && first->baseForm)
+    {
+        RecordPlayerItemPickup(first->baseForm);
+    }
+    else if (first == static_cast<TESObjectREFR*>(player) && second)
+    {
+        RecordPlayerItemPickup(second);
+    }
+}
+
+void OnActorEquipEventHandler(TESObjectREFR* /*thisObj*/, void* parameters)
+{
+    if (!parameters)
+    {
+        return;
+    }
+    void** params = static_cast<void**>(parameters);
+    auto* first = static_cast<TESObjectREFR*>(params[0]);
+    auto* second = static_cast<TESForm*>(params[1]);
+    if (g_eventLog.loggedHookFirstFire.insert("onactorequip").second)
+    {
+        LogLine("event-log: hook onactorequip fired for the first time this session (p0 type=%u, p1 type=%u).",
+            first ? static_cast<unsigned>(first->typeID) : 0,
+            second ? static_cast<unsigned>(second->typeID) : 0);
+    }
+    PlayerCharacter* player = GetPlayer();
+    if (!player)
+    {
+        return;
+    }
+    TESForm* item = nullptr;
+    if (first == static_cast<TESObjectREFR*>(player) && second)
+    {
+        item = second;
+    }
+    else if (second == static_cast<TESForm*>(player) && first && first->baseForm)
+    {
+        item = first->baseForm;
+    }
+    if (!item || (item->typeID != kFormType_TESObjectWEAP && item->typeID != kFormType_TESObjectARMO))
+    {
+        return;
+    }
+    const DWORD now = GetTickCount();
+    const auto recent = g_eventLog.recentEquips.find(item->refID);
+    if (recent != g_eventLog.recentEquips.end() && (now - recent->second) < kEquipDedupMs)
+    {
+        return;
+    }
+    g_eventLog.recentEquips[item->refID] = now;
+    const std::string name = GetDisplayNameSafe(item);
+    if (!name.empty())
+    {
+        QueueGameEvent("item", "Equipped " + name);
+    }
+}
+
+void RegisterGameEventHandlers()
+{
+    if (g_eventLog.handlersRegistered)
+    {
+        return;
+    }
+    if (!g_eventManager)
+    {
+        LogLine("event-log: xNVSE EventManager interface unavailable; hook-based events disabled (poll-based events still run).");
+        return;
+    }
+    struct HookSpec
+    {
+        const char* name;
+        NVSEEventManagerInterface::NativeEventHandler handler;
+    };
+    const HookSpec hooks[] = {
+        { "ondeath", OnDeathEventHandler },
+        { "onstartcombat", OnStartCombatEventHandler },
+        { "oncombatend", OnCombatEndEventHandler },
+        { "onhit", OnHitEventHandler },
+        { "onadd", OnAddEventHandler },
+        { "onactorequip", OnActorEquipEventHandler },
+    };
+    for (const HookSpec& hook : hooks)
+    {
+        const bool ok = g_eventManager->SetNativeEventHandler(hook.name, hook.handler);
+        LogLine("event-log: register %s handler -> %s.", hook.name, ok ? "ok" : "FAILED");
+    }
+    g_eventLog.handlersRegistered = true;
+}
+
+void ResetGameEventRuntime(const char* reason)
+{
+    {
+        std::lock_guard<std::mutex> lock(g_eventLog.pendingMutex);
+        g_eventLog.pending.clear();
+    }
+    g_eventLog.primed = false;
+    g_eventLog.lastSlowPollTick = 0;
+    g_eventLog.combatActive = false;
+    g_eventLog.combatParticipants.clear();
+    g_eventLog.combatTeammates.clear();
+    g_eventLog.combatKills.clear();
+    g_eventLog.lootFirstTick = 0;
+    g_eventLog.lootLastTick = 0;
+    g_eventLog.lootCounts.clear();
+    g_eventLog.lootNotables.clear();
+    g_eventLog.recentEquips.clear();
+    g_eventLog.knownTeammates.clear();
+    g_eventLog.questObjectiveStatus.clear();
+    g_eventLog.lastConversationNpcKey.clear();
+    g_eventLog.lastConversationTick = 0;
+    g_eventLog.dialogMenuWasOpen = false;
+    g_eventLog.dialogMenuPartner.clear();
+    LogLine("event-log: runtime reset (%s).", reason ? reason : "");
+}
+
+void NoteConversationRequestForEventLog(const std::string& npcKey, const std::string& npcName)
+{
+    if (npcKey.empty() || npcKey == kAdminNpcKey || npcName.empty())
+    {
+        return;
+    }
+    const DWORD now = GetTickCount();
+    if (npcKey == g_eventLog.lastConversationNpcKey
+        && g_eventLog.lastConversationTick
+        && (now - g_eventLog.lastConversationTick) < kConversationMarkerDedupMs)
+    {
+        g_eventLog.lastConversationTick = now;
+        return;
+    }
+    g_eventLog.lastConversationNpcKey = npcKey;
+    g_eventLog.lastConversationTick = now;
+    QueueGameEvent("conversation", "Talked with " + npcName, { { npcName, "" } });
+}
+
+int KarmaClassOf(float karma)
+{
+    if (karma <= -750.0f) return -2;
+    if (karma <= -250.0f) return -1;
+    if (karma < 250.0f) return 0;
+    if (karma < 750.0f) return 1;
+    return 2;
+}
+
+const char* KarmaClassName(int karmaClass)
+{
+    switch (karmaClass)
+    {
+    case -2: return "very evil";
+    case -1: return "evil";
+    case 0: return "neutral";
+    case 1: return "good";
+    default: return "very good";
+    }
+}
+
+// The 1 Hz slow poll: travel, calendar, level, karma, teammates, quest
+// objectives, vanilla dialogue, plus encounter/loot window closure + flushing.
+void UpdateGameEventLog()
+{
+    PlayerCharacter* player = GetPlayer();
+    if (!player)
+    {
+        return;
+    }
+    const DWORD now = GetTickCount();
+    if (g_eventLog.lastSlowPollTick && (now - g_eventLog.lastSlowPollTick) < kEventSlowPollMs)
+    {
+        return;
+    }
+    g_eventLog.lastSlowPollTick = now;
+
+    const bool priming = !g_eventLog.primed;
+
+    // --- travel (named-place changes only; no marker scans here) ------------
+    TESObjectCELL* cell = player->parentCell;
+    if (cell)
+    {
+        const std::string cellName = GetFormNameSafe(cell);
+        const bool interior = cell->worldSpace == nullptr;
+        const std::string worldspaceName = interior ? "" : GetFormNameSafe(cell->worldSpace);
+        if (!priming)
+        {
+            if (interior && !g_eventLog.lastCellWasInterior && !cellName.empty())
+            {
+                QueueGameEvent("location", "Entered " + cellName, {}, cellName);
+            }
+            else if (!interior && g_eventLog.lastCellWasInterior)
+            {
+                const std::string outside = !worldspaceName.empty() ? worldspaceName : std::string("the open wasteland");
+                QueueGameEvent("location", "Stepped out into " + outside, {}, worldspaceName);
+            }
+            else if (interior && !cellName.empty() && cellName != g_eventLog.lastCellName)
+            {
+                QueueGameEvent("location", "Entered " + cellName, {}, cellName);
+            }
+            else if (!interior && !worldspaceName.empty() && worldspaceName != g_eventLog.lastWorldspaceName
+                && !g_eventLog.lastWorldspaceName.empty())
+            {
+                QueueGameEvent("location", "Traveled to " + worldspaceName, {}, worldspaceName);
+            }
+            else if (!interior && !cellName.empty() && cellName != g_eventLog.lastCellName
+                && cellName != worldspaceName && cellName.find("Wilderness") == std::string::npos)
+            {
+                QueueGameEvent("location", "Arrived at " + cellName, {}, cellName);
+            }
+        }
+        g_eventLog.lastCellName = cellName;
+        g_eventLog.lastWorldspaceName = worldspaceName;
+        g_eventLog.lastCellWasInterior = interior;
+    }
+
+    // --- calendar ------------------------------------------------------------
+    const GameTimeGlobalsLayout* timeGlobals = GetGameTimeGlobals();
+    if (timeGlobals && timeGlobals->day && timeGlobals->month && timeGlobals->year)
+    {
+        const int day = static_cast<int>(timeGlobals->day->data);
+        const int month = static_cast<int>(timeGlobals->month->data);
+        const int year = static_cast<int>(timeGlobals->year->data);
+        if (!priming
+            && (day != g_eventLog.lastGameDay || month != g_eventLog.lastGameMonth || year != g_eventLog.lastGameYear)
+            && g_eventLog.lastGameDay > 0)
+        {
+            const std::string stamp = CurrentGameTimeString();
+            const size_t comma = stamp.find(", ");
+            const std::string date = comma == std::string::npos ? stamp : stamp.substr(comma + 2);
+            QueueGameEvent("day", "A new day — " + date);
+        }
+        g_eventLog.lastGameDay = day;
+        g_eventLog.lastGameMonth = month;
+        g_eventLog.lastGameYear = year;
+    }
+
+    // --- level + karma ---------------------------------------------------------
+    const UInt16 level = player->avOwner.Fn_0A();
+    if (!priming && level > g_eventLog.lastPlayerLevel && g_eventLog.lastPlayerLevel > 0)
+    {
+        char summary[48]{};
+        std::snprintf(summary, sizeof(summary), "Reached level %u", static_cast<unsigned>(level));
+        QueueGameEvent("level", summary);
+    }
+    g_eventLog.lastPlayerLevel = level;
+
+    const float karma = player->avOwner.Fn_03(kActorValueKarma);
+    const int karmaClass = KarmaClassOf(karma);
+    if (!priming && karmaClass != g_eventLog.lastKarmaClass && g_eventLog.lastKarmaClass != 99)
+    {
+        QueueGameEvent("karma", std::string("Karma shifted — now regarded as ") + KarmaClassName(karmaClass));
+    }
+    g_eventLog.lastKarmaClass = karmaClass;
+
+    // --- teammates -------------------------------------------------------------
+    {
+        std::unordered_map<UInt32, std::string> current;
+        for (auto it = player->teammates.Begin(); !it.End(); ++it)
+        {
+            Actor* teammate = it.Get();
+            if (!teammate)
+            {
+                continue;
+            }
+            const std::string name = GetFormNameSafe(teammate);
+            if (!name.empty())
+            {
+                current[teammate->refID] = name;
+            }
+        }
+        if (!priming)
+        {
+            for (const auto& entry : current)
+            {
+                if (!g_eventLog.knownTeammates.count(entry.first))
+                {
+                    QueueGameEvent("companion", entry.second + " joined you as a companion",
+                        { { entry.second, FormIdHex(entry.first) } });
+                }
+            }
+            for (const auto& entry : g_eventLog.knownTeammates)
+            {
+                if (!current.count(entry.first))
+                {
+                    QueueGameEvent("companion", entry.second + " parted ways with you",
+                        { { entry.second, FormIdHex(entry.first) } });
+                }
+            }
+        }
+        g_eventLog.knownTeammates.swap(current);
+    }
+
+    // --- quest objectives --------------------------------------------------------
+    {
+        for (auto it = player->questObjectiveList.Begin(); !it.End(); ++it)
+        {
+            BGSQuestObjective* objective = it.Get();
+            if (!objective || !objective->quest)
+            {
+                continue;
+            }
+            const unsigned long long key =
+                (static_cast<unsigned long long>(objective->quest->refID) << 32)
+                | static_cast<unsigned long long>(objective->objectiveId);
+            const UInt32 status = objective->status;
+            const auto known = g_eventLog.questObjectiveStatus.find(key);
+            const bool isNew = known == g_eventLog.questObjectiveStatus.end();
+            const UInt32 previous = isNew ? 0 : known->second;
+            g_eventLog.questObjectiveStatus[key] = status;
+            if (priming || !(status & BGSQuestObjective::eQObjStatus_displayed))
+            {
+                continue;
+            }
+            const std::string questName = GetFormNameSafe(objective->quest);
+            const char* text = objective->displayText.CStr();
+            const std::string objectiveText = text ? text : "";
+            if (questName.empty() && objectiveText.empty())
+            {
+                continue;
+            }
+            const std::string label = questName.empty()
+                ? objectiveText
+                : (objectiveText.empty() ? questName : (questName + ": " + objectiveText));
+            if (isNew || !(previous & BGSQuestObjective::eQObjStatus_displayed))
+            {
+                QueueGameEvent("quest", "New objective — " + label);
+            }
+            else if ((status & BGSQuestObjective::eQObjStatus_completed)
+                && !(previous & BGSQuestObjective::eQObjStatus_completed))
+            {
+                QueueGameEvent("quest", "Objective completed — " + label);
+            }
+        }
+    }
+
+    // --- vanilla dialogue (DialogMenu open/close) -------------------------------
+    {
+        const bool dialogOpen = IsMenuVisible(kMenuType_Dialog);
+        if (dialogOpen && !g_eventLog.dialogMenuWasOpen)
+        {
+            g_eventLog.dialogMenuOpenTick = now;
+            g_eventLog.dialogMenuPartner.clear();
+            InterfaceManager* ui = *reinterpret_cast<InterfaceManager**>(kInterfaceManagerSingletonAddress);
+            if (ui && ui->crosshairRef)
+            {
+                g_eventLog.dialogMenuPartner = EventActorName(ui->crosshairRef);
+            }
+            LogHookFirstFire("dialog_menu");
+        }
+        else if (!dialogOpen && g_eventLog.dialogMenuWasOpen)
+        {
+            const std::string partner = g_eventLog.dialogMenuPartner.empty()
+                ? std::string("a local")
+                : g_eventLog.dialogMenuPartner;
+            QueueGameEvent("conversation", "Spoke with " + partner,
+                g_eventLog.dialogMenuPartner.empty()
+                    ? std::vector<std::pair<std::string, std::string>>{}
+                    : std::vector<std::pair<std::string, std::string>>{ { partner, "" } });
+        }
+        g_eventLog.dialogMenuWasOpen = dialogOpen;
+    }
+
+    if (priming)
+    {
+        g_eventLog.primed = true;
+        LogLine("event-log: baselines primed (cell=%s, level=%u, teammates=%zu).",
+            g_eventLog.lastCellName.c_str(),
+            static_cast<unsigned>(g_eventLog.lastPlayerLevel),
+            g_eventLog.knownTeammates.size());
+    }
+
+    // --- aggregate window closure + flush ----------------------------------------
+    if (g_eventLog.combatActive
+        && !player->unk104
+        && g_eventLog.combatLastActivityTick
+        && (now - g_eventLog.combatLastActivityTick) >= kCombatQuietCloseMs)
+    {
+        EmitCombatEncounterEvent();
+    }
+    if (g_eventLog.lootFirstTick
+        && g_eventLog.lootLastTick
+        && (now - g_eventLog.lootLastTick) >= kLootWindowQuietMs)
+    {
+        EmitLootWindowEvent();
+    }
+    FlushGameEvents(false);
+}
+
 void OnMainGameLoop()
 {
     const bool gameWindowFocused = GameWindowHasFocus();
@@ -14328,6 +15439,7 @@ void OnMainGameLoop()
     UpdateCompanionFaceDesignSession();
     UpdateCompanionHotkey();
     UpdatePersonaCapture();
+    UpdateGameEventLog();
     // --- perf instrumentation (temporary): time the lip-sync + streaming phases to
     // locate the in-game speech lag, logged via "frame_perf_slow" trace events. ---
     static double s_perfAnimMs = 0.0;
@@ -15870,6 +16982,7 @@ void HandleNvseMessage(NVSEMessagingInterface::Message* msg)
         EnsureBridgeDirectories();
         MaybeRequestBridgeStackStartup("plugin_init");
         CompanionsOnDeferredInit();
+        RegisterGameEventHandlers();
         LogLine("FNV bridge native plugin initialized.");
         break;
 
@@ -15878,6 +16991,10 @@ void HandleNvseMessage(NVSEMessagingInterface::Message* msg)
         const std::string savePath = msg && msg->data ? reinterpret_cast<const char*>(msg->data) : "";
         if (!savePath.empty())
         {
+            // Flush pending gameplay events FIRST so they land in the same
+            // bridge poll as (and are ingested before) the save checkpoint —
+            // they belong to the timeline being saved.
+            FlushGameEvents(true);
             DispatchSaveStateEvent("save", savePath, false);
             // Persona: a save is THE capture trigger (docs/persona.md). Marks a
             // pending capture; the main loop takes it when the idle gates allow.
@@ -15889,6 +17006,7 @@ void HandleNvseMessage(NVSEMessagingInterface::Message* msg)
     case NVSEMessagingInterface::kMessage_NewGame:
         g_state.loadedIntoGame = true;
         ResetRuntimeState();
+        ResetGameEventRuntime("new_game");
         EnsureBridgeDirectories();
         MaybeRequestBridgeStackStartup("new_game");
         g_state.pendingLoadSavePath.clear();
@@ -15900,6 +17018,7 @@ void HandleNvseMessage(NVSEMessagingInterface::Message* msg)
     case NVSEMessagingInterface::kMessage_ExitToMainMenu:
         g_state.loadedIntoGame = false;
         ResetRuntimeState();
+        ResetGameEventRuntime("exit_to_main_menu");
         g_state.pendingLoadSavePath.clear();
         LogLine("Game session reset.");
         break;
@@ -15916,6 +17035,9 @@ void HandleNvseMessage(NVSEMessagingInterface::Message* msg)
     case NVSEMessagingInterface::kMessage_PreLoadGame:
         g_state.loadedIntoGame = false;
         ResetRuntimeState();
+        // Un-flushed events belong to the timeline being abandoned — drop them
+        // so they can never leak into the restored (post-rollback) log.
+        ResetGameEventRuntime("pre_load_game");
         g_state.pendingLoadSavePath = msg && msg->data ? reinterpret_cast<const char*>(msg->data) : "";
         LogLine("Preparing load for %s.", g_state.pendingLoadSavePath.c_str());
         break;
@@ -15934,6 +17056,7 @@ void HandleNvseMessage(NVSEMessagingInterface::Message* msg)
 
         g_state.loadedIntoGame = true;
         ResetRuntimeState();
+        ResetGameEventRuntime("post_load_game");
         EnsureBridgeDirectories();
         MaybeRequestBridgeStackStartup("post_load_game");
         std::string savePath = g_state.pendingLoadSavePath;
@@ -16096,6 +17219,7 @@ extern "C" __declspec(dllexport) bool NVSEPlugin_Load(NVSEInterface* nvse)
     g_serialization = static_cast<NVSESerializationInterface*>(nvse->QueryInterface(kInterface_Serialization));
     g_messaging = static_cast<NVSEMessagingInterface*>(nvse->QueryInterface(kInterface_Messaging));
     g_scriptInterface = static_cast<NVSEScriptInterface*>(nvse->QueryInterface(kInterface_Script));
+    g_eventManager = static_cast<NVSEEventManagerInterface*>(nvse->QueryInterface(kInterface_EventManager));
     if (!g_messaging || !g_scriptInterface)
     {
         return false;
