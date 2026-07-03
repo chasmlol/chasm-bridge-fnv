@@ -566,9 +566,9 @@ struct DebugConfig
     // dialogue turns ride the file bridge). ---
     bool personaEnabled = true;              // master switch for the whole feature
     bool personaScreenshotEnabled = true;    // false = stats-only uploads (no camera swing)
+    bool personaCaptureOnAutosave = false;   // let autosaves (door transitions...) trigger too
     std::string personaHttpPath = "/api/game/v1/persona";
-    DWORD personaPollIntervalMs = 3000;      // fingerprint re-check cadence while idle
-    DWORD personaDebounceMs = 30000;         // min gap between capture sequences
+    DWORD personaDebounceMs = 30000;         // min gap between capture sequences (quicksave spam)
     float personaCameraDistanceUnits = 140.0f; // flycam distance in front of the player
     float personaCameraHeightUnits = 110.0f;   // flycam height above the player's feet
     int personaMaxImageWidth = 1280;         // downscale bound before JPEG encode
@@ -2750,13 +2750,14 @@ void WriteDefaultDebugConfigIfMissing()
         << "http_host=127.0.0.1\r\n"
         << "http_port=7341\r\n"
         << "http_turn_path=/api/game/v1/turn\r\n"
-        << "# Player persona capture (docs/persona.md): on stat/equipment changes, snap a\r\n"
-        << "# front screenshot + stats snapshot and POST them to chasm (http_host:http_port,\r\n"
-        << "# used even when transport=file). persona_screenshot=0 sends stats only.\r\n"
+        << "# Player persona capture (docs/persona.md): when the game is saved (quicksave or\r\n"
+        << "# manual save), snap a front screenshot + stats snapshot and POST them to chasm\r\n"
+        << "# (http_host:http_port, used even when transport=file). persona_screenshot=0\r\n"
+        << "# sends stats only; persona_capture_on_autosave=1 lets autosaves trigger too.\r\n"
         << "persona=1\r\n"
         << "persona_screenshot=1\r\n"
+        << "persona_capture_on_autosave=0\r\n"
         << "persona_http_path=/api/game/v1/persona\r\n"
-        << "persona_poll_interval_ms=3000\r\n"
         << "persona_debounce_ms=30000\r\n"
         << "persona_camera_distance_units=140.0\r\n"
         << "persona_camera_height_units=110.0\r\n"
@@ -3003,19 +3004,15 @@ void LoadDebugConfigIfNeeded(bool force)
         {
             config.personaScreenshotEnabled = ParseConfigBool(value, config.personaScreenshotEnabled);
         }
+        else if (key == "persona_capture_on_autosave")
+        {
+            config.personaCaptureOnAutosave = ParseConfigBool(value, config.personaCaptureOnAutosave);
+        }
         else if (key == "persona_http_path")
         {
             if (!value.empty() && value[0] == '/')
             {
                 config.personaHttpPath = value;
-            }
-        }
-        else if (key == "persona_poll_interval_ms")
-        {
-            const int interval = std::atoi(value.c_str());
-            if (interval >= 500 && interval <= 60000)
-            {
-                config.personaPollIntervalMs = static_cast<DWORD>(interval);
             }
         }
         else if (key == "persona_debounce_ms")
@@ -13071,10 +13068,17 @@ void UpdateVoiceCaptureHotkey()
 // =====================================================================================
 // Player persona capture (frozen contract: docs/persona.md).
 //
-// Watches the stats the gamestate macros already read (SPECIAL / skills / perks /
-// level / name / equipped weapon / worn apparel) on a slow poll while the player is
-// idle in normal gameplay. When the "persona fingerprint" of those display strings
-// changes (and a >=30 s debounce has passed), the plugin:
+// SAVE-DRIVEN: capturing fires when the player saves the game. The NVSE SaveGame
+// message (the same detection point the save-sync machinery uses) classifies the
+// save by file name — quicksave*.fos -> "quicksave", autosave*.fos -> "autosave"
+// (ignored unless persona_capture_on_autosave=1), anything else -> "save" — and,
+// debounced to one sequence per personaDebounceMs, marks a capture PENDING. The
+// pending capture is taken the moment the idle gates below have held for
+// kPersonaGateStabilityMs (a save from a menu or mid-combat simply defers it);
+// if the gates stay closed for kPersonaPendingMaxAgeMs the pending capture
+// degrades to a stats-only upload so the save still refreshes the persona.
+// Saves always regenerate server-side, even with identical stats (fresh
+// screenshot -> fresh description). When a capture runs, the plugin:
 //
 //   1. snapshots the stats as JSON fields (the same display strings the macros send),
 //   2. swings the camera for a front view of the player using the engine's own
@@ -13119,13 +13123,14 @@ constexpr UInt32 kPlayerOffsetPcInCombat = 0xDF0;
 
 constexpr DWORD kPersonaGateStabilityMs = 1500;   // gates must hold this long before a capture
 constexpr DWORD kPersonaSequenceTimeoutMs = 2000; // watchdog on the whole swing
+constexpr DWORD kPersonaPendingMaxAgeMs = 5 * 60 * 1000; // pending save-capture -> stats-only after this
 constexpr int kPersonaSettleFrames = 3;           // frames between swing and grab
 constexpr int kPersonaRestoreMaxAttempts = 180;   // ~3 s of per-frame restore retries
 constexpr float kPersonaPi = 3.14159265358979323846f;
 
 enum class PersonaStage
 {
-    Idle,     // watching for stat changes
+    Idle,     // waiting for a save-triggered pending capture
     Settle,   // camera swung; waiting for the front view to be presented
     Restore,  // undoing tfc/tm (normally completes in the capture frame itself)
 };
@@ -13138,88 +13143,78 @@ struct PersonaCaptureRuntime
     int settleFramesRemaining = 0;
     int restoreAttemptsRemaining = 0;
     DWORD sequenceStartTick = 0;
-    DWORD lastPollTick = 0;
-    DWORD lastSequenceTick = 0;      // debounce anchor
+    DWORD lastSequenceTick = 0;      // debounce anchor (also set by stats-only expiry uploads)
     DWORD gatesSatisfiedSinceTick = 0;
-    bool levelUpVisibleLastFrame = false;
-    bool fingerprintLoaded = false;
-    std::string lastSentFingerprint; // last fingerprint chasm ACKed (persisted)
-    std::string pendingFingerprint;  // fingerprint of the in-flight capture
-    std::string pendingStatsJson;    // inner JSON fields snapped at trigger time
-    std::string pendingTrigger;
+    bool capturePending = false;     // a save fired; capture when the gates next allow
+    DWORD pendingSinceTick = 0;      // when the save fired (drives the stats-only expiry)
+    std::string pendingTrigger;      // "save" | "quicksave" | "autosave"
+    std::string pendingStatsJson;    // inner JSON fields snapped at sequence start
 };
 
 PersonaCaptureRuntime g_persona;
-// Upload handshake: the detached sender thread only touches these atomics (and its
-// own moved-in data). The game thread commits the fingerprint on success.
+// One upload in flight at a time, end to end (the detached sender thread only
+// touches this atomic and its own moved-in data — never game state).
 std::atomic<bool> g_personaSendInFlight{ false };
-std::atomic<int> g_personaSendResult{ 0 }; // 0 none, 1 success, -1 failure
 
-fs::path PersonaFingerprintPath()
+// Classifies a save path for the persona trigger vocabulary (docs/persona.md):
+// quicksave*.fos -> "quicksave", autosave*.fos -> "autosave", else "save".
+std::string ClassifyPersonaSaveTrigger(const std::string& savePath)
 {
-    return BridgeDir() / "persona_fingerprint.txt";
+    std::string stem;
+    try
+    {
+        stem = ToLowerAscii(fs::path(savePath).filename().string());
+    }
+    catch (...)
+    {
+        stem.clear();
+    }
+    if (stem.rfind("quicksave", 0) == 0)
+    {
+        return "quicksave";
+    }
+    if (stem.rfind("autosave", 0) == 0)
+    {
+        return "autosave";
+    }
+    return "save";
 }
 
-// The stats the persona reacts to, as one separator-joined string. Segment order is
-// load-bearing for ClassifyPersonaTrigger: name, level, SPECIAL, skills, perks,
-// weapon, apparel.
-std::string BuildPersonaFingerprint(PlayerCharacter* player)
+// NVSE SaveGame hook (the same detection point the save-sync machinery uses):
+// classify the save, apply the autosave knob + the debounce, and mark a capture
+// pending. The main-loop driver takes it when the idle gates next allow.
+void RequestPersonaCaptureForSave(const std::string& savePath)
 {
-    std::ostringstream out;
-    out << GetDisplayNameSafe(player) << '\x1F'
-        << static_cast<int>(player->avOwner.Fn_0A()) << '\x1F'
-        << BuildSpecialMacro(player) << '\x1F'
-        << BuildSkillsMacro(player) << '\x1F'
-        << BuildPerksMacro(player) << '\x1F'
-        << GetDisplayNameSafe(player->GetEquippedWeapon()) << '\x1F'
-        << BuildEquippedApparelMacro(player);
-    return out.str();
-}
+    if (!g_debugConfig.personaEnabled)
+    {
+        return;
+    }
+    const std::string trigger = ClassifyPersonaSaveTrigger(savePath);
+    if (trigger == "autosave" && !g_debugConfig.personaCaptureOnAutosave)
+    {
+        return;
+    }
 
-std::vector<std::string> SplitPersonaFingerprint(const std::string& fingerprint)
-{
-    std::vector<std::string> segments;
-    std::string::size_type start = 0;
-    for (;;)
+    const DWORD now = GetTickCount();
+    if (g_persona.capturePending)
     {
-        const std::string::size_type sep = fingerprint.find('\x1F', start);
-        if (sep == std::string::npos)
-        {
-            segments.push_back(fingerprint.substr(start));
-            return segments;
-        }
-        segments.push_back(fingerprint.substr(start, sep - start));
-        start = sep + 1;
+        // Coalesce save bursts into the already-pending capture; keep the
+        // ORIGINAL pendingSinceTick so the stats-only expiry cannot be pushed
+        // out forever by repeated saves.
+        g_persona.pendingTrigger = trigger;
+        return;
     }
-}
+    if (g_persona.lastSequenceTick != 0 &&
+        (now - g_persona.lastSequenceTick) < g_debugConfig.personaDebounceMs)
+    {
+        LogLine("Persona: save (%s) within the debounce window; skipping capture.", trigger.c_str());
+        return;
+    }
 
-// Which persona trigger a fingerprint change represents (docs/persona.md):
-// initial (no previous), level_up, stats_changed, equipment_changed.
-std::string ClassifyPersonaTrigger(const std::string& previous, const std::string& current)
-{
-    if (previous.empty())
-    {
-        return "initial";
-    }
-    const std::vector<std::string> before = SplitPersonaFingerprint(previous);
-    const std::vector<std::string> after = SplitPersonaFingerprint(current);
-    if (before.size() != 7 || after.size() != 7)
-    {
-        return "stats_changed";
-    }
-    if (before[1] != after[1])
-    {
-        return "level_up";
-    }
-    if (before[0] != after[0] || before[2] != after[2] || before[3] != after[3] || before[4] != after[4])
-    {
-        return "stats_changed";
-    }
-    if (before[5] != after[5] || before[6] != after[6])
-    {
-        return "equipment_changed";
-    }
-    return "stats_changed";
+    g_persona.capturePending = true;
+    g_persona.pendingSinceTick = now;
+    g_persona.pendingTrigger = trigger;
+    LogLine("Persona: capture pending (trigger=%s).", trigger.c_str());
 }
 
 // The capture's stats snapshot as JSON object FIELDS (no braces) so the sender
@@ -13697,7 +13692,7 @@ void StartPersonaUpload(std::string statsJsonFields, std::vector<BYTE> bgra, int
 {
     if (g_personaSendInFlight.exchange(true))
     {
-        return; // one upload at a time; the fingerprint stays unsent -> retried later
+        return; // one upload at a time; the driver waits on this before a new sequence
     }
 
     std::ostringstream url;
@@ -13736,7 +13731,6 @@ void StartPersonaUpload(std::string statsJsonFields, std::vector<BYTE> bgra, int
         const bool ok = PostPersonaCapture(url, body.str(), summary);
         LogLine("Persona upload %s (%s, image=%s).", ok ? "succeeded" : "failed",
             summary.c_str(), imageBase64.empty() ? "none" : "jpeg");
-        g_personaSendResult.store(ok ? 1 : -1);
         g_personaSendInFlight.store(false);
     }).detach();
 }
@@ -13801,13 +13795,12 @@ void FinishPersonaSequence(PlayerCharacter* player, bool captureFrame, const cha
     g_persona.pendingStatsJson.clear();
 }
 
-// Trigger: snapshot stats, then (when screenshots are enabled) hide the HUD, enter
-// the flycam, and pose it in front of the player. The settle countdown lets the
-// engine render + present the swung view before the grab.
-void BeginPersonaSequence(PlayerCharacter* player, const std::string& fingerprint, DWORD now)
+// Takes the pending save-triggered capture: snapshot stats, then (when screenshots
+// are enabled) hide the HUD, enter the flycam, and pose it in front of the player.
+// The settle countdown lets the engine render + present the swung view before the
+// grab.
+void BeginPersonaSequence(PlayerCharacter* player, DWORD now)
 {
-    g_persona.pendingFingerprint = fingerprint;
-    g_persona.pendingTrigger = ClassifyPersonaTrigger(g_persona.lastSentFingerprint, fingerprint);
     g_persona.pendingStatsJson = BuildPersonaStatsJsonFields(player, g_persona.pendingTrigger);
     g_persona.lastSequenceTick = now;
     g_persona.sequenceStartTick = now;
@@ -13858,6 +13851,14 @@ void AbortPersonaSequenceOnInterrupt(const char* reason)
         LogLine("Persona: sequence interrupted (%s).", reason);
         g_persona.pendingStatsJson.clear();
         g_persona.restoreAttemptsRemaining = kPersonaRestoreMaxAttempts;
+        // Re-arm the save's pending capture (original pendingSinceTick keeps
+        // the stats-only expiry bounded) so an interrupt defers rather than
+        // silently swallows it. The disabled-mid-sequence caller clears the
+        // flag right after; session resets clear it too.
+        if (!g_persona.pendingTrigger.empty())
+        {
+            g_persona.capturePending = true;
+        }
     }
     PlayerCharacter* player = GetPlayer();
     if (player)
@@ -13875,7 +13876,8 @@ void AbortPersonaSequenceOnInterrupt(const char* reason)
 // Session reset (load / new game / exit to menu): drop all transient state WITHOUT
 // console calls (the world may be mid-teardown). The engine rebuilds camera/UI
 // state on load anyway; the only residue risk is the ~3-frame window where a
-// sequence was live exactly when the session ended.
+// sequence was live exactly when the session ended. A pending capture is dropped
+// too — the freshly loaded state supersedes the save that queued it.
 void ResetPersonaStateForSession()
 {
     g_persona.stage = PersonaStage::Idle;
@@ -13884,30 +13886,13 @@ void ResetPersonaStateForSession()
     g_persona.settleFramesRemaining = 0;
     g_persona.restoreAttemptsRemaining = 0;
     g_persona.sequenceStartTick = 0;
-    g_persona.lastPollTick = 0;
     g_persona.gatesSatisfiedSinceTick = 0;
-    g_persona.levelUpVisibleLastFrame = false;
-    g_persona.pendingFingerprint.clear();
+    g_persona.capturePending = false;
+    g_persona.pendingSinceTick = 0;
     g_persona.pendingStatsJson.clear();
     g_persona.pendingTrigger.clear();
-    // lastSentFingerprint / fingerprintLoaded survive: they mirror the on-disk
-    // record of what chasm last ACKed, which is session-independent.
-}
-
-void EnsurePersonaFingerprintLoaded()
-{
-    if (g_persona.fingerprintLoaded)
-    {
-        return;
-    }
-    g_persona.fingerprintLoaded = true;
-    std::ifstream in(PersonaFingerprintPath(), std::ios::binary);
-    if (!in)
-    {
-        return;
-    }
-    g_persona.lastSentFingerprint.assign(
-        (std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    // lastSequenceTick survives: the debounce spans loads on purpose
+    // (quickload+quicksave loops should not double-capture).
 }
 
 // Per-frame driver, called from OnMainGameLoop once loadedIntoGame + player are
@@ -13923,38 +13908,15 @@ void UpdatePersonaCapture()
 
     const DWORD now = GetTickCount();
 
-    // Commit the sender thread's verdict: success persists the fingerprint (so
-    // restarts don't re-fire); failure leaves it unsent for a debounced retry.
-    switch (g_personaSendResult.exchange(0))
-    {
-    case 1:
-        g_persona.lastSentFingerprint = g_persona.pendingFingerprint;
-        WriteTextFileIfChanged(PersonaFingerprintPath(), g_persona.lastSentFingerprint);
-        break;
-    case -1:
-        // Nothing to do: lastSentFingerprint stays stale, so the change is
-        // re-detected and re-sent after the debounce window.
-        break;
-    default:
-        break;
-    }
-
     if (!g_debugConfig.personaEnabled)
     {
         if (g_persona.stage != PersonaStage::Idle)
         {
             AbortPersonaSequenceOnInterrupt("persona disabled mid-sequence");
         }
+        g_persona.capturePending = false;
         return;
     }
-
-    // Level-up menu close forces an immediate re-poll (debounce still applies).
-    const bool levelUpVisible = IsMenuVisible(kMenuType_LevelUp);
-    if (g_persona.levelUpVisibleLastFrame && !levelUpVisible)
-    {
-        g_persona.lastPollTick = 0;
-    }
-    g_persona.levelUpVisibleLastFrame = levelUpVisible;
 
     // Drive an in-flight sequence.
     if (g_persona.stage == PersonaStage::Settle)
@@ -13984,7 +13946,26 @@ void UpdatePersonaCapture()
         return;
     }
 
-    // Idle watch: gates must hold continuously before we trust the moment.
+    // Idle: nothing to do until a save marks a capture pending.
+    if (!g_persona.capturePending)
+    {
+        return;
+    }
+
+    // A pending capture that the gates have blocked for too long (endless
+    // combat, the player parked in a menu...) degrades to a stats-only upload:
+    // the save still refreshes the persona, just without a new screenshot.
+    if ((now - g_persona.pendingSinceTick) > kPersonaPendingMaxAgeMs)
+    {
+        LogLine("Persona: pending capture (trigger=%s) expired before the gates allowed a screenshot; uploading stats only.",
+            g_persona.pendingTrigger.c_str());
+        g_persona.capturePending = false;
+        g_persona.lastSequenceTick = now;
+        StartPersonaUpload(BuildPersonaStatsJsonFields(player, g_persona.pendingTrigger), {}, 0, 0);
+        return;
+    }
+
+    // Gates must hold continuously before we trust the moment.
     if (!PersonaGatesSatisfied(player))
     {
         g_persona.gatesSatisfiedSinceTick = 0;
@@ -14005,26 +13986,8 @@ void UpdatePersonaCapture()
         return; // one capture end-to-end at a time
     }
 
-    if (g_persona.lastPollTick != 0 && (now - g_persona.lastPollTick) < g_debugConfig.personaPollIntervalMs)
-    {
-        return;
-    }
-    g_persona.lastPollTick = now;
-
-    EnsurePersonaFingerprintLoaded();
-
-    const std::string fingerprint = BuildPersonaFingerprint(player);
-    if (fingerprint.empty() || fingerprint == g_persona.lastSentFingerprint)
-    {
-        return;
-    }
-
-    if (g_persona.lastSequenceTick != 0 && (now - g_persona.lastSequenceTick) < g_debugConfig.personaDebounceMs)
-    {
-        return; // debounce a burst of changes into one capture
-    }
-
-    BeginPersonaSequence(player, fingerprint, now);
+    g_persona.capturePending = false;
+    BeginPersonaSequence(player, now);
 }
 
 void OnMainGameLoop()
@@ -14291,6 +14254,9 @@ void HandleNvseMessage(NVSEMessagingInterface::Message* msg)
         if (!savePath.empty())
         {
             DispatchSaveStateEvent("save", savePath, false);
+            // Persona: a save is THE capture trigger (docs/persona.md). Marks a
+            // pending capture; the main loop takes it when the idle gates allow.
+            RequestPersonaCaptureForSave(savePath);
         }
         break;
     }
