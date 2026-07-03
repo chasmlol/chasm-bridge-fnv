@@ -14396,25 +14396,34 @@ std::string CurrentGameTimeString()
     return buffer;
 }
 
-// A short, human place string for an event row. Uses the full location scan
-// (map markers) — events are rare, so the cost is fine here; the 1 Hz travel
-// poll below deliberately does NOT use this.
+// A short, human place string for an event row. Prefers VISIBLE names — the
+// local/world map markers (already display strings) and the cell/worldspace
+// DISPLAY name ("Doc Mitchell's House") — never the editor id in
+// LocationSnapshot::cell. Uses the full location scan (map markers); events are
+// rare so the cost is fine here (the 1 Hz travel poll below does NOT use this).
 std::string ComposeEventPlace()
 {
     const LocationSnapshot location = CapturePlayerLocation();
-    if (!location.cell.empty())
-    {
-        return location.cell;
-    }
     if (!location.minor.empty())
     {
         return location.minor;
+    }
+    PlayerCharacter* player = GetPlayer();
+    TESObjectCELL* cell = player ? player->parentCell : nullptr;
+    const std::string cellDisplay = cell ? GetDisplayNameSafe(cell) : std::string();
+    if (!cellDisplay.empty())
+    {
+        return cellDisplay;
     }
     if (!location.major.empty())
     {
         return location.major;
     }
-    return location.worldspace;
+    if (cell && cell->worldSpace)
+    {
+        return GetDisplayNameSafe(cell->worldSpace);
+    }
+    return "";
 }
 
 void LogHookFirstFire(const char* hook)
@@ -14556,6 +14565,20 @@ bool IsNearPlayerForEvents(TESObjectREFR* ref)
     return DistanceSquared3D(player, ref) <= (kEventNearbyDistance * kEventNearbyDistance);
 }
 
+// Resolve a form/reference to its VISIBLE name ("Boone", "Ghost Town
+// Gunfight") rather than its editor id ("CraigBooneREF", "VMS01"). GetTheName
+// (display) is tried first; the editor id is only a last resort so a named
+// form never logs as an internal id.
+std::string EventDisplayName(TESForm* form)
+{
+    const std::string display = GetDisplayNameSafe(form);
+    if (!display.empty())
+    {
+        return display;
+    }
+    return GetFormNameSafe(form);
+}
+
 std::string EventActorName(TESObjectREFR* ref)
 {
     if (!ref)
@@ -14566,7 +14589,7 @@ std::string EventActorName(TESObjectREFR* ref)
     {
         return "You";
     }
-    return GetFormNameSafe(ref);
+    return EventDisplayName(ref);
 }
 
 bool IsKnownTeammateRefId(UInt32 refId)
@@ -14740,7 +14763,7 @@ void OnDeathEventHandler(TESObjectREFR* /*thisObj*/, void* parameters)
     }
 
     const std::string victimName = EventActorName(dying);
-    std::string killerName = killerForm ? GetFormNameSafe(killerForm) : "";
+    std::string killerName = killerForm ? EventDisplayName(killerForm) : "";
     if (killerIsPlayer)
     {
         killerName = "You";
@@ -15155,9 +15178,13 @@ void UpdateGameEventLog()
     TESObjectCELL* cell = player->parentCell;
     if (cell)
     {
-        const std::string cellName = GetFormNameSafe(cell);
+        // Display names ("Doc Mitchell's House", "Mojave Wasteland"), never the
+        // editor id. Unnamed exterior wilderness cells have an EMPTY display
+        // name, which the !cellName.empty() guards below skip naturally — so no
+        // "Wilderness" substring hack is needed.
+        const std::string cellName = GetDisplayNameSafe(cell);
         const bool interior = cell->worldSpace == nullptr;
-        const std::string worldspaceName = interior ? "" : GetFormNameSafe(cell->worldSpace);
+        const std::string worldspaceName = interior ? "" : GetDisplayNameSafe(cell->worldSpace);
         if (!priming)
         {
             if (interior && !g_eventLog.lastCellWasInterior && !cellName.empty())
@@ -15179,7 +15206,7 @@ void UpdateGameEventLog()
                 QueueGameEvent("location", "Traveled to " + worldspaceName, {}, worldspaceName);
             }
             else if (!interior && !cellName.empty() && cellName != g_eventLog.lastCellName
-                && cellName != worldspaceName && cellName.find("Wilderness") == std::string::npos)
+                && cellName != worldspaceName)
             {
                 QueueGameEvent("location", "Arrived at " + cellName, {}, cellName);
             }
@@ -15238,7 +15265,7 @@ void UpdateGameEventLog()
             {
                 continue;
             }
-            const std::string name = GetFormNameSafe(teammate);
+            const std::string name = EventDisplayName(teammate);
             if (!name.empty())
             {
                 current[teammate->refID] = name;
@@ -15287,7 +15314,7 @@ void UpdateGameEventLog()
             {
                 continue;
             }
-            const std::string questName = GetFormNameSafe(objective->quest);
+            const std::string questName = EventDisplayName(objective->quest);
             const char* text = objective->displayText.CStr();
             const std::string objectiveText = text ? text : "";
             if (questName.empty() && objectiveText.empty())
