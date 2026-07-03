@@ -1,0 +1,42 @@
+# Rolling nightly package: every push to main zips the ready-built mod folder
+# (the repo carries the compiled DLL + NVCompanions.esp in mo2-mod/NVBridge)
+# and replaces the asset on the single "nightly" pre-release:
+#   https://github.com/chasmlol/chasm-bridge-fnv/releases/tag/nightly
+name: nightly
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: nightly
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Zip the mod
+        shell: pwsh
+        run: Compress-Archive -Path mo2-mod/NVBridge -DestinationPath NVBridge-nightly.zip
+
+      - name: Publish to the rolling nightly release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $notes = "Rolling package of the latest merged main (commit ${{ github.sha }}).`n`nExtract into your MO2 mods folder, enable the mod AND the NVCompanions.esp plugin, and pair with the chasm nightly."
+          gh release view nightly 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create nightly --prerelease --title "Nightly (latest main)" --notes $notes
+          } else {
+            gh release edit nightly --prerelease --title "Nightly (latest main)" --notes $notes
+          }
+          gh release upload nightly NVBridge-nightly.zip --clobber
+          git push origin +HEAD:refs/tags/nightly
