@@ -10,8 +10,9 @@ it — SillyTavern-style plain substitution.
 The **mod is the source of truth**: whatever keys it sends that turn are
 exactly the macros available that turn. This file is the vocabulary contract
 between the plugin (`BuildPlayerMacros` in `native/nvse-plugin/main.cpp`) and
-anything that writes `{{macro}}` templates (the Gamestate tester today; cards /
-lore / system prompts once production injection lands).
+anything that writes `{{macro}}` templates (the Gamestate tester, and the
+**global scenario** template on chasm's Globals page — the production
+consumer; cards / lore / system prompts may follow later).
 
 ## Substitution rules
 
@@ -34,7 +35,7 @@ templates degrade gracefully.
 | `{{level}}` | `12` | actor level |
 | `{{major_location}}` | `Goodsprings` | nearest world-map marker (same value as the turn's top-level `location.major`) |
 | `{{minor_location}}` | `Prospector Saloon` | nearest local landmark / cell (same as `location.minor`) |
-| `{{time_of_day}}` | `afternoon (14:32)` | `GameHour` global; labels: morning 05–12, afternoon 12–17, evening 17–21, night otherwise |
+| `{{time_of_day}}` | `2:32PM` | `GameHour` global, rendered as a 12-hour clock (`6:30PM`, `11:12AM`) |
 | `{{health}}` | `185/220` | current HP / permanent max HP |
 | `{{health_percent}}` | `84%` | derived from `{{health}}`, clamped 0–100 |
 | `{{radiation}}` | `23 rads` | RadiationRads actor value |
@@ -77,8 +78,12 @@ Raw payloads are also visible in `%LOCALAPPDATA%\chasm\bridge\traces\` (enable
 `request_tracing` in `native_debug.cfg`) — each turn's `metadata` should carry
 a well-formed `macros` object.
 
-## Out of scope (deliberately)
+## Production injection (scenario-scoped)
 
-The macros are **not** injected into any real NPC prompt yet — the engine runs
-only in the Gamestate tester. Where substitution eventually hooks into
-production prompt assembly is a separate, later decision.
+The **global scenario** template (chasm's Globals → Scenario page) resolves
+through this engine every turn and is injected into each NPC's prompt at the
+scenario slot — that is the production surface for these macros today. chasm
+additionally computes `{{participants}}` (the player + the other group NPCs,
+excluding the prompted speaker) for that template; it is backend-derived, not
+part of the plugin's table above. Cards / lore / other system prompts still
+substitute nothing — widening the surface is a separate, later decision.

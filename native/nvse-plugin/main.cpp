@@ -29,9 +29,18 @@
 #include <dsound.h>
 #include <mmsystem.h>
 #include <winhttp.h>
+// Persona capture: read the presented frame off the game's own D3D9 device
+// (header-only COM vtable calls; no d3d9.lib import needed) and JPEG-encode it
+// with GDI+ on a background thread. objidl.h supplies IStream for gdiplus.
+#include <d3d9.h>
+#include <objidl.h>
+#include <gdiplus.h>
+#include <memory>
 
 #pragma comment(lib, "winmm.lib")
 #pragma comment(lib, "winhttp.lib")
+#pragma comment(lib, "gdiplus.lib")
+#pragma comment(lib, "ole32.lib")
 
 #include "common/ITypes.h"
 #include "nvse/containers.h"
@@ -552,6 +561,18 @@ struct DebugConfig
     DWORD stackBootstrapCooldownMs = kStackBootstrapCooldownMs;
     std::string stackLauncherPath;
     std::string bridgeRootPath;
+    // --- Player persona capture (docs/persona.md). Uploads use http_host /
+    // http_port regardless of `transport` (chasm's HTTP server runs even when
+    // dialogue turns ride the file bridge). ---
+    bool personaEnabled = true;              // master switch for the whole feature
+    bool personaScreenshotEnabled = true;    // false = stats-only uploads (no camera swing)
+    std::string personaHttpPath = "/api/game/v1/persona";
+    DWORD personaPollIntervalMs = 3000;      // fingerprint re-check cadence while idle
+    DWORD personaDebounceMs = 30000;         // min gap between capture sequences
+    float personaCameraDistanceUnits = 140.0f; // flycam distance in front of the player
+    float personaCameraHeightUnits = 110.0f;   // flycam height above the player's feet
+    int personaMaxImageWidth = 1280;         // downscale bound before JPEG encode
+    int personaJpegQuality = 85;             // GDI+ JPEG quality (30..100)
 };
 
 RuntimeState g_state;
@@ -677,6 +698,9 @@ void ResetTextInputKeyWatcher();
 void ClearTextInputKeyWatcher();
 void LoadDebugConfigIfNeeded(bool force = false);
 void WriteRuntimeHeartbeatIfNeeded(bool force = false);
+void UpdatePersonaCapture();
+void AbortPersonaSequenceOnInterrupt(const char* reason);
+void ResetPersonaStateForSession();
 void TraceRequestEvent(const std::string& requestId, const std::string& stage,
     const std::vector<std::pair<std::string, std::string>>& stringFields = {},
     const std::vector<std::pair<std::string, double>>& numberFields = {},
@@ -2725,7 +2749,19 @@ void WriteDefaultDebugConfigIfMissing()
         << "transport=file\r\n"
         << "http_host=127.0.0.1\r\n"
         << "http_port=7341\r\n"
-        << "http_turn_path=/api/game/v1/turn\r\n";
+        << "http_turn_path=/api/game/v1/turn\r\n"
+        << "# Player persona capture (docs/persona.md): on stat/equipment changes, snap a\r\n"
+        << "# front screenshot + stats snapshot and POST them to chasm (http_host:http_port,\r\n"
+        << "# used even when transport=file). persona_screenshot=0 sends stats only.\r\n"
+        << "persona=1\r\n"
+        << "persona_screenshot=1\r\n"
+        << "persona_http_path=/api/game/v1/persona\r\n"
+        << "persona_poll_interval_ms=3000\r\n"
+        << "persona_debounce_ms=30000\r\n"
+        << "persona_camera_distance_units=140.0\r\n"
+        << "persona_camera_height_units=110.0\r\n"
+        << "persona_max_image_width=1280\r\n"
+        << "persona_jpeg_quality=85\r\n";
 }
 
 void LoadDebugConfigIfNeeded(bool force)
@@ -2957,6 +2993,69 @@ void LoadDebugConfigIfNeeded(bool force)
             if (!value.empty() && value[0] == '/')
             {
                 config.httpTurnPath = value;
+            }
+        }
+        else if (key == "persona")
+        {
+            config.personaEnabled = ParseConfigBool(value, config.personaEnabled);
+        }
+        else if (key == "persona_screenshot")
+        {
+            config.personaScreenshotEnabled = ParseConfigBool(value, config.personaScreenshotEnabled);
+        }
+        else if (key == "persona_http_path")
+        {
+            if (!value.empty() && value[0] == '/')
+            {
+                config.personaHttpPath = value;
+            }
+        }
+        else if (key == "persona_poll_interval_ms")
+        {
+            const int interval = std::atoi(value.c_str());
+            if (interval >= 500 && interval <= 60000)
+            {
+                config.personaPollIntervalMs = static_cast<DWORD>(interval);
+            }
+        }
+        else if (key == "persona_debounce_ms")
+        {
+            const int interval = std::atoi(value.c_str());
+            if (interval >= 5000 && interval <= 600000)
+            {
+                config.personaDebounceMs = static_cast<DWORD>(interval);
+            }
+        }
+        else if (key == "persona_camera_distance_units")
+        {
+            const float distance = static_cast<float>(std::atof(value.c_str()));
+            if (distance >= 40.0f && distance <= 600.0f)
+            {
+                config.personaCameraDistanceUnits = distance;
+            }
+        }
+        else if (key == "persona_camera_height_units")
+        {
+            const float height = static_cast<float>(std::atof(value.c_str()));
+            if (height >= 0.0f && height <= 300.0f)
+            {
+                config.personaCameraHeightUnits = height;
+            }
+        }
+        else if (key == "persona_max_image_width")
+        {
+            const int width = std::atoi(value.c_str());
+            if (width >= 320 && width <= 3840)
+            {
+                config.personaMaxImageWidth = width;
+            }
+        }
+        else if (key == "persona_jpeg_quality")
+        {
+            const int quality = std::atoi(value.c_str());
+            if (quality >= 30 && quality <= 100)
+            {
+                config.personaJpegQuality = quality;
             }
         }
     }
@@ -4278,22 +4377,15 @@ std::string BuildTimeOfDayMacro()
     }
     hour %= 24;
 
-    const char* label = "night";
-    if (hour >= 5 && hour < 12)
+    const char* meridiem = (hour < 12) ? "AM" : "PM";
+    int hour12 = hour % 12;
+    if (hour12 == 0)
     {
-        label = "morning";
-    }
-    else if (hour >= 12 && hour < 17)
-    {
-        label = "afternoon";
-    }
-    else if (hour >= 17 && hour < 21)
-    {
-        label = "evening";
+        hour12 = 12;
     }
 
     char buffer[32]{};
-    std::snprintf(buffer, sizeof(buffer), "%s (%02d:%02d)", label, hour, minute);
+    std::snprintf(buffer, sizeof(buffer), "%d:%02d%s", hour12, minute, meridiem);
     return buffer;
 }
 
@@ -11639,6 +11731,7 @@ void ResetRuntimeState()
 {
     LoadDebugConfigIfNeeded(true);
     CancelHttpTurn();
+    ResetPersonaStateForSession();
     AbortVoiceCapture("runtime_reset_voice", false);
     ReleaseConversationHold("runtime_reset");
     StopSpeechAnimation();
@@ -12975,6 +13068,965 @@ void UpdateVoiceCaptureHotkey()
     StartAmbientVoiceCapture();
 }
 
+// =====================================================================================
+// Player persona capture (frozen contract: docs/persona.md).
+//
+// Watches the stats the gamestate macros already read (SPECIAL / skills / perks /
+// level / name / equipped weapon / worn apparel) on a slow poll while the player is
+// idle in normal gameplay. When the "persona fingerprint" of those display strings
+// changes (and a >=30 s debounce has passed), the plugin:
+//
+//   1. snapshots the stats as JSON fields (the same display strings the macros send),
+//   2. swings the camera for a front view of the player using the engine's own
+//      flycam: `tm` (hide UI) + `tfc` via the JIP `Console` helper, then writes the
+//      flycam pose fields on PlayerCharacter directly (offsets below) so the camera
+//      sits personaCameraDistanceUnits in front of the player's facing, looking back,
+//   3. waits kPersonaSettleFrames frames for that view to be rendered + presented,
+//   4. reads the presented frame off the game's own IDirect3DDevice9 front buffer
+//      (crop to the game window's client rect), restores the camera + UI in the SAME
+//      hook invocation, and
+//   5. hands the pixels to a detached background thread that downscales, JPEG-encodes
+//      (GDI+), base64s, and POSTs `{stats..., image_format, image_base64}` to chasm's
+//      POST /api/game/v1/persona with bounded timeouts (fire-and-forget; a dead
+//      backend costs nothing but a log line). Capture failure still uploads stats
+//      (chasm falls back to stats-only persona generation).
+//
+// STEALTH, honestly: the player-visible artifact is ~kPersonaSettleFrames+1 frames
+// (~50-70 ms at 60 fps) of a HUD-less front-view camera cut, at most once per
+// debounce window, and only when the gates below say the player is idle (no combat,
+// no menus, no dialogue, no bridge turn in flight, no movement, not scoped, window
+// focused). It is a visible blink to an attentive player, not literally invisible —
+// a true off-screen re-render would need renderer re-entry, which is not worth the
+// crash risk in a live game. GetFrontBufferData also stalls the GPU for a few ms on
+// the capture frame (one-frame hitch, same cadence).
+//
+// Engine field offsets (Fallout: New Vegas 1.4.0.525) — cross-checked between the
+// xNVSE SDK's own PlayerCharacter comment block ("Used when entering FlyCam:
+// 7E8/7EC/7F0 stores Pos ... 7E0 stores RotZ, 7E4 RotX"; "Byte at DF0 seems to be
+// PlayerIsInCombat") and JIP LN NVSE's GameObjects.h (flycamZRot 7E0, flycamXRot
+// 7E4, flycamPos 7E8, isUsingScope 64F, pcInCombat DF0). The NiDX9Renderer
+// singleton + device offset come from JIP LN NVSE internal/netimmerse.h
+// (GetSingleton = *(NiDX9Renderer**)0x11F4748; IDirect3DDevice9* device at +0x288).
+// =====================================================================================
+
+constexpr UInt32 kNiDX9RendererSingletonAddress = 0x011F4748;
+constexpr UInt32 kNiDX9RendererDeviceOffset = 0x288;
+constexpr UInt32 kPlayerOffsetFlycamZRot = 0x7E0;
+constexpr UInt32 kPlayerOffsetFlycamXRot = 0x7E4;
+constexpr UInt32 kPlayerOffsetFlycamPos = 0x7E8;
+constexpr UInt32 kPlayerOffsetIsUsingScope = 0x64F;
+constexpr UInt32 kPlayerOffsetPcInCombat = 0xDF0;
+
+constexpr DWORD kPersonaGateStabilityMs = 1500;   // gates must hold this long before a capture
+constexpr DWORD kPersonaSequenceTimeoutMs = 2000; // watchdog on the whole swing
+constexpr int kPersonaSettleFrames = 3;           // frames between swing and grab
+constexpr int kPersonaRestoreMaxAttempts = 180;   // ~3 s of per-frame restore retries
+constexpr float kPersonaPi = 3.14159265358979323846f;
+
+enum class PersonaStage
+{
+    Idle,     // watching for stat changes
+    Settle,   // camera swung; waiting for the front view to be presented
+    Restore,  // undoing tfc/tm (normally completes in the capture frame itself)
+};
+
+struct PersonaCaptureRuntime
+{
+    PersonaStage stage = PersonaStage::Idle;
+    bool hidHud = false;             // we toggled `tm` and owe a re-toggle
+    bool enteredFlycam = false;      // we toggled `tfc` and owe a re-toggle
+    int settleFramesRemaining = 0;
+    int restoreAttemptsRemaining = 0;
+    DWORD sequenceStartTick = 0;
+    DWORD lastPollTick = 0;
+    DWORD lastSequenceTick = 0;      // debounce anchor
+    DWORD gatesSatisfiedSinceTick = 0;
+    bool levelUpVisibleLastFrame = false;
+    bool fingerprintLoaded = false;
+    std::string lastSentFingerprint; // last fingerprint chasm ACKed (persisted)
+    std::string pendingFingerprint;  // fingerprint of the in-flight capture
+    std::string pendingStatsJson;    // inner JSON fields snapped at trigger time
+    std::string pendingTrigger;
+};
+
+PersonaCaptureRuntime g_persona;
+// Upload handshake: the detached sender thread only touches these atomics (and its
+// own moved-in data). The game thread commits the fingerprint on success.
+std::atomic<bool> g_personaSendInFlight{ false };
+std::atomic<int> g_personaSendResult{ 0 }; // 0 none, 1 success, -1 failure
+
+fs::path PersonaFingerprintPath()
+{
+    return BridgeDir() / "persona_fingerprint.txt";
+}
+
+// The stats the persona reacts to, as one separator-joined string. Segment order is
+// load-bearing for ClassifyPersonaTrigger: name, level, SPECIAL, skills, perks,
+// weapon, apparel.
+std::string BuildPersonaFingerprint(PlayerCharacter* player)
+{
+    std::ostringstream out;
+    out << GetDisplayNameSafe(player) << '\x1F'
+        << static_cast<int>(player->avOwner.Fn_0A()) << '\x1F'
+        << BuildSpecialMacro(player) << '\x1F'
+        << BuildSkillsMacro(player) << '\x1F'
+        << BuildPerksMacro(player) << '\x1F'
+        << GetDisplayNameSafe(player->GetEquippedWeapon()) << '\x1F'
+        << BuildEquippedApparelMacro(player);
+    return out.str();
+}
+
+std::vector<std::string> SplitPersonaFingerprint(const std::string& fingerprint)
+{
+    std::vector<std::string> segments;
+    std::string::size_type start = 0;
+    for (;;)
+    {
+        const std::string::size_type sep = fingerprint.find('\x1F', start);
+        if (sep == std::string::npos)
+        {
+            segments.push_back(fingerprint.substr(start));
+            return segments;
+        }
+        segments.push_back(fingerprint.substr(start, sep - start));
+        start = sep + 1;
+    }
+}
+
+// Which persona trigger a fingerprint change represents (docs/persona.md):
+// initial (no previous), level_up, stats_changed, equipment_changed.
+std::string ClassifyPersonaTrigger(const std::string& previous, const std::string& current)
+{
+    if (previous.empty())
+    {
+        return "initial";
+    }
+    const std::vector<std::string> before = SplitPersonaFingerprint(previous);
+    const std::vector<std::string> after = SplitPersonaFingerprint(current);
+    if (before.size() != 7 || after.size() != 7)
+    {
+        return "stats_changed";
+    }
+    if (before[1] != after[1])
+    {
+        return "level_up";
+    }
+    if (before[0] != after[0] || before[2] != after[2] || before[3] != after[3] || before[4] != after[4])
+    {
+        return "stats_changed";
+    }
+    if (before[5] != after[5] || before[6] != after[6])
+    {
+        return "equipment_changed";
+    }
+    return "stats_changed";
+}
+
+// The capture's stats snapshot as JSON object FIELDS (no braces) so the sender
+// thread can splice the image fields in. Keys are the frozen vocabulary of
+// docs/persona.md; every value is the same display string the gamestate macros
+// send, and any unreadable field is omitted (the backend tolerates absence).
+std::string BuildPersonaStatsJsonFields(PlayerCharacter* player, const std::string& trigger)
+{
+    std::ostringstream out;
+    bool first = true;
+    AppendJsonMacro(out, first, "captured_at", NowIsoUtc());
+    AppendJsonMacro(out, first, "trigger", trigger);
+    AppendJsonMacro(out, first, "player_name", GetDisplayNameSafe(player));
+    const int level = static_cast<int>(player->avOwner.Fn_0A());
+    if (level > 0)
+    {
+        AppendJsonMacro(out, first, "level", std::to_string(level));
+    }
+    AppendJsonMacro(out, first, "special", BuildSpecialMacro(player));
+    AppendJsonMacro(out, first, "skills", BuildSkillsMacro(player));
+    AppendJsonMacro(out, first, "perks", BuildPerksMacro(player));
+    AppendJsonMacro(out, first, "equipped_weapon", GetDisplayNameSafe(player->GetEquippedWeapon()));
+    AppendJsonMacro(out, first, "equipped_apparel", BuildEquippedApparelMacro(player));
+    const LocationSnapshot location = CapturePlayerLocation();
+    std::string locationLabel = location.minor;
+    if (!location.major.empty())
+    {
+        if (!locationLabel.empty())
+        {
+            locationLabel += ", ";
+        }
+        locationLabel += location.major;
+    }
+    AppendJsonMacro(out, first, "location", locationLabel);
+    return out.str();
+}
+
+template <typename T>
+T ReadPlayerRaw(const PlayerCharacter* player, UInt32 offset)
+{
+    return *reinterpret_cast<const T*>(reinterpret_cast<const BYTE*>(player) + offset);
+}
+
+// Any menu other than the HUD itself (Pip-Boy, dialogue, barter, level-up, loading,
+// main menu...) blocks persona capture.
+bool AnyBlockingMenuVisible()
+{
+    for (UInt32 menuType = kMenuType_Min; menuType <= kMenuType_Max; ++menuType)
+    {
+        if (menuType == kMenuType_HUDMain)
+        {
+            continue;
+        }
+        if (IsMenuVisible(menuType))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+// True when the player is idle in normal gameplay: no combat, no menus, no
+// dialogue/bridge activity, no save-sync, not scoped, not moving, alive. The
+// caller has already checked window focus + loadedIntoGame.
+bool PersonaGatesSatisfied(PlayerCharacter* player)
+{
+    if (g_state.awaitingInput || g_state.awaitingReply || g_state.awaitingVoiceReply)
+    {
+        return false;
+    }
+    if (g_state.voiceCapture.active || g_state.conversationHold.active || g_state.saveStateSyncPending)
+    {
+        return false;
+    }
+    if (HasQueuedOrPlayingReply() || IsTextInputMenuActive() || AnyBlockingMenuVisible())
+    {
+        return false;
+    }
+    if (ReadPlayerRaw<UInt8>(player, kPlayerOffsetPcInCombat) != 0)
+    {
+        return false;
+    }
+    if (ReadPlayerRaw<UInt8>(player, kPlayerOffsetIsUsingScope) != 0)
+    {
+        return false;
+    }
+    if (ReadPlayerActorValueInt(player, eActorVal_Health) <= 0)
+    {
+        return false;
+    }
+    if (player->actorMover)
+    {
+        const UInt32 movementFlags = player->GetMovementFlags();
+        constexpr UInt32 kMovingMask = (1u << 7) | (1u << 8) | (1u << 11); // walking / running / swimming
+        if ((movementFlags & kMovingMask) != 0)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Point the flycam at the player: personaCameraDistanceUnits in front of their
+// facing at personaCameraHeightUnits above their feet, yawed 180 degrees back.
+// Bethesda heading convention: forward = (sin rotZ, cos rotZ). Written every
+// settle frame so stray mouse input cannot drift the pose.
+void ApplyPersonaFlycamPose(PlayerCharacter* player)
+{
+    const float yaw = player->rotZ;
+    const float distance = g_debugConfig.personaCameraDistanceUnits;
+    const float height = g_debugConfig.personaCameraHeightUnits;
+
+    BYTE* base = reinterpret_cast<BYTE*>(player);
+    float* flycamZRot = reinterpret_cast<float*>(base + kPlayerOffsetFlycamZRot);
+    float* flycamXRot = reinterpret_cast<float*>(base + kPlayerOffsetFlycamXRot);
+    float* flycamPos = reinterpret_cast<float*>(base + kPlayerOffsetFlycamPos);
+
+    flycamPos[0] = player->posX + std::sin(yaw) * distance;
+    flycamPos[1] = player->posY + std::cos(yaw) * distance;
+    flycamPos[2] = player->posZ + height;
+
+    float back = yaw + kPersonaPi;
+    if (back >= 2.0f * kPersonaPi)
+    {
+        back -= 2.0f * kPersonaPi;
+    }
+    *flycamZRot = back;
+    *flycamXRot = 0.0f; // level pitch
+}
+
+IDirect3DDevice9* GetGameD3D9Device()
+{
+    BYTE* renderer = *reinterpret_cast<BYTE**>(kNiDX9RendererSingletonAddress);
+    if (!renderer)
+    {
+        return nullptr;
+    }
+    return *reinterpret_cast<IDirect3DDevice9**>(renderer + kNiDX9RendererDeviceOffset);
+}
+
+// Copies the currently PRESENTED frame (what the player sees) into a tightly
+// packed BGRA buffer, cropped to the game window's client area. Runs on the game
+// thread (the game's D3D9 device is not created multithreaded). Returns false on
+// any failure — the capture then degrades to a stats-only upload.
+bool CapturePresentedFramePixels(std::vector<BYTE>& outBgra, int& outWidth, int& outHeight)
+{
+    outBgra.clear();
+    outWidth = 0;
+    outHeight = 0;
+
+    IDirect3DDevice9* device = GetGameD3D9Device();
+    if (!device)
+    {
+        LogLine("Persona capture: D3D9 device unavailable.");
+        return false;
+    }
+
+    D3DDISPLAYMODE mode{};
+    if (FAILED(device->GetDisplayMode(0, &mode)) || mode.Width == 0 || mode.Height == 0)
+    {
+        LogLine("Persona capture: GetDisplayMode failed.");
+        return false;
+    }
+
+    IDirect3DSurface9* surface = nullptr;
+    if (FAILED(device->CreateOffscreenPlainSurface(mode.Width, mode.Height, D3DFMT_A8R8G8B8,
+            D3DPOOL_SYSTEMMEM, &surface, nullptr)) || !surface)
+    {
+        LogLine("Persona capture: offscreen surface creation failed.");
+        return false;
+    }
+
+    const HRESULT frontBufferResult = device->GetFrontBufferData(0, surface);
+    if (FAILED(frontBufferResult))
+    {
+        surface->Release();
+        LogLine("Persona capture: GetFrontBufferData failed (0x%08lX).", static_cast<unsigned long>(frontBufferResult));
+        return false;
+    }
+
+    // GetFrontBufferData returns the whole display; crop to the game window's
+    // client rect (which IS the display in exclusive fullscreen / borderless).
+    LONG left = 0;
+    LONG top = 0;
+    LONG width = static_cast<LONG>(mode.Width);
+    LONG height = static_cast<LONG>(mode.Height);
+    HWND gameWindow = GetGameWindow();
+    RECT client{};
+    POINT origin{ 0, 0 };
+    if (gameWindow && GetClientRect(gameWindow, &client) && client.right > client.left &&
+        client.bottom > client.top && ClientToScreen(gameWindow, &origin))
+    {
+        LONG monitorLeft = 0;
+        LONG monitorTop = 0;
+        MONITORINFO monitorInfo{};
+        monitorInfo.cbSize = sizeof(monitorInfo);
+        HMONITOR monitor = MonitorFromWindow(gameWindow, MONITOR_DEFAULTTONEAREST);
+        if (monitor && GetMonitorInfoW(monitor, &monitorInfo))
+        {
+            monitorLeft = monitorInfo.rcMonitor.left;
+            monitorTop = monitorInfo.rcMonitor.top;
+        }
+        left = origin.x - monitorLeft;
+        top = origin.y - monitorTop;
+        width = client.right - client.left;
+        height = client.bottom - client.top;
+    }
+    left = (std::max)(0L, (std::min)(left, static_cast<LONG>(mode.Width) - 1));
+    top = (std::max)(0L, (std::min)(top, static_cast<LONG>(mode.Height) - 1));
+    width = (std::min)(width, static_cast<LONG>(mode.Width) - left);
+    height = (std::min)(height, static_cast<LONG>(mode.Height) - top);
+    if (width < 64 || height < 64)
+    {
+        surface->Release();
+        LogLine("Persona capture: window crop degenerate (%ldx%ld).", width, height);
+        return false;
+    }
+
+    D3DLOCKED_RECT locked{};
+    if (FAILED(surface->LockRect(&locked, nullptr, D3DLOCK_READONLY)) || !locked.pBits)
+    {
+        surface->Release();
+        LogLine("Persona capture: LockRect failed.");
+        return false;
+    }
+
+    outBgra.resize(static_cast<size_t>(width) * static_cast<size_t>(height) * 4u);
+    const BYTE* pixels = static_cast<const BYTE*>(locked.pBits);
+    for (LONG row = 0; row < height; ++row)
+    {
+        std::memcpy(outBgra.data() + static_cast<size_t>(row) * width * 4u,
+            pixels + static_cast<size_t>(top + row) * locked.Pitch + static_cast<size_t>(left) * 4u,
+            static_cast<size_t>(width) * 4u);
+    }
+    surface->UnlockRect();
+    surface->Release();
+
+    outWidth = static_cast<int>(width);
+    outHeight = static_cast<int>(height);
+    return true;
+}
+
+// --- JPEG encoding (GDI+; sender thread only) ----------------------------------------
+
+bool EnsureGdiplusStarted()
+{
+    static std::once_flag s_once;
+    static bool s_started = false;
+    std::call_once(s_once, [] {
+        Gdiplus::GdiplusStartupInput input;
+        ULONG_PTR token = 0;
+        s_started = Gdiplus::GdiplusStartup(&token, &input, nullptr) == Gdiplus::Ok;
+        // The token is deliberately never shut down: GDI+ stays for the process.
+    });
+    return s_started;
+}
+
+bool GetJpegEncoderClsid(CLSID& outClsid)
+{
+    UINT count = 0;
+    UINT bytes = 0;
+    if (Gdiplus::GetImageEncodersSize(&count, &bytes) != Gdiplus::Ok || bytes == 0)
+    {
+        return false;
+    }
+    std::vector<BYTE> buffer(bytes);
+    auto* encoders = reinterpret_cast<Gdiplus::ImageCodecInfo*>(buffer.data());
+    if (Gdiplus::GetImageEncoders(count, bytes, encoders) != Gdiplus::Ok)
+    {
+        return false;
+    }
+    for (UINT index = 0; index < count; ++index)
+    {
+        if (encoders[index].MimeType && wcscmp(encoders[index].MimeType, L"image/jpeg") == 0)
+        {
+            outClsid = encoders[index].Clsid;
+            return true;
+        }
+    }
+    return false;
+}
+
+// Downscales (bounded by maxWidth) and JPEG-encodes a tightly packed BGRA frame.
+// `bgra` must stay alive for the duration (the source Bitmap wraps it in place).
+bool EncodeBgraToJpeg(std::vector<BYTE>& bgra, int width, int height, int maxWidth, int quality,
+    std::vector<BYTE>& outJpeg)
+{
+    outJpeg.clear();
+    if (bgra.empty() || width <= 0 || height <= 0 || !EnsureGdiplusStarted())
+    {
+        return false;
+    }
+
+    // PixelFormat32bppRGB = B,G,R,pad byte order in memory — exactly the
+    // D3DFMT_A8R8G8B8 layout (the front buffer's alpha is garbage; ignore it).
+    Gdiplus::Bitmap source(width, height, width * 4, PixelFormat32bppRGB, bgra.data());
+    if (source.GetLastStatus() != Gdiplus::Ok)
+    {
+        return false;
+    }
+
+    Gdiplus::Bitmap* toSave = &source;
+    std::unique_ptr<Gdiplus::Bitmap> scaled;
+    if (maxWidth > 0 && width > maxWidth)
+    {
+        const int destWidth = maxWidth;
+        const int destHeight = (std::max)(1, static_cast<int>(
+            (static_cast<long long>(height) * destWidth + width / 2) / width));
+        scaled = std::make_unique<Gdiplus::Bitmap>(destWidth, destHeight, PixelFormat24bppRGB);
+        if (scaled->GetLastStatus() != Gdiplus::Ok)
+        {
+            return false;
+        }
+        Gdiplus::Graphics graphics(scaled.get());
+        graphics.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+        graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+        if (graphics.DrawImage(&source, Gdiplus::Rect(0, 0, destWidth, destHeight),
+                0, 0, width, height, Gdiplus::UnitPixel) != Gdiplus::Ok)
+        {
+            return false;
+        }
+        toSave = scaled.get();
+    }
+
+    CLSID jpegClsid{};
+    if (!GetJpegEncoderClsid(jpegClsid))
+    {
+        return false;
+    }
+
+    IStream* stream = nullptr;
+    if (FAILED(CreateStreamOnHGlobal(nullptr, TRUE, &stream)) || !stream)
+    {
+        return false;
+    }
+
+    ULONG qualityValue = static_cast<ULONG>((std::max)(30, (std::min)(100, quality)));
+    Gdiplus::EncoderParameters parameters{};
+    parameters.Count = 1;
+    parameters.Parameter[0].Guid = Gdiplus::EncoderQuality;
+    parameters.Parameter[0].Type = Gdiplus::EncoderParameterValueTypeLong;
+    parameters.Parameter[0].NumberOfValues = 1;
+    parameters.Parameter[0].Value = &qualityValue;
+
+    bool ok = toSave->Save(stream, &jpegClsid, &parameters) == Gdiplus::Ok;
+    if (ok)
+    {
+        HGLOBAL hglobal = nullptr;
+        ok = SUCCEEDED(GetHGlobalFromStream(stream, &hglobal)) && hglobal;
+        if (ok)
+        {
+            const SIZE_T size = GlobalSize(hglobal);
+            const void* bytes = GlobalLock(hglobal);
+            if (bytes && size > 0)
+            {
+                outJpeg.assign(static_cast<const BYTE*>(bytes), static_cast<const BYTE*>(bytes) + size);
+                GlobalUnlock(hglobal);
+            }
+            else
+            {
+                ok = false;
+            }
+        }
+    }
+    stream->Release();
+    return ok && !outJpeg.empty();
+}
+
+// --- HTTP upload (sender thread only) -------------------------------------------------
+
+// One bounded POST; success = HTTP 2xx. Mirrors RunHttpTurn's WinHTTP usage minus
+// the streaming (the persona response is one small JSON object).
+bool PostPersonaCapture(const std::string& url, const std::string& body, std::string& outSummary)
+{
+    URL_COMPONENTS components{};
+    components.dwStructSize = sizeof(components);
+    wchar_t hostName[256] = { 0 };
+    wchar_t urlPath[2048] = { 0 };
+    components.lpszHostName = hostName;
+    components.dwHostNameLength = static_cast<DWORD>(std::size(hostName));
+    components.lpszUrlPath = urlPath;
+    components.dwUrlPathLength = static_cast<DWORD>(std::size(urlPath));
+
+    const std::wstring wideUrl = Utf8ToWide(url);
+    if (!WinHttpCrackUrl(wideUrl.c_str(), 0, 0, &components))
+    {
+        outSummary = "URL parse failed";
+        return false;
+    }
+
+    HINTERNET session = WinHttpOpen(L"FNVBridgeNative/1.0",
+        WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!session)
+    {
+        outSummary = "session open failed";
+        return false;
+    }
+    WinHttpSetTimeouts(session, 5000, 5000, 15000, 20000);
+
+    bool ok = false;
+    std::ostringstream summary;
+    HINTERNET connection = WinHttpConnect(session, components.lpszHostName, components.nPort, 0);
+    HINTERNET request = nullptr;
+    if (!connection)
+    {
+        summary << "connect failed (is chasm running?)";
+    }
+    else
+    {
+        const DWORD secureFlag = (components.nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0;
+        request = WinHttpOpenRequest(connection, L"POST", components.lpszUrlPath,
+            nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, secureFlag);
+        if (!request)
+        {
+            summary << "request open failed";
+        }
+        else if (!WinHttpSendRequest(request, L"Content-Type: application/json\r\n", static_cast<DWORD>(-1),
+                     const_cast<char*>(body.data()), static_cast<DWORD>(body.size()),
+                     static_cast<DWORD>(body.size()), 0))
+        {
+            summary << "send failed (is chasm running?)";
+        }
+        else if (!WinHttpReceiveResponse(request, nullptr))
+        {
+            summary << "response receive failed";
+        }
+        else
+        {
+            DWORD statusCode = 0;
+            DWORD statusSize = sizeof(statusCode);
+            WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusSize, WINHTTP_NO_HEADER_INDEX);
+
+            std::string responseBody;
+            DWORD available = 0;
+            while (WinHttpQueryDataAvailable(request, &available) && available > 0 && responseBody.size() < 2048)
+            {
+                std::string buffer(available, '\0');
+                DWORD read = 0;
+                if (!WinHttpReadData(request, buffer.data(), available, &read) || read == 0)
+                {
+                    break;
+                }
+                responseBody.append(buffer.data(), read);
+            }
+
+            ok = statusCode >= 200 && statusCode < 300;
+            summary << "HTTP " << statusCode;
+            if (!responseBody.empty())
+            {
+                summary << " " << Trim(responseBody).substr(0, 200);
+            }
+        }
+    }
+
+    if (request)
+    {
+        WinHttpCloseHandle(request);
+    }
+    if (connection)
+    {
+        WinHttpCloseHandle(connection);
+    }
+    WinHttpCloseHandle(session);
+    outSummary = summary.str();
+    return ok;
+}
+
+// Fire-and-forget upload on a detached thread: JPEG-encode (when pixels exist),
+// base64, splice the image fields into the stats snapshot, POST. The thread only
+// touches its own moved-in data, LogLine (already called from the HTTP turn worker
+// thread today), and the two persona atomics — never game state. Detached on
+// purpose: a hung POST can never wedge game exit; process teardown reaps it.
+void StartPersonaUpload(std::string statsJsonFields, std::vector<BYTE> bgra, int width, int height)
+{
+    if (g_personaSendInFlight.exchange(true))
+    {
+        return; // one upload at a time; the fingerprint stays unsent -> retried later
+    }
+
+    std::ostringstream url;
+    url << "http://" << g_debugConfig.httpHost << ":" << g_debugConfig.httpPort
+        << g_debugConfig.personaHttpPath;
+
+    const int maxWidth = g_debugConfig.personaMaxImageWidth;
+    const int quality = g_debugConfig.personaJpegQuality;
+
+    std::thread([statsJsonFields = std::move(statsJsonFields), bgra = std::move(bgra),
+                    width, height, url = url.str(), maxWidth, quality]() mutable {
+        std::string imageBase64;
+        if (!bgra.empty())
+        {
+            std::vector<BYTE> jpeg;
+            if (EncodeBgraToJpeg(bgra, width, height, maxWidth, quality, jpeg))
+            {
+                imageBase64 = EncodeBase64(jpeg.data(), jpeg.size());
+            }
+            else
+            {
+                LogLine("Persona upload: JPEG encode failed; sending stats only.");
+            }
+        }
+
+        std::ostringstream body;
+        body << "{" << statsJsonFields;
+        if (!imageBase64.empty())
+        {
+            // base64 uses a JSON-safe alphabet; no escaping needed.
+            body << ",\"image_format\":\"jpeg\",\"image_base64\":\"" << imageBase64 << "\"";
+        }
+        body << "}";
+
+        std::string summary;
+        const bool ok = PostPersonaCapture(url, body.str(), summary);
+        LogLine("Persona upload %s (%s, image=%s).", ok ? "succeeded" : "failed",
+            summary.c_str(), imageBase64.empty() ? "none" : "jpeg");
+        g_personaSendResult.store(ok ? 1 : -1);
+        g_personaSendInFlight.store(false);
+    }).detach();
+}
+
+// --- The capture sequence (game thread) -----------------------------------------------
+
+// Undo `tfc` / `tm` (retrying on console failure) and go Idle when both are undone.
+void TryPersonaRestore(PlayerCharacter* player)
+{
+    if (g_persona.enteredFlycam && ExecuteConsoleCommand(player, "tfc"))
+    {
+        g_persona.enteredFlycam = false;
+    }
+    if (!g_persona.enteredFlycam && g_persona.hidHud && ExecuteConsoleCommand(player, "tm"))
+    {
+        g_persona.hidHud = false;
+    }
+    if (!g_persona.enteredFlycam && !g_persona.hidHud)
+    {
+        g_persona.stage = PersonaStage::Idle;
+        return;
+    }
+    g_persona.stage = PersonaStage::Restore;
+    if (--g_persona.restoreAttemptsRemaining <= 0)
+    {
+        LogLine("Persona: FAILED to restore camera/HUD after capture (flycam=%d hud_hidden=%d) - player visible!",
+            g_persona.enteredFlycam ? 1 : 0, g_persona.hidHud ? 1 : 0);
+        g_persona.enteredFlycam = false;
+        g_persona.hidHud = false;
+        g_persona.stage = PersonaStage::Idle;
+    }
+}
+
+// Ends the sequence: optionally grabs the presented frame FIRST, then restores the
+// camera/HUD in this same hook invocation, then hands off the upload. Every abort
+// path still uploads the stats snapshot (chasm generates stats-only personas).
+void FinishPersonaSequence(PlayerCharacter* player, bool captureFrame, const char* abortReason)
+{
+    std::vector<BYTE> bgra;
+    int width = 0;
+    int height = 0;
+    if (captureFrame && !CapturePresentedFramePixels(bgra, width, height))
+    {
+        bgra.clear();
+        width = 0;
+        height = 0;
+    }
+
+    g_persona.restoreAttemptsRemaining = kPersonaRestoreMaxAttempts;
+    TryPersonaRestore(player); // normally completes right here, same frame
+
+    if (abortReason)
+    {
+        LogLine("Persona: capture sequence aborted (%s); uploading stats only.", abortReason);
+    }
+    else
+    {
+        LogLine("Persona: captured %dx%d frame (trigger=%s).", width, height, g_persona.pendingTrigger.c_str());
+    }
+
+    StartPersonaUpload(std::move(g_persona.pendingStatsJson), std::move(bgra), width, height);
+    g_persona.pendingStatsJson.clear();
+}
+
+// Trigger: snapshot stats, then (when screenshots are enabled) hide the HUD, enter
+// the flycam, and pose it in front of the player. The settle countdown lets the
+// engine render + present the swung view before the grab.
+void BeginPersonaSequence(PlayerCharacter* player, const std::string& fingerprint, DWORD now)
+{
+    g_persona.pendingFingerprint = fingerprint;
+    g_persona.pendingTrigger = ClassifyPersonaTrigger(g_persona.lastSentFingerprint, fingerprint);
+    g_persona.pendingStatsJson = BuildPersonaStatsJsonFields(player, g_persona.pendingTrigger);
+    g_persona.lastSequenceTick = now;
+    g_persona.sequenceStartTick = now;
+    g_persona.hidHud = false;
+    g_persona.enteredFlycam = false;
+
+    if (!g_debugConfig.personaScreenshotEnabled)
+    {
+        LogLine("Persona: screenshots disabled; uploading stats only (trigger=%s).",
+            g_persona.pendingTrigger.c_str());
+        StartPersonaUpload(std::move(g_persona.pendingStatsJson), {}, 0, 0);
+        g_persona.pendingStatsJson.clear();
+        return;
+    }
+
+    g_persona.hidHud = ExecuteConsoleCommand(player, "tm");
+    g_persona.enteredFlycam = ExecuteConsoleCommand(player, "tfc");
+    if (!g_persona.enteredFlycam)
+    {
+        LogLine("Persona: tfc unavailable; uploading stats only.");
+        g_persona.restoreAttemptsRemaining = kPersonaRestoreMaxAttempts;
+        TryPersonaRestore(player); // undoes tm if it went through
+        StartPersonaUpload(std::move(g_persona.pendingStatsJson), {}, 0, 0);
+        g_persona.pendingStatsJson.clear();
+        return;
+    }
+
+    ApplyPersonaFlycamPose(player);
+    g_persona.stage = PersonaStage::Settle;
+    g_persona.settleFramesRemaining = kPersonaSettleFrames;
+    LogLine("Persona: capture sequence started (trigger=%s).", g_persona.pendingTrigger.c_str());
+}
+
+// Interrupt hook for abnormal paths (window focus loss mid-sequence): restore
+// immediately and drop the pending capture; the un-updated fingerprint retries
+// after the debounce window.
+void AbortPersonaSequenceOnInterrupt(const char* reason)
+{
+    if (g_persona.stage == PersonaStage::Idle)
+    {
+        return;
+    }
+    // Called every frame in some paths (e.g. while the window stays unfocused):
+    // only log + arm the retry budget on the Settle -> Restore transition, then
+    // let the bounded per-frame retries run.
+    if (g_persona.stage != PersonaStage::Restore)
+    {
+        LogLine("Persona: sequence interrupted (%s).", reason);
+        g_persona.pendingStatsJson.clear();
+        g_persona.restoreAttemptsRemaining = kPersonaRestoreMaxAttempts;
+    }
+    PlayerCharacter* player = GetPlayer();
+    if (player)
+    {
+        TryPersonaRestore(player);
+    }
+    else
+    {
+        g_persona.enteredFlycam = false;
+        g_persona.hidHud = false;
+        g_persona.stage = PersonaStage::Idle;
+    }
+}
+
+// Session reset (load / new game / exit to menu): drop all transient state WITHOUT
+// console calls (the world may be mid-teardown). The engine rebuilds camera/UI
+// state on load anyway; the only residue risk is the ~3-frame window where a
+// sequence was live exactly when the session ended.
+void ResetPersonaStateForSession()
+{
+    g_persona.stage = PersonaStage::Idle;
+    g_persona.hidHud = false;
+    g_persona.enteredFlycam = false;
+    g_persona.settleFramesRemaining = 0;
+    g_persona.restoreAttemptsRemaining = 0;
+    g_persona.sequenceStartTick = 0;
+    g_persona.lastPollTick = 0;
+    g_persona.gatesSatisfiedSinceTick = 0;
+    g_persona.levelUpVisibleLastFrame = false;
+    g_persona.pendingFingerprint.clear();
+    g_persona.pendingStatsJson.clear();
+    g_persona.pendingTrigger.clear();
+    // lastSentFingerprint / fingerprintLoaded survive: they mirror the on-disk
+    // record of what chasm last ACKed, which is session-independent.
+}
+
+void EnsurePersonaFingerprintLoaded()
+{
+    if (g_persona.fingerprintLoaded)
+    {
+        return;
+    }
+    g_persona.fingerprintLoaded = true;
+    std::ifstream in(PersonaFingerprintPath(), std::ios::binary);
+    if (!in)
+    {
+        return;
+    }
+    g_persona.lastSentFingerprint.assign(
+        (std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+}
+
+// Per-frame driver, called from OnMainGameLoop once loadedIntoGame + player are
+// established. Never blocks: all heavy work (encode/POST) lives on the sender
+// thread; the only game-thread cost is the capture frame's GetFrontBufferData.
+void UpdatePersonaCapture()
+{
+    PlayerCharacter* player = GetPlayer();
+    if (!player)
+    {
+        return;
+    }
+
+    const DWORD now = GetTickCount();
+
+    // Commit the sender thread's verdict: success persists the fingerprint (so
+    // restarts don't re-fire); failure leaves it unsent for a debounced retry.
+    switch (g_personaSendResult.exchange(0))
+    {
+    case 1:
+        g_persona.lastSentFingerprint = g_persona.pendingFingerprint;
+        WriteTextFileIfChanged(PersonaFingerprintPath(), g_persona.lastSentFingerprint);
+        break;
+    case -1:
+        // Nothing to do: lastSentFingerprint stays stale, so the change is
+        // re-detected and re-sent after the debounce window.
+        break;
+    default:
+        break;
+    }
+
+    if (!g_debugConfig.personaEnabled)
+    {
+        if (g_persona.stage != PersonaStage::Idle)
+        {
+            AbortPersonaSequenceOnInterrupt("persona disabled mid-sequence");
+        }
+        return;
+    }
+
+    // Level-up menu close forces an immediate re-poll (debounce still applies).
+    const bool levelUpVisible = IsMenuVisible(kMenuType_LevelUp);
+    if (g_persona.levelUpVisibleLastFrame && !levelUpVisible)
+    {
+        g_persona.lastPollTick = 0;
+    }
+    g_persona.levelUpVisibleLastFrame = levelUpVisible;
+
+    // Drive an in-flight sequence.
+    if (g_persona.stage == PersonaStage::Settle)
+    {
+        if ((now - g_persona.sequenceStartTick) > kPersonaSequenceTimeoutMs)
+        {
+            FinishPersonaSequence(player, false, "sequence watchdog timeout");
+            return;
+        }
+        if (!PersonaGatesSatisfied(player))
+        {
+            FinishPersonaSequence(player, false, "idle gates broke during settle");
+            return;
+        }
+        ApplyPersonaFlycamPose(player); // re-assert against mouse drift
+        if (--g_persona.settleFramesRemaining > 0)
+        {
+            return;
+        }
+        FinishPersonaSequence(player, true, nullptr);
+        return;
+    }
+    if (g_persona.stage == PersonaStage::Restore)
+    {
+        // Retry undoing tfc/tm until it sticks (bounded by restoreAttemptsRemaining).
+        TryPersonaRestore(player);
+        return;
+    }
+
+    // Idle watch: gates must hold continuously before we trust the moment.
+    if (!PersonaGatesSatisfied(player))
+    {
+        g_persona.gatesSatisfiedSinceTick = 0;
+        return;
+    }
+    if (g_persona.gatesSatisfiedSinceTick == 0)
+    {
+        g_persona.gatesSatisfiedSinceTick = now;
+        return;
+    }
+    if ((now - g_persona.gatesSatisfiedSinceTick) < kPersonaGateStabilityMs)
+    {
+        return;
+    }
+
+    if (g_personaSendInFlight.load())
+    {
+        return; // one capture end-to-end at a time
+    }
+
+    if (g_persona.lastPollTick != 0 && (now - g_persona.lastPollTick) < g_debugConfig.personaPollIntervalMs)
+    {
+        return;
+    }
+    g_persona.lastPollTick = now;
+
+    EnsurePersonaFingerprintLoaded();
+
+    const std::string fingerprint = BuildPersonaFingerprint(player);
+    if (fingerprint.empty() || fingerprint == g_persona.lastSentFingerprint)
+    {
+        return;
+    }
+
+    if (g_persona.lastSequenceTick != 0 && (now - g_persona.lastSequenceTick) < g_debugConfig.personaDebounceMs)
+    {
+        return; // debounce a burst of changes into one capture
+    }
+
+    BeginPersonaSequence(player, fingerprint, now);
+}
+
 void OnMainGameLoop()
 {
     const bool gameWindowFocused = GameWindowHasFocus();
@@ -13004,6 +14056,7 @@ void OnMainGameLoop()
         {
             AbortVoiceCapture("voice_capture_focus_lost", false);
         }
+        AbortPersonaSequenceOnInterrupt("game window focus lost");
         return;
     }
 
@@ -13047,6 +14100,7 @@ void OnMainGameLoop()
     UpdateVoiceBootstrapStatus();
     LoadDebugConfigIfNeeded(false);
     PollNativeActionCommands();
+    UpdatePersonaCapture();
     // --- perf instrumentation (temporary): time the lip-sync + streaming phases to
     // locate the in-game speech lag, logged via "frame_perf_slow" trace events. ---
     static double s_perfAnimMs = 0.0;
