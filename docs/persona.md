@@ -118,63 +118,59 @@ these have held for ≥ 1.5 s continuously:
   input, no voice capture, no conversation hold, no save-sync pending
 - not walking/running/swimming
 
-## Screenshot behavior — what "stealth" really means here
+## Screenshot behavior — a true off-screen render, nothing visible
 
-Technique (engine-native, no renderer hooks):
+The portrait is **not** a screen capture. The plugin renders the player's
+3rd-person model into a **private Direct3D render target** the screen never
+sees — the game camera, the HUD, and the presented frame are untouched. There
+is no camera cut, no blink, no hitch the player can perceive. The model is
+**isolated on a flat studio background** (the world is never drawn).
 
-1. `tm` (hide all UI) and `tfc` (engine flycam) via the JIP `Console` helper
-   the plugin already uses for script commands.
-2. The flycam pose is written directly to `PlayerCharacter`'s flycam fields
-   (offsets 0x7E0 rotZ / 0x7E4 rotX / 0x7E8 pos — cross-checked between the
-   xNVSE SDK's annotations and JIP LN NVSE's headers, FNV 1.4.0.525):
-   `persona_camera_distance_units` (140) in front of the player's facing at
-   `persona_camera_height_units` (110) above their feet, yawed back at the
-   player, level pitch. The pose is re-asserted every settle frame so mouse
-   input cannot drift it.
-3. After 3 settle frames (so the swung view has actually been rendered AND
-   presented), the plugin copies the **front buffer** from the game's own
-   `IDirect3DDevice9` (`NiDX9Renderer` singleton `0x11F4748`, device at
-   `+0x288`), cropped to the game window's client rect — this works in
-   exclusive fullscreen, borderless, and windowed, and it captures exactly
-   what the player sees (including ENB-style post-processing).
-4. Camera and HUD are restored **in the same frame** as the grab; JPEG
-   encode + base64 + POST happen on the background sender thread.
+Technique (one game-thread pass per capture):
 
-**Honest artifact accounting** (there is no free lunch without re-entering the
-renderer, which is not worth the crash risk):
+1. Walk the player's scene graph (`player->GetNiNode()` — the 3rd-person
+   skeleton, maintained by the engine even in first person; this is exactly
+   how player shadows are rendered by graphics extenders). Collect every
+   tri-shape/tri-strips under it. The walk is SEH-guarded: a bad engine
+   pointer aborts the capture, never the game.
+2. CPU-skin each skinned mesh from the **live skeleton pose** using the
+   engine's own skinning data (`NiSkinData` bone weights + per-bone
+   skin-to-bone transforms composed with the bones' world transforms). The
+   skin layout is validated at runtime before it is trusted; a mesh that
+   fails validation falls back to bind pose + node transform, logged.
+3. Draw everything fixed-function textured (each mesh's own diffuse texture,
+   alpha-tested for hair/lashes) into a `persona_portrait_size`-tall 3:4
+   render target cleared to neutral gray, viewed by a synthetic camera
+   `persona_camera_distance_units` (220) in front of the player's facing at
+   eye height `persona_camera_height_units` (100), aimed at the model's
+   bound center, `persona_portrait_fov_deg` (48) vertical FOV.
+4. Read the target back (private surface — no front-buffer stall), then JPEG
+   encode + base64 + POST on the background sender thread. Every device
+   state touched is saved and restored around the pass (state block + render
+   target/depth/viewport).
 
-- The player can see **~4 frames (~65 ms at 60 fps) of a HUD-less, front-view
-  camera cut**, at most once per debounce window, only while idle by the gates
-  above. It reads as a brief blink; an attentive player WILL occasionally
-  notice it. It is not literally invisible.
-- `GetFrontBufferData` stalls the GPU for a few ms on the grab frame — a
-  one-frame hitch at the same cadence.
-- During those frames, movement/mouse input briefly steers the (frozen)
-  flycam instead of the player — practically irrelevant because captures only
-  fire after 1.5 s of standing still.
-- Aborts (combat starts, a menu opens, focus lost, watchdog at 2 s) restore
-  camera/HUD immediately and **still upload the stats snapshot**, so the
-  backend can regenerate a stats-only persona.
-- If `tfc` cannot be issued (JIP missing — not a supported configuration) or
-  the D3D9 read fails, the capture degrades to stats-only, silently for the
-  player.
+Artifact accounting: **none visible.** The pass costs ~1–3 ms of game-thread
+time (CPU skinning + a few hundred draw calls + readback) at most once per
+debounce window. ENB post-processing is NOT captured (the portrait is a raw
+model render, which is a feature: clean, evenly lit, no bloom/DoF).
 
 Residual risks, stated plainly:
 
-- The restore is console-driven (`tfc`/`tm` re-toggles). If a console call
-  fails, the plugin retries every frame (~3 s worth) and then logs loudly; a
-  session reset (save load) also rebuilds camera/UI state engine-side. A game
-  crash in the exact 4-frame window could theoretically leave `tm` latched
-  until the next load — never observed, but the pairing is blind toggling.
-- If the player stands facing a wall, the flycam can clip into geometry and
-  the shot shows the wall/void. The vision model still gets *something*; the
-  stats snapshot is unaffected. No raycast correction is attempted (yet).
-- If the player is already in `tfc` (screenarcher workflows), a capture would
-  exit and re-enter their flycam and move it. The movement gates make this
-  unlikely (flycam users are actively flying) but it is possible.
+- Engine struct offsets (scene graph, skinning, texture plumbing) are
+  reverse-engineered constants (cross-checked between TESReloaded's NEWVEGAS
+  headers and JIP LN NVSE, FNV 1.4.0.525). A mismatch shows up as a wrong or
+  empty portrait plus a log line — never a crash (SEH + runtime validation).
+- If the portrait renders **mirrored** (left/right flipped), set
+  `persona_portrait_mirror=1`. One calibration look at the first real
+  screenshot settles it.
+- Fixed-function fullbright rendering: no normal maps, no scene lighting —
+  the portrait looks like a character-viewer preview, not an in-world photo.
+  For the vision model this is strictly better (nothing to confuse it).
+- Meshes whose diffuse texture cannot be resolved draw flat gray (logged as
+  `textured` vs `geometries` counts in `bridge/native_plugin.log`).
 - The camera frames a standing humanoid at default distances; extreme scales
   or seated/knocked-down poses may frame imperfectly (tunable via
-  `persona_camera_*_units`).
+  `persona_camera_*_units`, `persona_portrait_fov_deg`).
 
 ## Config (`native_debug.cfg`)
 
@@ -185,8 +181,11 @@ Residual risks, stated plainly:
 | `persona_capture_on_autosave` | `0` | `1` = autosaves (door transitions, waits...) trigger captures too |
 | `persona_http_path` | `/api/game/v1/persona` | POST path on `http_host:http_port` |
 | `persona_debounce_ms` | `30000` | min gap between capture sequences (5000–600000) |
-| `persona_camera_distance_units` | `140.0` | flycam distance in front of the player (40–600) |
-| `persona_camera_height_units` | `110.0` | flycam height above the player's feet (0–300) |
+| `persona_camera_distance_units` | `220.0` | portrait camera distance in front of the player (40–600) |
+| `persona_camera_height_units` | `100.0` | portrait camera eye height above the player's feet (0–300) |
+| `persona_portrait_size` | `1024` | offscreen portrait height; width is 3/4 of it (256–2048) |
+| `persona_portrait_fov_deg` | `48.0` | portrait camera vertical FOV in degrees (15–100) |
+| `persona_portrait_mirror` | `0` | set `1` if the portrait renders left/right mirrored |
 | `persona_max_image_width` | `1280` | downscale bound before JPEG encode (320–3840) |
 | `persona_jpeg_quality` | `85` | GDI+ JPEG quality (30–100) |
 
@@ -221,7 +220,7 @@ is ignored if present.)
 
 1. Rebuild + install the plugin DLL, start chasm, load a save. Stand still
    (out of combat, no menus) and **quicksave** — within ~2 s you should see a
-   barely-perceptible camera blink, and within ~30 s the **Persona** page
+   with nothing visible on screen at all, and within ~30 s the **Persona** page
    shows the fresh front screenshot, the stats, the generation prompt
    (collapsible, below the stats), and a new ONE-paragraph description.
 2. Quicksave again immediately → nothing (debounce, logged). Quicksave after

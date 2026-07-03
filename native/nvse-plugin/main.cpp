@@ -569,8 +569,11 @@ struct DebugConfig
     bool personaCaptureOnAutosave = false;   // let autosaves (door transitions...) trigger too
     std::string personaHttpPath = "/api/game/v1/persona";
     DWORD personaDebounceMs = 30000;         // min gap between capture sequences (quicksave spam)
-    float personaCameraDistanceUnits = 140.0f; // flycam distance in front of the player
-    float personaCameraHeightUnits = 110.0f;   // flycam height above the player's feet
+    float personaCameraDistanceUnits = 220.0f; // portrait camera distance in front of the player
+    float personaCameraHeightUnits = 100.0f;   // portrait camera eye height above the player's feet
+    int personaPortraitSize = 1024;          // offscreen portrait height (width = 3/4 of this)
+    float personaPortraitFovDeg = 48.0f;     // portrait camera vertical FOV (degrees)
+    bool personaPortraitMirror = false;      // flip horizontally if the render comes out mirrored
     int personaMaxImageWidth = 1280;         // downscale bound before JPEG encode
     int personaJpegQuality = 85;             // GDI+ JPEG quality (30..100)
 };
@@ -699,7 +702,6 @@ void ClearTextInputKeyWatcher();
 void LoadDebugConfigIfNeeded(bool force = false);
 void WriteRuntimeHeartbeatIfNeeded(bool force = false);
 void UpdatePersonaCapture();
-void AbortPersonaSequenceOnInterrupt(const char* reason);
 void ResetPersonaStateForSession();
 void TraceRequestEvent(const std::string& requestId, const std::string& stage,
     const std::vector<std::pair<std::string, std::string>>& stringFields = {},
@@ -2751,16 +2753,21 @@ void WriteDefaultDebugConfigIfMissing()
         << "http_port=7341\r\n"
         << "http_turn_path=/api/game/v1/turn\r\n"
         << "# Player persona capture (docs/persona.md): when the game is saved (quicksave or\r\n"
-        << "# manual save), snap a front screenshot + stats snapshot and POST them to chasm\r\n"
+        << "# manual save), render the player model OFF-SCREEN (isolated, blank background -\r\n"
+        << "# nothing visible in-game) + snap a stats snapshot and POST them to chasm\r\n"
         << "# (http_host:http_port, used even when transport=file). persona_screenshot=0\r\n"
         << "# sends stats only; persona_capture_on_autosave=1 lets autosaves trigger too.\r\n"
+        << "# persona_portrait_mirror=1 flips the portrait if it renders mirrored.\r\n"
         << "persona=1\r\n"
         << "persona_screenshot=1\r\n"
         << "persona_capture_on_autosave=0\r\n"
         << "persona_http_path=/api/game/v1/persona\r\n"
         << "persona_debounce_ms=30000\r\n"
-        << "persona_camera_distance_units=140.0\r\n"
-        << "persona_camera_height_units=110.0\r\n"
+        << "persona_camera_distance_units=220.0\r\n"
+        << "persona_camera_height_units=100.0\r\n"
+        << "persona_portrait_size=1024\r\n"
+        << "persona_portrait_fov_deg=48.0\r\n"
+        << "persona_portrait_mirror=0\r\n"
         << "persona_max_image_width=1280\r\n"
         << "persona_jpeg_quality=85\r\n";
 }
@@ -3038,6 +3045,26 @@ void LoadDebugConfigIfNeeded(bool force)
             {
                 config.personaCameraHeightUnits = height;
             }
+        }
+        else if (key == "persona_portrait_size")
+        {
+            const int size = std::atoi(value.c_str());
+            if (size >= 256 && size <= 2048)
+            {
+                config.personaPortraitSize = size;
+            }
+        }
+        else if (key == "persona_portrait_fov_deg")
+        {
+            const float fov = static_cast<float>(std::atof(value.c_str()));
+            if (fov >= 15.0f && fov <= 100.0f)
+            {
+                config.personaPortraitFovDeg = fov;
+            }
+        }
+        else if (key == "persona_portrait_mirror")
+        {
+            config.personaPortraitMirror = value == "1" || value == "true";
         }
         else if (key == "persona_max_image_width")
         {
@@ -13081,74 +13108,52 @@ void UpdateVoiceCaptureHotkey()
 // screenshot -> fresh description). When a capture runs, the plugin:
 //
 //   1. snapshots the stats as JSON fields (the same display strings the macros send),
-//   2. swings the camera for a front view of the player using the engine's own
-//      flycam: `tm` (hide UI) + `tfc` via the JIP `Console` helper, then writes the
-//      flycam pose fields on PlayerCharacter directly (offsets below) so the camera
-//      sits personaCameraDistanceUnits in front of the player's facing, looking back,
-//   3. waits kPersonaSettleFrames frames for that view to be rendered + presented,
-//   4. reads the presented frame off the game's own IDirect3DDevice9 front buffer
-//      (crop to the game window's client rect), restores the camera + UI in the SAME
-//      hook invocation, and
-//   5. hands the pixels to a detached background thread that downscales, JPEG-encodes
-//      (GDI+), base64s, and POSTs `{stats..., image_format, image_base64}` to chasm's
-//      POST /api/game/v1/persona with bounded timeouts (fire-and-forget; a dead
-//      backend costs nothing but a log line). Capture failure still uploads stats
-//      (chasm falls back to stats-only persona generation).
+//   2. renders the player's 3rd-person model OFF-SCREEN: it walks the player's
+//      scene-graph subtree (player->GetNiNode() — maintained by the engine even in
+//      first person; this is how player shadows work), CPU-skins the skinned
+//      tri-shapes from the live skeleton pose, and draws everything fixed-function
+//      textured into a PRIVATE render target cleared to a flat studio background,
+//      viewed by a synthetic camera placed in front of the player's facing. The
+//      visible frame, the game camera, and the HUD are never touched — the player
+//      sees NOTHING, and the portrait has a clean blank background (the model is
+//      isolated; the world is never drawn),
+//   3. reads the private target back and hands the pixels to a detached background
+//      thread that downscales, JPEG-encodes (GDI+), base64s, and POSTs
+//      `{stats..., image_format, image_base64}` to chasm's POST /api/game/v1/persona
+//      with bounded timeouts (fire-and-forget; a dead backend costs nothing but a
+//      log line). Any render failure still uploads stats (chasm falls back to
+//      stats-only persona generation), and the scene-graph pass is SEH-guarded so a
+//      bad pointer aborts the capture instead of the game.
 //
-// STEALTH, honestly: the player-visible artifact is ~kPersonaSettleFrames+1 frames
-// (~50-70 ms at 60 fps) of a HUD-less front-view camera cut, at most once per
-// debounce window, and only when the gates below say the player is idle (no combat,
-// no menus, no dialogue, no bridge turn in flight, no movement, not scoped, window
-// focused). It is a visible blink to an attentive player, not literally invisible —
-// a true off-screen re-render would need renderer re-entry, which is not worth the
-// crash risk in a live game. GetFrontBufferData also stalls the GPU for a few ms on
-// the capture frame (one-frame hitch, same cadence).
+// Cost, honestly: one-time CPU skinning + ~a few hundred draw calls on the game
+// thread (~1-3 ms) at most once per debounce window, plus a GetRenderTargetData
+// readback of a private 1024-class surface (no front-buffer stall, no visible
+// artifact of any kind).
 //
-// Engine field offsets (Fallout: New Vegas 1.4.0.525) — cross-checked between the
-// xNVSE SDK's own PlayerCharacter comment block ("Used when entering FlyCam:
-// 7E8/7EC/7F0 stores Pos ... 7E0 stores RotZ, 7E4 RotX"; "Byte at DF0 seems to be
-// PlayerIsInCombat") and JIP LN NVSE's GameObjects.h (flycamZRot 7E0, flycamXRot
-// 7E4, flycamPos 7E8, isUsingScope 64F, pcInCombat DF0). The NiDX9Renderer
-// singleton + device offset come from JIP LN NVSE internal/netimmerse.h
-// (GetSingleton = *(NiDX9Renderer**)0x11F4748; IDirect3DDevice9* device at +0x288).
+// Engine layout sources (Fallout: New Vegas 1.4.0.525): the NiDX9Renderer singleton
+// + device offset from JIP LN NVSE internal/netimmerse.h (*(NiDX9Renderer**)0x11F4748,
+// device at +0x288); scene-graph/geometry/skinning layouts cross-checked between
+// TESReloaded's GameNi.h NEWVEGAS block and JIP LN NVSE internal/netimmerse.h (see
+// the portrait namespace below); isUsingScope 64F + pcInCombat DF0 from JIP
+// GameObjects.h, cross-checked against the xNVSE SDK comment block.
 // =====================================================================================
 
 constexpr UInt32 kNiDX9RendererSingletonAddress = 0x011F4748;
 constexpr UInt32 kNiDX9RendererDeviceOffset = 0x288;
-constexpr UInt32 kPlayerOffsetFlycamZRot = 0x7E0;
-constexpr UInt32 kPlayerOffsetFlycamXRot = 0x7E4;
-constexpr UInt32 kPlayerOffsetFlycamPos = 0x7E8;
 constexpr UInt32 kPlayerOffsetIsUsingScope = 0x64F;
 constexpr UInt32 kPlayerOffsetPcInCombat = 0xDF0;
 
 constexpr DWORD kPersonaGateStabilityMs = 1500;   // gates must hold this long before a capture
-constexpr DWORD kPersonaSequenceTimeoutMs = 2000; // watchdog on the whole swing
 constexpr DWORD kPersonaPendingMaxAgeMs = 5 * 60 * 1000; // pending save-capture -> stats-only after this
-constexpr int kPersonaSettleFrames = 3;           // frames between swing and grab
-constexpr int kPersonaRestoreMaxAttempts = 180;   // ~3 s of per-frame restore retries
 constexpr float kPersonaPi = 3.14159265358979323846f;
-
-enum class PersonaStage
-{
-    Idle,     // waiting for a save-triggered pending capture
-    Settle,   // camera swung; waiting for the front view to be presented
-    Restore,  // undoing tfc/tm (normally completes in the capture frame itself)
-};
 
 struct PersonaCaptureRuntime
 {
-    PersonaStage stage = PersonaStage::Idle;
-    bool hidHud = false;             // we toggled `tm` and owe a re-toggle
-    bool enteredFlycam = false;      // we toggled `tfc` and owe a re-toggle
-    int settleFramesRemaining = 0;
-    int restoreAttemptsRemaining = 0;
-    DWORD sequenceStartTick = 0;
     DWORD lastSequenceTick = 0;      // debounce anchor (also set by stats-only expiry uploads)
     DWORD gatesSatisfiedSinceTick = 0;
     bool capturePending = false;     // a save fired; capture when the gates next allow
     DWORD pendingSinceTick = 0;      // when the save fired (drives the stats-only expiry)
     std::string pendingTrigger;      // "save" | "quicksave" | "autosave"
-    std::string pendingStatsJson;    // inner JSON fields snapped at sequence start
 };
 
 PersonaCaptureRuntime g_persona;
@@ -13317,32 +13322,810 @@ bool PersonaGatesSatisfied(PlayerCharacter* player)
     return true;
 }
 
-// Point the flycam at the player: personaCameraDistanceUnits in front of their
-// facing at personaCameraHeightUnits above their feet, yawed 180 degrees back.
-// Bethesda heading convention: forward = (sin rotZ, cos rotZ). Written every
-// settle frame so stray mouse input cannot drift the pose.
-void ApplyPersonaFlycamPose(PlayerCharacter* player)
+// --- Offscreen player portrait renderer -----------------------------------------------
+//
+// Draws the player's 3rd-person model into a private render target — the screen,
+// game camera, and HUD are never involved. Minimal NEW VEGAS Gamebryo mirrors below;
+// every offset is cross-checked between TESReloaded GameNi.h (NEWVEGAS block) and
+// JIP LN NVSE internal/netimmerse.h. Field reads are raw offsets on purpose: the
+// xNVSE SDK's NiGeometry layout disagrees with both (it lacks the property state),
+// so we trust the two sources that ship working renderers against this executable.
+namespace portrait
 {
+
+struct NiRttiMirror
+{
+    const char* name;
+    NiRttiMirror* parent;
+};
+
+struct Mtx33
+{
+    float m[3][3];
+};
+
+struct Xform // NiTransform: 0x34 bytes
+{
+    Mtx33 rot;
+    float pos[3];
+    float scale;
+};
+
+// NiObject vtable slots (JIP: /*08*/GetType, /*0C*/GetNiNode, /*18*/GetNiGeometry,
+// /*1C*/GetTriBasedGeom, /*20*/GetTriStrips, /*24*/GetTriShape — each "returns this"
+// when the object IS that type, else null; slots 0/1 are the dtor + Free).
+enum : UInt32
+{
+    kVt_GetType = 2,
+    kVt_GetNiNode = 3,
+    kVt_GetTriBasedGeom = 7,
+    kVt_GetTriStrips = 8,
+    kVt_GetTriShape = 9,
+};
+
+using VtFn = void*(__thiscall*)(void*);
+
+inline void* VCall(void* obj, UInt32 slot)
+{
+    if (!obj)
+    {
+        return nullptr;
+    }
+    VtFn* vtbl = *reinterpret_cast<VtFn**>(obj);
+    if (!vtbl)
+    {
+        return nullptr;
+    }
+    return vtbl[slot](obj);
+}
+
+inline const char* RttiName(void* obj)
+{
+    auto* rtti = static_cast<NiRttiMirror*>(VCall(obj, kVt_GetType));
+    return (rtti && rtti->name) ? rtti->name : "";
+}
+
+template <typename T>
+inline T Read(const void* base, UInt32 offset)
+{
+    return *reinterpret_cast<const T*>(static_cast<const BYTE*>(base) + offset);
+}
+
+// NiAVObject / NiNode / NiGeometry field offsets (NV).
+constexpr UInt32 kOffAvWorldXform = 0x68;   // NiTransform m_worldTransform
+constexpr UInt32 kOffAvWorldBound = 0x20;   // NiSphere { float x,y,z,radius }
+constexpr UInt32 kOffNodeChildren = 0x9C;   // NiTArray<NiAVObject*>: data +4, capacity(UInt16) +8
+constexpr UInt32 kOffGeoPropState = 0x9C;   // NiProperty* prop[6]; 3 = shader, 5 = texturing
+constexpr UInt32 kOffGeoData = 0xB8;        // NiGeometryData*
+constexpr UInt32 kOffGeoSkin = 0xBC;        // NiSkinInstance*
+// NiGeometryData.
+constexpr UInt32 kOffGdNumVerts = 0x08;     // UInt16
+constexpr UInt32 kOffGdVertices = 0x20;     // NiVector3*
+constexpr UInt32 kOffGdUvCoords = 0x2C;     // NiPoint2*
+// NiTriShapeData / NiTriStripsData.
+constexpr UInt32 kOffTsNumTris = 0x40;      // UInt16 (NiTriBasedGeomData)
+constexpr UInt32 kOffTsTriangles = 0x48;    // UInt16 triples
+constexpr UInt32 kOffStNumStrips = 0x44;    // UInt16
+constexpr UInt32 kOffStStripLengths = 0x48; // UInt16*
+constexpr UInt32 kOffStStrips = 0x4C;       // UInt16* (concatenated)
+// NiSkinInstance.
+constexpr UInt32 kOffSiSkinData = 0x08;     // NiSkinData*
+constexpr UInt32 kOffSiBoneObjects = 0x14;  // NiAVObject**
+constexpr UInt32 kOffSiBoneCount = 0x1C;    // UInt32
+// NiSkinData: BoneData* at 0x40, bone count at 0x44. BoneData is the natural
+// packing of { NiTransform skinToBone; NiPoint3 center; float radius;
+// BoneVertData* weights; UInt16 numVerts; } = 0x4C stride (TESReloaded's comment
+// offsets for this struct are internally inconsistent; the field ORDER is theirs,
+// the packing is arithmetic). Validated at runtime before use — see below.
+constexpr UInt32 kOffSdBoneData = 0x40;
+constexpr UInt32 kOffSdBoneCount = 0x44;
+constexpr UInt32 kBoneDataStride = 0x4C;
+constexpr UInt32 kOffBdSkinToBone = 0x00;
+constexpr UInt32 kOffBdWeights = 0x44;
+constexpr UInt32 kOffBdNumVerts = 0x48;
+
+struct BoneVertData // MSVC default packing: 8 bytes
+{
+    UInt16 vertIndex;
+    UInt16 pad;
+    float weight;
+};
+
+// Texture plumbing: NiTexture::rendererData at 0x24 -> NiDX9TextureData::dTexture
+// at 0x64. BSShaderPPLightingProperty keeps NiTexture** srcTextures[6] at 0xAC
+// (slot 0 = diffuse); BSShaderNoLightingProperty keeps NiTexture* at 0x60;
+// classic NiTexturingProperty keeps NiTArray<Map*> at 0x1C with Map::srcTexture
+// at 0x08 (map 0 = base).
+constexpr UInt32 kOffTexRendererData = 0x24;
+constexpr UInt32 kOffTexDataDTexture = 0x64;
+constexpr UInt32 kOffPplSrcTextures = 0xAC;
+constexpr UInt32 kOffNolSrcTexture = 0x60;
+constexpr UInt32 kOffTexPropMaps = 0x1C;
+constexpr UInt32 kOffMapSrcTexture = 0x08;
+
+inline void XformPoint(const Xform& t, const float in[3], float out[3])
+{
+    const float x = in[0] * t.scale;
+    const float y = in[1] * t.scale;
+    const float z = in[2] * t.scale;
+    out[0] = t.rot.m[0][0] * x + t.rot.m[0][1] * y + t.rot.m[0][2] * z + t.pos[0];
+    out[1] = t.rot.m[1][0] * x + t.rot.m[1][1] * y + t.rot.m[1][2] * z + t.pos[1];
+    out[2] = t.rot.m[2][0] * x + t.rot.m[2][1] * y + t.rot.m[2][2] * z + t.pos[2];
+}
+
+// out = a ∘ b (apply b first, then a).
+inline void ComposeXform(const Xform& a, const Xform& b, Xform& out)
+{
+    for (int r = 0; r < 3; ++r)
+    {
+        for (int c = 0; c < 3; ++c)
+        {
+            out.rot.m[r][c] = a.rot.m[r][0] * b.rot.m[0][c] + a.rot.m[r][1] * b.rot.m[1][c] +
+                a.rot.m[r][2] * b.rot.m[2][c];
+        }
+    }
+    XformPoint(a, b.pos, out.pos);
+    out.scale = a.scale * b.scale;
+}
+
+struct Vtx
+{
+    float x, y, z;
+    float u, v;
+};
+
+// One drawable extracted from the scene graph (plain data; device-ready).
+struct DrawItem
+{
+    std::vector<Vtx> vertices;
+    std::vector<UInt16> indices;      // triangle list
+    std::vector<UInt16> stripLengths; // when non-empty: indices holds concatenated strips
+    IDirect3DBaseTexture9* texture = nullptr;
+};
+
+struct ExtractStats
+{
+    int geometries = 0;
+    int skinned = 0;
+    int bindPoseFallbacks = 0;
+    int textured = 0;
+    int skippedNoData = 0;
+};
+
+IDirect3DBaseTexture9* DiffuseTextureOf(void* geo)
+{
+    void* shaderProp = Read<void*>(geo, kOffGeoPropState + 3 * 4);
+    if (shaderProp)
+    {
+        const char* rtti = RttiName(shaderProp);
+        void* niTexture = nullptr;
+        if (std::strstr(rtti, "PPLighting") || std::strstr(rtti, "Lighting30"))
+        {
+            void** diffuseSlot = Read<void**>(shaderProp, kOffPplSrcTextures);
+            if (diffuseSlot)
+            {
+                niTexture = *diffuseSlot;
+            }
+        }
+        else if (std::strstr(rtti, "NoLighting"))
+        {
+            niTexture = Read<void*>(shaderProp, kOffNolSrcTexture);
+        }
+        if (niTexture)
+        {
+            void* rendererData = Read<void*>(niTexture, kOffTexRendererData);
+            if (rendererData)
+            {
+                return Read<IDirect3DBaseTexture9*>(rendererData, kOffTexDataDTexture);
+            }
+        }
+    }
+    void* texProp = Read<void*>(geo, kOffGeoPropState + 5 * 4);
+    if (texProp)
+    {
+        void** maps = Read<void**>(texProp, kOffTexPropMaps + 4);
+        const UInt16 capacity = Read<UInt16>(texProp, kOffTexPropMaps + 8);
+        if (maps && capacity > 0 && maps[0])
+        {
+            void* srcTexture = Read<void*>(maps[0], kOffMapSrcTexture);
+            if (srcTexture)
+            {
+                void* rendererData = Read<void*>(srcTexture, kOffTexRendererData);
+                if (rendererData)
+                {
+                    return Read<IDirect3DBaseTexture9*>(rendererData, kOffTexDataDTexture);
+                }
+            }
+        }
+    }
+    return nullptr;
+}
+
+// Validates the assumed NiSkinData::BoneData layout against live data before
+// trusting it: every bone's weight list must be a readable array of plausible
+// (index < numVerts, 0 <= weight <= 1.02) entries. One failed bone rejects the
+// skin (that geometry falls back to bind pose + node transform).
+bool SkinLooksValid(void* skinData, UInt32 boneCount, UInt16 numVerts)
+{
+    const BYTE* boneData = Read<const BYTE*>(skinData, kOffSdBoneData);
+    if (!boneData || boneCount == 0 || boneCount > 256)
+    {
+        return false;
+    }
+    for (UInt32 b = 0; b < boneCount; ++b)
+    {
+        const BYTE* bone = boneData + b * kBoneDataStride;
+        const auto* weights = *reinterpret_cast<const BoneVertData* const*>(bone + kOffBdWeights);
+        const UInt16 boneVerts = *reinterpret_cast<const UInt16*>(bone + kOffBdNumVerts);
+        if (!weights || boneVerts == 0 || boneVerts > numVerts)
+        {
+            return false;
+        }
+        // Spot-check first + last entries (full scan happens during accumulation).
+        const BoneVertData& first = weights[0];
+        const BoneVertData& last = weights[boneVerts - 1];
+        if (first.vertIndex >= numVerts || last.vertIndex >= numVerts)
+        {
+            return false;
+        }
+        if (!(first.weight >= -0.01f && first.weight <= 1.02f) ||
+            !(last.weight >= -0.01f && last.weight <= 1.02f))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Extracts one geometry into a DrawItem: world-space positions (CPU-skinned when a
+// valid skin is present, else bind pose x node world transform), UVs, indices, and
+// the diffuse texture. Returns false when the geometry has nothing drawable.
+bool ExtractGeometry(void* geo, DrawItem& item, ExtractStats& stats)
+{
+    void* data = Read<void*>(geo, kOffGeoData);
+    if (!data)
+    {
+        ++stats.skippedNoData;
+        return false;
+    }
+    const UInt16 numVerts = Read<UInt16>(data, kOffGdNumVerts);
+    const float* bindVerts = Read<const float*>(data, kOffGdVertices);
+    const float* uvs = Read<const float*>(data, kOffGdUvCoords);
+    if (!numVerts || !bindVerts)
+    {
+        ++stats.skippedNoData;
+        return false;
+    }
+
+    // Indices first — no point skinning something we cannot draw.
+    if (VCall(geo, kVt_GetTriShape))
+    {
+        const UInt16 numTris = Read<UInt16>(data, kOffTsNumTris);
+        const UInt16* tris = Read<const UInt16*>(data, kOffTsTriangles);
+        if (!numTris || !tris)
+        {
+            ++stats.skippedNoData;
+            return false;
+        }
+        item.indices.assign(tris, tris + static_cast<size_t>(numTris) * 3);
+    }
+    else if (VCall(geo, kVt_GetTriStrips))
+    {
+        const UInt16 numStrips = Read<UInt16>(data, kOffStNumStrips);
+        const UInt16* lengths = Read<const UInt16*>(data, kOffStStripLengths);
+        const UInt16* strips = Read<const UInt16*>(data, kOffStStrips);
+        if (!numStrips || !lengths || !strips)
+        {
+            ++stats.skippedNoData;
+            return false;
+        }
+        size_t total = 0;
+        for (UInt16 s = 0; s < numStrips; ++s)
+        {
+            total += lengths[s];
+        }
+        if (!total || total > 200000)
+        {
+            ++stats.skippedNoData;
+            return false;
+        }
+        item.stripLengths.assign(lengths, lengths + numStrips);
+        item.indices.assign(strips, strips + total);
+    }
+    else
+    {
+        return false; // not a tri-based geometry (particles etc.)
+    }
+
+    // Positions: CPU skinning from the live skeleton pose when possible.
+    std::vector<float> world(static_cast<size_t>(numVerts) * 3, 0.0f);
+    bool skinned = false;
+    void* skin = Read<void*>(geo, kOffGeoSkin);
+    void* skinData = skin ? Read<void*>(skin, kOffSiSkinData) : nullptr;
+    if (skinData)
+    {
+        const UInt32 boneCount = Read<UInt32>(skinData, kOffSdBoneCount);
+        void** boneObjects = Read<void**>(skin, kOffSiBoneObjects);
+        const UInt32 instanceBones = Read<UInt32>(skin, kOffSiBoneCount);
+        if (boneObjects && instanceBones == boneCount && SkinLooksValid(skinData, boneCount, numVerts))
+        {
+            std::vector<float> accumulated(static_cast<size_t>(numVerts), 0.0f);
+            const BYTE* boneData = Read<const BYTE*>(skinData, kOffSdBoneData);
+            for (UInt32 b = 0; b < boneCount; ++b)
+            {
+                void* boneNode = boneObjects[b];
+                if (!boneNode)
+                {
+                    continue;
+                }
+                const Xform boneWorld = Read<Xform>(boneNode, kOffAvWorldXform);
+                const BYTE* bone = boneData + b * kBoneDataStride;
+                const Xform skinToBone = *reinterpret_cast<const Xform*>(bone + kOffBdSkinToBone);
+                Xform toWorld{};
+                ComposeXform(boneWorld, skinToBone, toWorld);
+                const auto* weights = *reinterpret_cast<const BoneVertData* const*>(bone + kOffBdWeights);
+                const UInt16 boneVerts = *reinterpret_cast<const UInt16*>(bone + kOffBdNumVerts);
+                for (UInt16 w = 0; w < boneVerts; ++w)
+                {
+                    const UInt16 index = weights[w].vertIndex;
+                    const float weight = weights[w].weight;
+                    if (index >= numVerts || weight <= 0.0f)
+                    {
+                        continue;
+                    }
+                    float p[3];
+                    XformPoint(toWorld, bindVerts + static_cast<size_t>(index) * 3, p);
+                    float* out = world.data() + static_cast<size_t>(index) * 3;
+                    out[0] += p[0] * weight;
+                    out[1] += p[1] * weight;
+                    out[2] += p[2] * weight;
+                    accumulated[index] += weight;
+                }
+            }
+            // Renormalize (weights should sum to ~1; guard drift) and catch
+            // unweighted verts.
+            const Xform geoWorld = Read<Xform>(geo, kOffAvWorldXform);
+            for (UInt16 v = 0; v < numVerts; ++v)
+            {
+                float* out = world.data() + static_cast<size_t>(v) * 3;
+                const float total = accumulated[v];
+                if (total > 0.05f)
+                {
+                    out[0] /= total;
+                    out[1] /= total;
+                    out[2] /= total;
+                }
+                else
+                {
+                    XformPoint(geoWorld, bindVerts + static_cast<size_t>(v) * 3, out);
+                }
+            }
+            skinned = true;
+            ++stats.skinned;
+        }
+    }
+    if (!skinned)
+    {
+        const Xform geoWorld = Read<Xform>(geo, kOffAvWorldXform);
+        for (UInt16 v = 0; v < numVerts; ++v)
+        {
+            XformPoint(geoWorld, bindVerts + static_cast<size_t>(v) * 3,
+                world.data() + static_cast<size_t>(v) * 3);
+        }
+        if (skinData)
+        {
+            ++stats.bindPoseFallbacks;
+        }
+    }
+
+    item.vertices.resize(numVerts);
+    for (UInt16 v = 0; v < numVerts; ++v)
+    {
+        Vtx& out = item.vertices[v];
+        const float* p = world.data() + static_cast<size_t>(v) * 3;
+        out.x = p[0];
+        out.y = p[1];
+        out.z = p[2];
+        out.u = uvs ? uvs[static_cast<size_t>(v) * 2] : 0.0f;
+        out.v = uvs ? uvs[static_cast<size_t>(v) * 2 + 1] : 0.0f;
+    }
+
+    item.texture = DiffuseTextureOf(geo);
+    if (item.texture)
+    {
+        ++stats.textured;
+    }
+    ++stats.geometries;
+    return true;
+}
+
+void CollectGeometry(void* avObject, std::vector<DrawItem>& items, ExtractStats& stats, int depth)
+{
+    if (!avObject || depth > 24 || items.size() >= 512)
+    {
+        return;
+    }
+    if (VCall(avObject, kVt_GetTriBasedGeom))
+    {
+        DrawItem item;
+        if (ExtractGeometry(avObject, item, stats))
+        {
+            items.push_back(std::move(item));
+        }
+        return;
+    }
+    if (!VCall(avObject, kVt_GetNiNode))
+    {
+        return;
+    }
+    void** children = Read<void**>(avObject, kOffNodeChildren + 4);
+    const UInt16 capacity = Read<UInt16>(avObject, kOffNodeChildren + 8);
+    if (!children)
+    {
+        return;
+    }
+    for (UInt16 i = 0; i < capacity; ++i)
+    {
+        if (children[i])
+        {
+            CollectGeometry(children[i], items, stats, depth + 1);
+        }
+    }
+}
+
+// SEH around the scene-graph pass: raw engine pointers are involved, and a wild
+// read must abort the capture, not the game. No unwindable locals in this frame.
+bool CollectGeometryGuarded(void* root, std::vector<DrawItem>* items, ExtractStats* stats)
+{
+    __try
+    {
+        CollectGeometry(root, *items, *stats, 0);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+// Row-vector 4x4 (D3D fixed-function convention).
+struct Mtx44
+{
+    float m[4][4];
+};
+
+inline void LookAt(const float eye[3], const float at[3], bool mirror, Mtx44& out)
+{
+    float f[3] = { at[0] - eye[0], at[1] - eye[1], at[2] - eye[2] };
+    const float fLen = std::sqrt(f[0] * f[0] + f[1] * f[1] + f[2] * f[2]);
+    if (fLen < 0.001f)
+    {
+        f[0] = 0.0f;
+        f[1] = 1.0f;
+        f[2] = 0.0f;
+    }
+    else
+    {
+        f[0] /= fLen;
+        f[1] /= fLen;
+        f[2] /= fLen;
+    }
+    const float up[3] = { 0.0f, 0.0f, 1.0f };
+    float r[3] = { up[1] * f[2] - up[2] * f[1], up[2] * f[0] - up[0] * f[2], up[0] * f[1] - up[1] * f[0] };
+    const float rLen = std::sqrt(r[0] * r[0] + r[1] * r[1] + r[2] * r[2]);
+    if (rLen < 0.001f)
+    {
+        r[0] = 1.0f;
+        r[1] = 0.0f;
+        r[2] = 0.0f;
+    }
+    else
+    {
+        r[0] /= rLen;
+        r[1] /= rLen;
+        r[2] /= rLen;
+    }
+    if (mirror)
+    {
+        r[0] = -r[0];
+        r[1] = -r[1];
+        r[2] = -r[2];
+    }
+    const float u[3] = { f[1] * r[2] - f[2] * r[1], f[2] * r[0] - f[0] * r[2], f[0] * r[1] - f[1] * r[0] };
+    out = {};
+    out.m[0][0] = r[0]; out.m[0][1] = u[0]; out.m[0][2] = f[0];
+    out.m[1][0] = r[1]; out.m[1][1] = u[1]; out.m[1][2] = f[1];
+    out.m[2][0] = r[2]; out.m[2][1] = u[2]; out.m[2][2] = f[2];
+    out.m[3][0] = -(r[0] * eye[0] + r[1] * eye[1] + r[2] * eye[2]);
+    out.m[3][1] = -(u[0] * eye[0] + u[1] * eye[1] + u[2] * eye[2]);
+    out.m[3][2] = -(f[0] * eye[0] + f[1] * eye[1] + f[2] * eye[2]);
+    out.m[3][3] = 1.0f;
+}
+
+inline void PerspectiveFov(float fovYRadians, float aspect, float zn, float zf, Mtx44& out)
+{
+    const float yScale = 1.0f / std::tan(fovYRadians * 0.5f);
+    out = {};
+    out.m[0][0] = yScale / aspect;
+    out.m[1][1] = yScale;
+    out.m[2][2] = zf / (zf - zn);
+    out.m[2][3] = 1.0f;
+    out.m[3][2] = -zn * zf / (zf - zn);
+}
+
+} // namespace portrait
+
+IDirect3DDevice9* GetGameD3D9Device();
+
+// Renders the player's isolated 3rd-person model to a private render target and
+// returns tightly packed BGRA pixels. Runs on the game thread. Returns false on
+// any failure — the capture then degrades to a stats-only upload.
+bool RenderPlayerPortraitPixels(PlayerCharacter* player, std::vector<BYTE>& outBgra,
+    int& outWidth, int& outHeight)
+{
+    outBgra.clear();
+    outWidth = 0;
+    outHeight = 0;
+
+    IDirect3DDevice9* device = GetGameD3D9Device();
+    if (!device)
+    {
+        LogLine("Persona portrait: D3D9 device unavailable.");
+        return false;
+    }
+    NiNode* root = player->GetNiNode();
+    if (!root)
+    {
+        LogLine("Persona portrait: player has no 3D loaded.");
+        return false;
+    }
+
+    const DWORD extractStart = GetTickCount();
+    std::vector<portrait::DrawItem> items;
+    portrait::ExtractStats stats;
+    if (!portrait::CollectGeometryGuarded(root, &items, &stats))
+    {
+        LogLine("Persona portrait: scene-graph pass faulted (SEH); capture aborted.");
+        return false;
+    }
+    if (items.empty())
+    {
+        LogLine("Persona portrait: no drawable geometry under the player node.");
+        return false;
+    }
+
+    // Camera: in front of the player's facing, aimed at the model's world bound
+    // center (falls back to pos + half height). Bethesda heading convention:
+    // forward = (sin rotZ, cos rotZ).
     const float yaw = player->rotZ;
     const float distance = g_debugConfig.personaCameraDistanceUnits;
-    const float height = g_debugConfig.personaCameraHeightUnits;
-
-    BYTE* base = reinterpret_cast<BYTE*>(player);
-    float* flycamZRot = reinterpret_cast<float*>(base + kPlayerOffsetFlycamZRot);
-    float* flycamXRot = reinterpret_cast<float*>(base + kPlayerOffsetFlycamXRot);
-    float* flycamPos = reinterpret_cast<float*>(base + kPlayerOffsetFlycamPos);
-
-    flycamPos[0] = player->posX + std::sin(yaw) * distance;
-    flycamPos[1] = player->posY + std::cos(yaw) * distance;
-    flycamPos[2] = player->posZ + height;
-
-    float back = yaw + kPersonaPi;
-    if (back >= 2.0f * kPersonaPi)
+    const float eyeHeight = g_debugConfig.personaCameraHeightUnits;
+    const float eye[3] = {
+        player->posX + std::sin(yaw) * distance,
+        player->posY + std::cos(yaw) * distance,
+        player->posZ + eyeHeight,
+    };
+    float at[3] = { player->posX, player->posY, player->posZ + eyeHeight * 0.82f };
+    const float boundCenterZ = portrait::Read<float>(root, portrait::kOffAvWorldBound + 8);
+    const float boundRadius = portrait::Read<float>(root, portrait::kOffAvWorldBound + 12);
+    if (boundRadius > 1.0f && boundRadius < 500.0f)
     {
-        back -= 2.0f * kPersonaPi;
+        at[0] = portrait::Read<float>(root, portrait::kOffAvWorldBound);
+        at[1] = portrait::Read<float>(root, portrait::kOffAvWorldBound + 4);
+        at[2] = boundCenterZ;
     }
-    *flycamZRot = back;
-    *flycamXRot = 0.0f; // level pitch
+
+    const int size = g_debugConfig.personaPortraitSize;
+    const int width = (size * 3) / 4; // portrait 3:4
+    const int height = size;
+
+    portrait::Mtx44 view;
+    portrait::LookAt(eye, at, g_debugConfig.personaPortraitMirror, view);
+    portrait::Mtx44 projection;
+    portrait::PerspectiveFov(g_debugConfig.personaPortraitFovDeg * (kPersonaPi / 180.0f),
+        static_cast<float>(width) / static_cast<float>(height), 8.0f, 4096.0f, projection);
+    portrait::Mtx44 identity{};
+    identity.m[0][0] = identity.m[1][1] = identity.m[2][2] = identity.m[3][3] = 1.0f;
+
+    // --- Device work: private target; every touched state saved + restored. ---
+    IDirect3DSurface9* previousTarget = nullptr;
+    IDirect3DSurface9* previousDepth = nullptr;
+    D3DVIEWPORT9 previousViewport{};
+    IDirect3DStateBlock9* stateBlock = nullptr;
+    IDirect3DSurface9* renderTarget = nullptr;
+    IDirect3DSurface9* depthSurface = nullptr;
+    IDirect3DSurface9* readback = nullptr;
+    bool ok = false;
+    bool begunScene = false;
+
+    device->GetRenderTarget(0, &previousTarget);
+    device->GetDepthStencilSurface(&previousDepth);
+    device->GetViewport(&previousViewport);
+
+    do
+    {
+        if (FAILED(device->CreateStateBlock(D3DSBT_ALL, &stateBlock)) || !stateBlock)
+        {
+            LogLine("Persona portrait: CreateStateBlock failed.");
+            break;
+        }
+        if (FAILED(device->CreateRenderTarget(width, height, D3DFMT_X8R8G8B8,
+                D3DMULTISAMPLE_NONE, 0, FALSE, &renderTarget, nullptr)) || !renderTarget)
+        {
+            LogLine("Persona portrait: CreateRenderTarget %dx%d failed.", width, height);
+            break;
+        }
+        if (FAILED(device->CreateDepthStencilSurface(width, height, D3DFMT_D24S8,
+                D3DMULTISAMPLE_NONE, 0, TRUE, &depthSurface, nullptr)) || !depthSurface)
+        {
+            LogLine("Persona portrait: depth surface failed.");
+            break;
+        }
+
+        device->SetRenderTarget(0, renderTarget);
+        device->SetDepthStencilSurface(depthSurface);
+        D3DVIEWPORT9 viewport{ 0, 0, static_cast<DWORD>(width), static_cast<DWORD>(height), 0.0f, 1.0f };
+        device->SetViewport(&viewport);
+        device->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER,
+            D3DCOLOR_XRGB(110, 110, 112), 1.0f, 0);
+
+        begunScene = SUCCEEDED(device->BeginScene());
+
+        device->SetVertexShader(nullptr);
+        device->SetPixelShader(nullptr);
+        device->SetFVF(D3DFVF_XYZ | D3DFVF_TEX1);
+        device->SetTransform(D3DTS_WORLD, reinterpret_cast<const D3DMATRIX*>(&identity));
+        device->SetTransform(D3DTS_VIEW, reinterpret_cast<const D3DMATRIX*>(&view));
+        device->SetTransform(D3DTS_PROJECTION, reinterpret_cast<const D3DMATRIX*>(&projection));
+
+        device->SetRenderState(D3DRS_LIGHTING, FALSE);
+        device->SetRenderState(D3DRS_ZENABLE, D3DZB_TRUE);
+        device->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
+        device->SetRenderState(D3DRS_ZFUNC, D3DCMP_LESSEQUAL);
+        device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+        device->SetRenderState(D3DRS_FILLMODE, D3DFILL_SOLID);
+        device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+        device->SetRenderState(D3DRS_ALPHATESTENABLE, TRUE);
+        device->SetRenderState(D3DRS_ALPHAREF, 96);
+        device->SetRenderState(D3DRS_ALPHAFUNC, D3DCMP_GREATEREQUAL);
+        device->SetRenderState(D3DRS_FOGENABLE, FALSE);
+        device->SetRenderState(D3DRS_STENCILENABLE, FALSE);
+        device->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
+        device->SetRenderState(D3DRS_CLIPPLANEENABLE, 0);
+        device->SetRenderState(D3DRS_SRGBWRITEENABLE, FALSE);
+        device->SetRenderState(D3DRS_TEXTUREFACTOR, D3DCOLOR_XRGB(150, 148, 145));
+        device->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+        device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+        device->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_LINEAR);
+        device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
+        device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
+        device->SetSamplerState(0, D3DSAMP_SRGBTEXTURE, FALSE);
+        device->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
+        device->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
+
+        for (const portrait::DrawItem& item : items)
+        {
+            if (item.vertices.empty() || item.indices.empty())
+            {
+                continue;
+            }
+            if (item.texture)
+            {
+                device->SetTexture(0, item.texture);
+                device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+                device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+                device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+                device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+            }
+            else
+            {
+                device->SetTexture(0, nullptr);
+                device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG2);
+                device->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_TFACTOR);
+                device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG2);
+                device->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_TFACTOR);
+            }
+            const UINT vertexCount = static_cast<UINT>(item.vertices.size());
+            if (item.stripLengths.empty())
+            {
+                device->DrawIndexedPrimitiveUP(D3DPT_TRIANGLELIST, 0, vertexCount,
+                    static_cast<UINT>(item.indices.size() / 3), item.indices.data(),
+                    D3DFMT_INDEX16, item.vertices.data(), sizeof(portrait::Vtx));
+            }
+            else
+            {
+                const UInt16* strip = item.indices.data();
+                for (UInt16 length : item.stripLengths)
+                {
+                    if (length >= 3)
+                    {
+                        device->DrawIndexedPrimitiveUP(D3DPT_TRIANGLESTRIP, 0, vertexCount,
+                            static_cast<UINT>(length - 2), strip, D3DFMT_INDEX16,
+                            item.vertices.data(), sizeof(portrait::Vtx));
+                    }
+                    strip += length;
+                }
+            }
+        }
+
+        if (begunScene)
+        {
+            device->EndScene();
+            begunScene = false;
+        }
+
+        if (FAILED(device->CreateOffscreenPlainSurface(width, height, D3DFMT_X8R8G8B8,
+                D3DPOOL_SYSTEMMEM, &readback, nullptr)) || !readback)
+        {
+            LogLine("Persona portrait: readback surface failed.");
+            break;
+        }
+        if (FAILED(device->GetRenderTargetData(renderTarget, readback)))
+        {
+            LogLine("Persona portrait: GetRenderTargetData failed.");
+            break;
+        }
+        D3DLOCKED_RECT locked{};
+        if (FAILED(readback->LockRect(&locked, nullptr, D3DLOCK_READONLY)) || !locked.pBits)
+        {
+            LogLine("Persona portrait: LockRect failed.");
+            break;
+        }
+        outBgra.resize(static_cast<size_t>(width) * static_cast<size_t>(height) * 4u);
+        const BYTE* pixels = static_cast<const BYTE*>(locked.pBits);
+        for (int row = 0; row < height; ++row)
+        {
+            std::memcpy(outBgra.data() + static_cast<size_t>(row) * width * 4u,
+                pixels + static_cast<size_t>(row) * locked.Pitch,
+                static_cast<size_t>(width) * 4u);
+        }
+        readback->UnlockRect();
+        outWidth = width;
+        outHeight = height;
+        ok = true;
+    } while (false);
+
+    if (begunScene)
+    {
+        device->EndScene();
+    }
+    device->SetRenderTarget(0, previousTarget);
+    device->SetDepthStencilSurface(previousDepth);
+    device->SetViewport(&previousViewport);
+    if (stateBlock)
+    {
+        stateBlock->Apply();
+        stateBlock->Release();
+    }
+    if (previousTarget)
+    {
+        previousTarget->Release();
+    }
+    if (previousDepth)
+    {
+        previousDepth->Release();
+    }
+    if (renderTarget)
+    {
+        renderTarget->Release();
+    }
+    if (depthSurface)
+    {
+        depthSurface->Release();
+    }
+    if (readback)
+    {
+        readback->Release();
+    }
+
+    if (ok)
+    {
+        LogLine("Persona portrait: rendered %d geometries (%d skinned, %d bind-pose, %d textured, %d skipped) in %lu ms at %dx%d.",
+            stats.geometries, stats.skinned, stats.bindPoseFallbacks, stats.textured,
+            stats.skippedNoData, static_cast<unsigned long>(GetTickCount() - extractStart),
+            width, height);
+    }
+    return ok;
 }
 
 IDirect3DDevice9* GetGameD3D9Device()
@@ -13353,108 +14136,6 @@ IDirect3DDevice9* GetGameD3D9Device()
         return nullptr;
     }
     return *reinterpret_cast<IDirect3DDevice9**>(renderer + kNiDX9RendererDeviceOffset);
-}
-
-// Copies the currently PRESENTED frame (what the player sees) into a tightly
-// packed BGRA buffer, cropped to the game window's client area. Runs on the game
-// thread (the game's D3D9 device is not created multithreaded). Returns false on
-// any failure — the capture then degrades to a stats-only upload.
-bool CapturePresentedFramePixels(std::vector<BYTE>& outBgra, int& outWidth, int& outHeight)
-{
-    outBgra.clear();
-    outWidth = 0;
-    outHeight = 0;
-
-    IDirect3DDevice9* device = GetGameD3D9Device();
-    if (!device)
-    {
-        LogLine("Persona capture: D3D9 device unavailable.");
-        return false;
-    }
-
-    D3DDISPLAYMODE mode{};
-    if (FAILED(device->GetDisplayMode(0, &mode)) || mode.Width == 0 || mode.Height == 0)
-    {
-        LogLine("Persona capture: GetDisplayMode failed.");
-        return false;
-    }
-
-    IDirect3DSurface9* surface = nullptr;
-    if (FAILED(device->CreateOffscreenPlainSurface(mode.Width, mode.Height, D3DFMT_A8R8G8B8,
-            D3DPOOL_SYSTEMMEM, &surface, nullptr)) || !surface)
-    {
-        LogLine("Persona capture: offscreen surface creation failed.");
-        return false;
-    }
-
-    const HRESULT frontBufferResult = device->GetFrontBufferData(0, surface);
-    if (FAILED(frontBufferResult))
-    {
-        surface->Release();
-        LogLine("Persona capture: GetFrontBufferData failed (0x%08lX).", static_cast<unsigned long>(frontBufferResult));
-        return false;
-    }
-
-    // GetFrontBufferData returns the whole display; crop to the game window's
-    // client rect (which IS the display in exclusive fullscreen / borderless).
-    LONG left = 0;
-    LONG top = 0;
-    LONG width = static_cast<LONG>(mode.Width);
-    LONG height = static_cast<LONG>(mode.Height);
-    HWND gameWindow = GetGameWindow();
-    RECT client{};
-    POINT origin{ 0, 0 };
-    if (gameWindow && GetClientRect(gameWindow, &client) && client.right > client.left &&
-        client.bottom > client.top && ClientToScreen(gameWindow, &origin))
-    {
-        LONG monitorLeft = 0;
-        LONG monitorTop = 0;
-        MONITORINFO monitorInfo{};
-        monitorInfo.cbSize = sizeof(monitorInfo);
-        HMONITOR monitor = MonitorFromWindow(gameWindow, MONITOR_DEFAULTTONEAREST);
-        if (monitor && GetMonitorInfoW(monitor, &monitorInfo))
-        {
-            monitorLeft = monitorInfo.rcMonitor.left;
-            monitorTop = monitorInfo.rcMonitor.top;
-        }
-        left = origin.x - monitorLeft;
-        top = origin.y - monitorTop;
-        width = client.right - client.left;
-        height = client.bottom - client.top;
-    }
-    left = (std::max)(0L, (std::min)(left, static_cast<LONG>(mode.Width) - 1));
-    top = (std::max)(0L, (std::min)(top, static_cast<LONG>(mode.Height) - 1));
-    width = (std::min)(width, static_cast<LONG>(mode.Width) - left);
-    height = (std::min)(height, static_cast<LONG>(mode.Height) - top);
-    if (width < 64 || height < 64)
-    {
-        surface->Release();
-        LogLine("Persona capture: window crop degenerate (%ldx%ld).", width, height);
-        return false;
-    }
-
-    D3DLOCKED_RECT locked{};
-    if (FAILED(surface->LockRect(&locked, nullptr, D3DLOCK_READONLY)) || !locked.pBits)
-    {
-        surface->Release();
-        LogLine("Persona capture: LockRect failed.");
-        return false;
-    }
-
-    outBgra.resize(static_cast<size_t>(width) * static_cast<size_t>(height) * 4u);
-    const BYTE* pixels = static_cast<const BYTE*>(locked.pBits);
-    for (LONG row = 0; row < height; ++row)
-    {
-        std::memcpy(outBgra.data() + static_cast<size_t>(row) * width * 4u,
-            pixels + static_cast<size_t>(top + row) * locked.Pitch + static_cast<size_t>(left) * 4u,
-            static_cast<size_t>(width) * 4u);
-    }
-    surface->UnlockRect();
-    surface->Release();
-
-    outWidth = static_cast<int>(width);
-    outHeight = static_cast<int>(height);
-    return true;
 }
 
 // --- JPEG encoding (GDI+; sender thread only) ----------------------------------------
@@ -13735,161 +14416,49 @@ void StartPersonaUpload(std::string statsJsonFields, std::vector<BYTE> bgra, int
     }).detach();
 }
 
-// --- The capture sequence (game thread) -----------------------------------------------
+// --- The capture (game thread) ---------------------------------------------------------
 
-// Undo `tfc` / `tm` (retrying on console failure) and go Idle when both are undone.
-void TryPersonaRestore(PlayerCharacter* player)
-{
-    if (g_persona.enteredFlycam && ExecuteConsoleCommand(player, "tfc"))
-    {
-        g_persona.enteredFlycam = false;
-    }
-    if (!g_persona.enteredFlycam && g_persona.hidHud && ExecuteConsoleCommand(player, "tm"))
-    {
-        g_persona.hidHud = false;
-    }
-    if (!g_persona.enteredFlycam && !g_persona.hidHud)
-    {
-        g_persona.stage = PersonaStage::Idle;
-        return;
-    }
-    g_persona.stage = PersonaStage::Restore;
-    if (--g_persona.restoreAttemptsRemaining <= 0)
-    {
-        LogLine("Persona: FAILED to restore camera/HUD after capture (flycam=%d hud_hidden=%d) - player visible!",
-            g_persona.enteredFlycam ? 1 : 0, g_persona.hidHud ? 1 : 0);
-        g_persona.enteredFlycam = false;
-        g_persona.hidHud = false;
-        g_persona.stage = PersonaStage::Idle;
-    }
-}
-
-// Ends the sequence: optionally grabs the presented frame FIRST, then restores the
-// camera/HUD in this same hook invocation, then hands off the upload. Every abort
+// Takes the pending save-triggered capture in ONE frame: snapshot stats, render the
+// offscreen portrait (nothing visible happens), hand off the upload. Every failure
 // path still uploads the stats snapshot (chasm generates stats-only personas).
-void FinishPersonaSequence(PlayerCharacter* player, bool captureFrame, const char* abortReason)
+void TakePersonaCapture(PlayerCharacter* player, DWORD now)
 {
+    std::string statsJson = BuildPersonaStatsJsonFields(player, g_persona.pendingTrigger);
+    g_persona.lastSequenceTick = now;
+
     std::vector<BYTE> bgra;
     int width = 0;
     int height = 0;
-    if (captureFrame && !CapturePresentedFramePixels(bgra, width, height))
-    {
-        bgra.clear();
-        width = 0;
-        height = 0;
-    }
-
-    g_persona.restoreAttemptsRemaining = kPersonaRestoreMaxAttempts;
-    TryPersonaRestore(player); // normally completes right here, same frame
-
-    if (abortReason)
-    {
-        LogLine("Persona: capture sequence aborted (%s); uploading stats only.", abortReason);
-    }
-    else
-    {
-        LogLine("Persona: captured %dx%d frame (trigger=%s).", width, height, g_persona.pendingTrigger.c_str());
-    }
-
-    StartPersonaUpload(std::move(g_persona.pendingStatsJson), std::move(bgra), width, height);
-    g_persona.pendingStatsJson.clear();
-}
-
-// Takes the pending save-triggered capture: snapshot stats, then (when screenshots
-// are enabled) hide the HUD, enter the flycam, and pose it in front of the player.
-// The settle countdown lets the engine render + present the swung view before the
-// grab.
-void BeginPersonaSequence(PlayerCharacter* player, DWORD now)
-{
-    g_persona.pendingStatsJson = BuildPersonaStatsJsonFields(player, g_persona.pendingTrigger);
-    g_persona.lastSequenceTick = now;
-    g_persona.sequenceStartTick = now;
-    g_persona.hidHud = false;
-    g_persona.enteredFlycam = false;
-
     if (!g_debugConfig.personaScreenshotEnabled)
     {
         LogLine("Persona: screenshots disabled; uploading stats only (trigger=%s).",
             g_persona.pendingTrigger.c_str());
-        StartPersonaUpload(std::move(g_persona.pendingStatsJson), {}, 0, 0);
-        g_persona.pendingStatsJson.clear();
-        return;
     }
-
-    g_persona.hidHud = ExecuteConsoleCommand(player, "tm");
-    g_persona.enteredFlycam = ExecuteConsoleCommand(player, "tfc");
-    if (!g_persona.enteredFlycam)
+    else if (!RenderPlayerPortraitPixels(player, bgra, width, height))
     {
-        LogLine("Persona: tfc unavailable; uploading stats only.");
-        g_persona.restoreAttemptsRemaining = kPersonaRestoreMaxAttempts;
-        TryPersonaRestore(player); // undoes tm if it went through
-        StartPersonaUpload(std::move(g_persona.pendingStatsJson), {}, 0, 0);
-        g_persona.pendingStatsJson.clear();
-        return;
-    }
-
-    ApplyPersonaFlycamPose(player);
-    g_persona.stage = PersonaStage::Settle;
-    g_persona.settleFramesRemaining = kPersonaSettleFrames;
-    LogLine("Persona: capture sequence started (trigger=%s).", g_persona.pendingTrigger.c_str());
-}
-
-// Interrupt hook for abnormal paths (window focus loss mid-sequence): restore
-// immediately and drop the pending capture; the un-updated fingerprint retries
-// after the debounce window.
-void AbortPersonaSequenceOnInterrupt(const char* reason)
-{
-    if (g_persona.stage == PersonaStage::Idle)
-    {
-        return;
-    }
-    // Called every frame in some paths (e.g. while the window stays unfocused):
-    // only log + arm the retry budget on the Settle -> Restore transition, then
-    // let the bounded per-frame retries run.
-    if (g_persona.stage != PersonaStage::Restore)
-    {
-        LogLine("Persona: sequence interrupted (%s).", reason);
-        g_persona.pendingStatsJson.clear();
-        g_persona.restoreAttemptsRemaining = kPersonaRestoreMaxAttempts;
-        // Re-arm the save's pending capture (original pendingSinceTick keeps
-        // the stats-only expiry bounded) so an interrupt defers rather than
-        // silently swallows it. The disabled-mid-sequence caller clears the
-        // flag right after; session resets clear it too.
-        if (!g_persona.pendingTrigger.empty())
-        {
-            g_persona.capturePending = true;
-        }
-    }
-    PlayerCharacter* player = GetPlayer();
-    if (player)
-    {
-        TryPersonaRestore(player);
+        bgra.clear();
+        width = 0;
+        height = 0;
+        LogLine("Persona: portrait render failed; uploading stats only (trigger=%s).",
+            g_persona.pendingTrigger.c_str());
     }
     else
     {
-        g_persona.enteredFlycam = false;
-        g_persona.hidHud = false;
-        g_persona.stage = PersonaStage::Idle;
+        LogLine("Persona: captured %dx%d portrait (trigger=%s).", width, height,
+            g_persona.pendingTrigger.c_str());
     }
+    StartPersonaUpload(std::move(statsJson), std::move(bgra), width, height);
 }
 
-// Session reset (load / new game / exit to menu): drop all transient state WITHOUT
-// console calls (the world may be mid-teardown). The engine rebuilds camera/UI
-// state on load anyway; the only residue risk is the ~3-frame window where a
-// sequence was live exactly when the session ended. A pending capture is dropped
-// too — the freshly loaded state supersedes the save that queued it.
+// Session reset (load / new game / exit to menu): drop all transient state. The
+// offscreen capture leaves nothing behind mid-flight (no camera/HUD toggles to
+// undo). A pending capture is dropped too — the freshly loaded state supersedes
+// the save that queued it.
 void ResetPersonaStateForSession()
 {
-    g_persona.stage = PersonaStage::Idle;
-    g_persona.hidHud = false;
-    g_persona.enteredFlycam = false;
-    g_persona.settleFramesRemaining = 0;
-    g_persona.restoreAttemptsRemaining = 0;
-    g_persona.sequenceStartTick = 0;
     g_persona.gatesSatisfiedSinceTick = 0;
     g_persona.capturePending = false;
     g_persona.pendingSinceTick = 0;
-    g_persona.pendingStatsJson.clear();
     g_persona.pendingTrigger.clear();
     // lastSequenceTick survives: the debounce spans loads on purpose
     // (quickload+quicksave loops should not double-capture).
@@ -13910,43 +14479,11 @@ void UpdatePersonaCapture()
 
     if (!g_debugConfig.personaEnabled)
     {
-        if (g_persona.stage != PersonaStage::Idle)
-        {
-            AbortPersonaSequenceOnInterrupt("persona disabled mid-sequence");
-        }
         g_persona.capturePending = false;
         return;
     }
 
-    // Drive an in-flight sequence.
-    if (g_persona.stage == PersonaStage::Settle)
-    {
-        if ((now - g_persona.sequenceStartTick) > kPersonaSequenceTimeoutMs)
-        {
-            FinishPersonaSequence(player, false, "sequence watchdog timeout");
-            return;
-        }
-        if (!PersonaGatesSatisfied(player))
-        {
-            FinishPersonaSequence(player, false, "idle gates broke during settle");
-            return;
-        }
-        ApplyPersonaFlycamPose(player); // re-assert against mouse drift
-        if (--g_persona.settleFramesRemaining > 0)
-        {
-            return;
-        }
-        FinishPersonaSequence(player, true, nullptr);
-        return;
-    }
-    if (g_persona.stage == PersonaStage::Restore)
-    {
-        // Retry undoing tfc/tm until it sticks (bounded by restoreAttemptsRemaining).
-        TryPersonaRestore(player);
-        return;
-    }
-
-    // Idle: nothing to do until a save marks a capture pending.
+    // Nothing to do until a save marks a capture pending.
     if (!g_persona.capturePending)
     {
         return;
@@ -13987,7 +14524,7 @@ void UpdatePersonaCapture()
     }
 
     g_persona.capturePending = false;
-    BeginPersonaSequence(player, now);
+    TakePersonaCapture(player, now);
 }
 
 void OnMainGameLoop()
@@ -14019,7 +14556,7 @@ void OnMainGameLoop()
         {
             AbortVoiceCapture("voice_capture_focus_lost", false);
         }
-        AbortPersonaSequenceOnInterrupt("game window focus lost");
+        g_persona.gatesSatisfiedSinceTick = 0; // persona gates re-arm after refocus
         return;
     }
 
