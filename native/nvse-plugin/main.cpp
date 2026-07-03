@@ -209,6 +209,8 @@ struct TrustedExecutionArgument
 struct SpeakerSnapshot
 {
     UInt32 refId = 0;
+    UInt32 baseId = 0;  // base form (TESNPC/TESCreature) FormID; detects FormID recycling
+                        // when a cell unloads (a recycled ref keeps refId but changes base).
     float posX = 0.0f;
     float posY = 0.0f;
     float posZ = 0.0f;
@@ -471,15 +473,20 @@ struct RuntimeState
     std::string streamRequestId;     // utterance this buffer serves
     SpeakerSnapshot streamSpeaker;
     bool streamNonPositional = false;          // 2D (player-centered) vs 3D positional
+    bool streamSpeakerOrphaned = false;        // speaker unloaded/recycled mid-utterance:
+                                               // freeze audio at last pos, never rebind
     std::deque<PendingStreamLipSync> streamLipSyncQueue;
-    // Phase 3 caption chunking (display only): the NPC's full line split into
-    // <= captionMaxChars segments, revealed in sync with the streaming playback.
-    int captionMaxChars = -1;                  // -1 unset; 0 = whole line in one caption
-    std::vector<std::string> captionSegments;
-    std::vector<DWORD> captionSegmentStartChar; // char offset of each segment (for play-cursor sync)
+    // Caption timeline (display only): one segment per synthesized SENTENCE. chasm
+    // streams LLM->TTS at sentence granularity, and each sentence's audio begins with a
+    // chunk carrying that sentence's caption text (later chunks of the same sentence
+    // carry EMPTY text). Each segment is anchored to the audio-buffer ms where its
+    // sentence starts, so UpdateStreamingVoice swaps the caption in sync with playback
+    // across EVERY sentence of the reply (not just the first).
+    int captionMaxChars = -1;                  // -1 unset (display hint, forwarded by backend)
+    std::vector<std::string> captionSegments;  // one caption per sentence, in play order
+    std::vector<DWORD> captionSegmentStartMs;  // audio-buffer ms where each segment begins
     int captionCurrentIndex = -1;              // segment currently on screen
-    std::string captionSourceText;             // the full line the segments came from
-    DWORD captionTotalMsLocked = 0;            // total audio ms locked once synthesis settles (stable basis)
+    std::string captionSourceText;             // accumulated full line so far (lip-sync visemes)
     DWORD captionLastShowTick = 0;             // last (re)show of the current caption (refresh timer)
     // Phase 3 lip-sync coalescing: accumulate mini-chunks into ~kLipSyncWindowMs
     // windows so the face animation isn't restarted per 200ms chunk.
@@ -6652,6 +6659,7 @@ SpeakerSnapshot CaptureSpeakerSnapshot(TESObjectREFR* ref)
     }
 
     snapshot.refId = ref->refID;
+    snapshot.baseId = (ref->baseForm ? ref->baseForm->refID : 0);
     snapshot.posX = ref->posX;
     snapshot.posY = ref->posY;
     snapshot.posZ = ref->posZ;
@@ -9855,8 +9863,11 @@ void UpdateActiveSoundPositions()
         }
 
         TESObjectREFR* speakerRef = ResolveSpeakerRef(sound.speaker);
-        if (!speakerRef)
+        if (!speakerRef || !speakerRef->GetNiNode())
         {
+            // Speaker gone or unloaded (left the cell): leave the sound at its last
+            // position rather than snapping it to a stale/editor position or a recycled
+            // ref. ResolveSpeakerRef already refuses a FormID recycled to another form.
             continue;
         }
 
@@ -10114,7 +10125,28 @@ TESObjectREFR* ResolveSpeakerRef(const SpeakerSnapshot& speaker)
         return nullptr;
     }
 
-    return static_cast<TESObjectREFR*>(form);
+    // A FormID freed on cell unload can be RECYCLED by the engine for a different form.
+    // Two guards so in-flight speech (audio/lip-sync/captions) never rebinds to the
+    // wrong actor via a stale identity:
+    //   1) The form must still be a placed reference (Character/Creature/REFR share the
+    //      TESObjectREFR layout). If it recycled to a non-ref form, casting and reading
+    //      posX/baseForm would be garbage — refuse it.
+    //   2) The live ref's base form must still match the one captured for this speaker.
+    //      A recycled ref keeps the FormID but points at a different base — refuse it.
+    const UInt8 typeId = form->typeID;
+    if (typeId != kFormType_TESObjectREFR && typeId != kFormType_Character
+        && typeId != kFormType_Creature)
+    {
+        return nullptr;
+    }
+
+    auto* ref = static_cast<TESObjectREFR*>(form);
+    if (speaker.baseId && (!ref->baseForm || ref->baseForm->refID != speaker.baseId))
+    {
+        return nullptr;
+    }
+
+    return ref;
 }
 
 bool HasPageAccess(DWORD protect, bool requireWrite)
@@ -11036,14 +11068,14 @@ void StopStreamingVoice(const char* reason)
     g_state.streamRequestId.clear();
     g_state.streamSpeaker = {};
     g_state.streamNonPositional = false;
+    g_state.streamSpeakerOrphaned = false;
     g_state.streamFormat = {};
     g_state.streamLipSyncQueue.clear();
     g_state.captionMaxChars = -1;
     g_state.captionSegments.clear();
-    g_state.captionSegmentStartChar.clear();
+    g_state.captionSegmentStartMs.clear();
     g_state.captionCurrentIndex = -1;
     g_state.captionSourceText.clear();
-    g_state.captionTotalMsLocked = 0;
     g_state.captionLastShowTick = 0;
     g_state.lipSyncAccumPcm.clear();
     g_state.lipSyncAccumMs = 0;
@@ -11072,6 +11104,51 @@ void ApplyStreamingVoiceSpatial(const SpeakerSnapshot& speaker, bool nonPosition
     }
     g_state.streamBuffer->SetVolume(nonPositional ? DSBVOLUME_MAX
         : ComputeDistanceAttenuatedVolume(player, speaker));
+}
+
+// Re-resolve the streaming speaker's CURRENT world position each frame so 3D audio
+// FOLLOWS them as they move (previously the buffer held the position captured when the
+// chunk was appended, so the voice froze in place when the NPC walked away).
+//
+// Identity-safe: ResolveSpeakerRef refuses a FormID that was recycled to a different
+// form/actor when the speaker's cell unloads. If the speaker is not currently loaded
+// (no 3D) or can't be resolved, we FREEZE the audio at the last known position (orphan)
+// and never rebind to a wrong ref — this is the "speaker left the cell mid-speech"
+// case that used to cross-wire the voice onto another character.
+void RefreshStreamingSpeakerPosition()
+{
+    if (g_state.streamNonPositional || !g_state.streamSpeaker.valid)
+    {
+        return;
+    }
+
+    TESObjectREFR* ref = ResolveSpeakerRef(g_state.streamSpeaker);
+    const bool loaded = ref && ref->GetNiNode();
+    if (loaded)
+    {
+        // Same actor, currently loaded: track its live position.
+        g_state.streamSpeaker.posX = ref->posX;
+        g_state.streamSpeaker.posY = ref->posY;
+        g_state.streamSpeaker.posZ = ref->posZ;
+        if (g_state.streamSpeakerOrphaned)
+        {
+            g_state.streamSpeakerOrphaned = false;
+            LogLine("stream speaker %08X reloaded mid-speech; audio tracking resumed.",
+                g_state.streamSpeaker.refId);
+        }
+        return;
+    }
+
+    // Unloaded or recycled: keep the frozen position, log once per orphan event.
+    if (!g_state.streamSpeakerOrphaned)
+    {
+        g_state.streamSpeakerOrphaned = true;
+        TraceRequestEvent(g_state.streamRequestId, "stream_speaker_unloaded",
+            {},
+            { { "speaker_ref_id", static_cast<double>(g_state.streamSpeaker.refId) } });
+        LogLine("stream speaker %08X unloaded mid-speech; freezing audio at last position "
+            "(no rebind).", g_state.streamSpeaker.refId);
+    }
 }
 
 // Create the streaming buffer for a new utterance, sized to hold the whole line.
@@ -11173,82 +11250,41 @@ bool StartStreamingVoice(const WavData& first, const SpeakerSnapshot& speaker,
     return true;
 }
 
-// Split the NPC's full line into <= maxChars caption segments at word/punctuation
-// boundaries and record each segment's CHARACTER offset. UpdateStreamingVoice reveals
-// a segment when the actual play cursor reaches that character's share of the line, so
-// captions track the real speech (not a fixed rate). maxChars <= 0 => one segment (the
-// whole line). DISPLAY ONLY — never touches the audio.
-void BuildCaptionSegments(const std::string& text, int maxChars)
+// Append one caption segment (= one synthesized sentence) anchored at `startMs`, the
+// audio-buffer offset where this sentence's audio begins. UpdateStreamingVoice reveals
+// each segment when the play cursor reaches its startMs, so captions swap 1:1 with the
+// TTS audio through every sentence of the reply. DISPLAY ONLY — never touches audio.
+//
+// This replaces the old build-once-from-the-first-chunk approach, which only ever knew
+// the FIRST sentence's text (later sentences arrive on later chunks) and so froze the
+// captions on the opening line for the rest of the turn.
+void AppendCaptionSegment(const std::string& text, DWORD startMs)
 {
-    g_state.captionSegments.clear();
-    g_state.captionSegmentStartChar.clear();
-    g_state.captionCurrentIndex = -1;
-    g_state.captionSourceText = text;
     if (text.empty())
     {
         return;
     }
-    if (maxChars <= 0 || text.size() <= static_cast<size_t>(maxChars))
+    // Segments arrive in playback order; startMs is monotonic within an utterance.
+    // Ignore anything that would go backwards (defensive against a re-processed chunk).
+    if (!g_state.captionSegmentStartMs.empty() && startMs < g_state.captionSegmentStartMs.back())
     {
-        g_state.captionSegments.push_back(text);
-        g_state.captionSegmentStartChar.push_back(0);
         return;
     }
-    const size_t limit = static_cast<size_t>(maxChars);
-    const size_t n = text.size();
-    size_t i = 0;
-    while (i < n)
+    g_state.captionSegments.push_back(text);
+    g_state.captionSegmentStartMs.push_back(startMs);
+    // Accumulate the full spoken line so far for lip-sync viseme slicing (space-joined).
+    if (!g_state.captionSourceText.empty())
     {
-        while (i < n && text[i] == ' ')
-        {
-            ++i;
-        }
-        if (i >= n)
-        {
-            break;
-        }
-        const size_t startChar = i;
-        size_t end = (i + limit < n) ? i + limit : n;
-        if (end < n)
-        {
-            // Prefer a sentence/clause punctuation break past the segment midpoint,
-            // else the last word boundary; else hard-split a single long word.
-            size_t punct = std::string::npos;
-            for (size_t p = i; p < end; ++p)
-            {
-                const char c = text[p];
-                if (c == '.' || c == '!' || c == '?' || c == ',' || c == ';' || c == ':')
-                {
-                    punct = p;
-                }
-            }
-            const size_t space = text.rfind(' ', end);
-            if (punct != std::string::npos && punct >= i + limit / 2)
-            {
-                end = punct + 1;
-            }
-            else if (space != std::string::npos && space > i)
-            {
-                end = space;
-            }
-        }
-        std::string seg = text.substr(i, end - i);
-        while (!seg.empty() && seg.back() == ' ')
-        {
-            seg.pop_back();
-        }
-        if (!seg.empty())
-        {
-            g_state.captionSegments.push_back(seg);
-            g_state.captionSegmentStartChar.push_back(static_cast<DWORD>(startChar));
-        }
-        i = end;
+        g_state.captionSourceText.push_back(' ');
     }
-    if (g_state.captionSegments.empty())
-    {
-        g_state.captionSegments.push_back(text);
-        g_state.captionSegmentStartChar.push_back(0);
-    }
+    g_state.captionSourceText += text;
+    TraceRequestEvent(g_state.streamRequestId, "caption_segment_added",
+        {},
+        {
+            { "segment_index", static_cast<double>(g_state.captionSegments.size() - 1) },
+            { "start_ms", static_cast<double>(startMs) },
+            { "chars", static_cast<double>(text.size()) },
+        });
 }
 
 // Write one chunk's PCM into the streaming buffer (creating it on the first chunk of
@@ -11380,12 +11416,15 @@ bool AppendStreamingChunk(const QueuedAudioChunk& chunk, const WavData& wav, con
     g_state.streamLipSyncQueue.push_back(std::move(ls));
     g_state.streamedAudioSeenForReply = true;
 
-    // Build the caption segments from the line's full text on the first chunk that
-    // carries it (display only; revealed by UpdateStreamingVoice).
-    if (g_state.captionSegments.empty() && !chunk.subtitleText.empty())
+    // Captions follow the TTS audio 1:1. Each synthesized sentence's audio begins with a
+    // chunk carrying that sentence's caption text (later chunks of the same sentence carry
+    // EMPTY text), so a non-empty subtitle marks a new sentence starting HERE in the
+    // buffer. Anchor a caption segment to this chunk's start so UpdateStreamingVoice swaps
+    // to it when playback reaches it — for every sentence, not just the first.
+    if (!chunk.subtitleText.empty())
     {
         g_state.captionMaxChars = chunk.captionMaxChars;
-        BuildCaptionSegments(chunk.subtitleText, chunk.captionMaxChars);
+        AppendCaptionSegment(chunk.subtitleText, chunkStartMs);
     }
 
     TraceRequestEvent(chunk.requestId, "stream_chunk_appended",
@@ -11497,9 +11536,11 @@ void UpdateStreamingVoice()
     if (g_state.streamStarted)
     {
         // Keep the voice spatialized EVERY frame so the 3D direction + distance volume
-        // track the player as they move/turn. The single streaming buffer isn't in
-        // activeSounds, so UpdateActiveSoundPositions doesn't cover it; updating only
-        // per-chunk made the directional audio lag.
+        // track BOTH the player (listener) and the speaker as they move/turn. The single
+        // streaming buffer isn't in activeSounds, so UpdateActiveSoundPositions doesn't
+        // cover it. RefreshStreamingSpeakerPosition re-reads the speaker's live position
+        // (following them when they walk away) or freezes on unload without rebinding.
+        RefreshStreamingSpeakerPosition();
         ApplyStreamingVoiceSpatial(g_state.streamSpeaker, g_state.streamNonPositional);
         const DWORD elapsed = now - g_state.streamPlayStartTick;
         // Coalesce due mini-chunks into a lip-sync window, then drive ONE face
@@ -11551,36 +11592,12 @@ void UpdateStreamingVoice()
         }
     }
 
-    // Caption scheduler (DISPLAY ONLY): reveal each segment when the ACTUAL playback
-    // position reaches that segment's text — its character share of the whole line,
-    // measured against the real audio duration. Anchored to the play cursor so it
-    // tracks the speech exactly and never drifts (the old fixed-rate estimate lagged
-    // and accumulated desync). Falls back to caption_ms_per_char only if the play
-    // cursor is unavailable. Audio is never gated or reshaped by this.
+    // Caption scheduler (DISPLAY ONLY): reveal each sentence's caption when the ACTUAL
+    // play cursor reaches that sentence's audio (its recorded start ms in the buffer).
+    // Anchored directly to playback, so captions swap 1:1 with the audio through EVERY
+    // sentence of the reply and never drift. Audio is never gated or reshaped by this.
     if (g_state.streamStarted && g_debugConfig.subtitlesEnabled && !g_state.captionSegments.empty())
     {
-        const size_t totalChars = g_state.captionSourceText.size();
-        // Lock the total audio duration once the WHOLE reply is in, so the play-cursor
-        // fraction is measured against a STABLE, COMPLETE total. Two conditions:
-        //   1) !awaitingReply  - the backend has sent its final response, so no more
-        //      audio chunks are coming. This is the critical guard: TTS slices arrive
-        //      ~400-650 ms apart (each ~1.5 s slice takes that long to render), and
-        //      once the off-VFS lag fix made chunk reads instant, those normal
-        //      inter-chunk waits exceed the 400 ms timer below. Locking on the timer
-        //      ALONE would fire during the opener->remainder gap and freeze totalMs at
-        //      a PARTIAL (opener-only) duration -> the fraction overshoots 1.0 and the
-        //      caption skips to the end. awaitingReply stays true across that gap.
-        //   2) 400 ms since the last append - the final chunk has been appended and
-        //      processed (the final response can land a few ms before the last chunk).
-        // Using the still-growing streamCumulativeMs before this also made the target
-        // wobble -> flashing / captions ending early.
-        if (g_state.captionTotalMsLocked == 0 && g_state.streamCumulativeMs > 0
-            && !g_state.awaitingReply
-            && (now - g_state.streamLastAppendTick) > 400)
-        {
-            g_state.captionTotalMsLocked = g_state.streamCumulativeMs;
-        }
-        const DWORD totalMs = g_state.captionTotalMsLocked;
         const DWORD byteRate = g_state.streamFormat.nAvgBytesPerSec;
         DWORD playPos = 0;
         DWORD writePos = 0;
@@ -11589,26 +11606,21 @@ void UpdateStreamingVoice()
         const unsigned long long playMs =
             havePlay ? static_cast<unsigned long long>(playPos) * 1000ULL / byteRate : 0ULL;
 
-        // Highest segment the play cursor has reached, MONOTONIC (never step back, so
-        // it can't flash between two). Only advances past 0 once the total is locked;
-        // until then segment 0 holds.
+        // Highest segment whose audio has started, MONOTONIC (never step back, so it
+        // can't flash between two). Segment 0 is anchored at ms 0 and shows immediately.
         int target = (g_state.captionCurrentIndex < 0) ? 0 : g_state.captionCurrentIndex;
-        if (havePlay && totalMs > 0 && totalChars > 0)
+        for (size_t s = 0; s < g_state.captionSegmentStartMs.size(); ++s)
         {
-            for (size_t s = 0; s < g_state.captionSegmentStartChar.size(); ++s)
+            if (playMs >= static_cast<unsigned long long>(g_state.captionSegmentStartMs[s]))
             {
-                const DWORD startChar = g_state.captionSegmentStartChar[s];
-                if (playMs * totalChars >= static_cast<unsigned long long>(startChar) * totalMs)
+                if (static_cast<int>(s) > target)
                 {
-                    if (static_cast<int>(s) > target)
-                    {
-                        target = static_cast<int>(s);
-                    }
+                    target = static_cast<int>(s);
                 }
-                else
-                {
-                    break;
-                }
+            }
+            else
+            {
+                break;
             }
         }
 
@@ -11617,6 +11629,7 @@ void UpdateStreamingVoice()
         const bool advanced = target != g_state.captionCurrentIndex;
         if (advanced || (now - g_state.captionLastShowTick) >= 1000)
         {
+            const bool swapped = target != g_state.captionCurrentIndex;
             g_state.captionCurrentIndex = target;
             const std::string ascii = ToUiAscii(g_state.captionSegments[static_cast<size_t>(target)]);
             if (!ascii.empty() && ShowDialogSubtitle("", ascii, 2.0f))
@@ -11624,6 +11637,16 @@ void UpdateStreamingVoice()
                 g_state.subtitleShownForReply = true;
                 g_state.replySubtitleText = g_state.captionSegments[static_cast<size_t>(target)];
                 g_state.captionLastShowTick = now;
+                if (swapped)
+                {
+                    TraceRequestEvent(g_state.streamRequestId, "caption_segment_shown",
+                        {},
+                        {
+                            { "segment_index", static_cast<double>(target) },
+                            { "play_ms", static_cast<double>(playMs) },
+                            { "start_ms", static_cast<double>(g_state.captionSegmentStartMs[static_cast<size_t>(target)]) },
+                        });
+                }
             }
         }
     }
