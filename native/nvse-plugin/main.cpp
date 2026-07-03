@@ -14279,16 +14279,19 @@ void UpdateActiveSong()
 //
 // Sources:
 //   * xNVSE EventManager native handlers (ondeath, onstartcombat, oncombatend,
-//     onhit, onadd, onactorequip) — registered at DeferredInit.
+//     onhit, onadd, onactorequip, ondrop, onfire) — registered at DeferredInit.
 //   * A 1 Hz slow poll in the main loop for everything the engine has no event
 //     for: cell/worldspace travel, game-day change, level-ups, karma class,
 //     teammate roster, quest objectives, and the vanilla DialogMenu.
 //   * WriteRequest marks chasm conversations (one marker per NPC per window).
 //
-// Noise rules: hits/kills collapse into ONE combat-encounter event; pickups
-// aggregate into an 8s loot window (notables called out, junk counted); travel
-// only fires on NAMED place changes; every poll-derived event needs a primed
-// baseline (nothing fires on load); nothing is emitted per frame.
+// Noise rules: hits/kills collapse into ONE combat-encounter event; item
+// pickups and drops each aggregate into a short window (notables called out,
+// junk counted); consumables (food/meds via onactorequip on an AlchemyItem)
+// dedup per item; out-of-combat shooting collapses a firing burst into one
+// event (and is dropped entirely if a real fight starts); travel only fires on
+// NAMED place changes; every poll-derived event needs a primed baseline
+// (nothing fires on load); nothing is emitted per frame.
 // ===========================================================================
 
 constexpr UInt32 kGameTimeGlobalsAddress = 0x011DE7B8;
@@ -14300,9 +14303,15 @@ constexpr DWORD kCombatQuietCloseMs = 4000;
 constexpr DWORD kLootWindowQuietMs = 8000;
 constexpr DWORD kEquipDedupMs = 10 * 60 * 1000;
 constexpr DWORD kConversationMarkerDedupMs = 3 * 60 * 1000;
+constexpr DWORD kConsumableDedupMs = 12 * 1000;   // collapse rapid re-use (combat healing)
+constexpr DWORD kDropWindowQuietMs = 6000;        // aggregate a dropping spree
+constexpr DWORD kShootWindowQuietMs = 3500;       // out-of-combat firing burst
 constexpr double kEventNearbyDistance = 70.0 * kGameUnitsPerMeter; // 70 m
 constexpr UInt32 kFormFlagQuestItem = 0x400;
 constexpr UInt32 kActorValueKarma = 23;
+// FNV ALCH (AlchemyItem) ENIT flags in the low byte at +0xBC.
+constexpr UInt8 kAlchFlagFood = 0x02;
+constexpr UInt8 kAlchFlagMedicine = 0x04;
 
 // JIP-documented calendar globals (year/month/day/hour as TESGlobal floats).
 struct GameTimeGlobalsLayout
@@ -14357,8 +14366,22 @@ struct GameEventLogState
     std::map<std::string, int> lootCounts;            // display name -> count
     std::vector<std::string> lootNotables;
 
-    // Equip dedup + conversation markers.
-    std::unordered_map<UInt32, DWORD> recentEquips;   // item formId -> tick
+    // Equip + consumable dedup.
+    std::unordered_map<UInt32, DWORD> recentEquips;      // item formId -> tick
+    std::unordered_map<UInt32, DWORD> recentConsumables; // aid formId -> tick
+
+    // Drop window aggregation.
+    DWORD dropFirstTick = 0;
+    DWORD dropLastTick = 0;
+    std::map<std::string, int> dropCounts;              // display name -> count
+
+    // Out-of-combat shooting burst.
+    DWORD shootFirstTick = 0;
+    DWORD shootLastTick = 0;
+    int shootShots = 0;
+    std::string shootWeapon;
+
+    // Conversation markers.
     std::string lastConversationNpcKey;
     DWORD lastConversationTick = 0;
     bool dialogMenuWasOpen = false;
@@ -14610,6 +14633,12 @@ void TouchCombatEncounter(TESObjectREFR* actorRef)
         g_eventLog.combatKills.clear();
         g_eventLog.combatHits = 0;
         g_eventLog.combatPlayerInvolved = false;
+        // Any in-flight "shooting" burst was the opening of this fight, not
+        // idle plinking — discard it so it never double-logs alongside combat.
+        g_eventLog.shootFirstTick = 0;
+        g_eventLog.shootLastTick = 0;
+        g_eventLog.shootShots = 0;
+        g_eventLog.shootWeapon.clear();
         LogHookFirstFire("combat_encounter_open");
     }
     g_eventLog.combatLastActivityTick = now;
@@ -15040,22 +15069,223 @@ void OnActorEquipEventHandler(TESObjectREFR* /*thisObj*/, void* parameters)
     {
         item = first->baseForm;
     }
-    if (!item || (item->typeID != kFormType_TESObjectWEAP && item->typeID != kFormType_TESObjectARMO))
+    if (!item)
     {
         return;
     }
     const DWORD now = GetTickCount();
+    const std::string name = GetDisplayNameSafe(item);
+
+    // Consumables: FNV "uses" an aid item by equipping it briefly. Classify by
+    // the ALCH flags into eating / medicine / other so the summary reads right.
+    if (item->typeID == kFormType_AlchemyItem)
+    {
+        const auto recent = g_eventLog.recentConsumables.find(item->refID);
+        if (recent != g_eventLog.recentConsumables.end() && (now - recent->second) < kConsumableDedupMs)
+        {
+            return;
+        }
+        g_eventLog.recentConsumables[item->refID] = now;
+        if (name.empty())
+        {
+            return;
+        }
+        const UInt8 alchFlags = reinterpret_cast<AlchemyItem*>(item)->alchFlags;
+        if (g_eventLog.loggedHookFirstFire.insert("consumable").second)
+        {
+            LogLine("event-log: first consumable use (%s, alchFlags=0x%02X).", name.c_str(), static_cast<unsigned>(alchFlags));
+        }
+        const char* verb =
+            (alchFlags & kAlchFlagFood) ? "Ate "
+            : (alchFlags & kAlchFlagMedicine) ? "Used "
+            : "Consumed ";
+        QueueGameEvent("item", verb + name);
+        return;
+    }
+
+    if (item->typeID != kFormType_TESObjectWEAP && item->typeID != kFormType_TESObjectARMO)
+    {
+        return;
+    }
     const auto recent = g_eventLog.recentEquips.find(item->refID);
     if (recent != g_eventLog.recentEquips.end() && (now - recent->second) < kEquipDedupMs)
     {
         return;
     }
     g_eventLog.recentEquips[item->refID] = now;
-    const std::string name = GetDisplayNameSafe(item);
     if (!name.empty())
     {
         QueueGameEvent("item", "Equipped " + name);
     }
+}
+
+// A dropped item feeds a short aggregation window, like loot (dropping a stack
+// or clearing junk shouldn't spam one event per item).
+void RecordPlayerItemDrop(TESForm* itemForm)
+{
+    const std::string name = GetDisplayNameSafe(itemForm);
+    if (name.empty())
+    {
+        return;
+    }
+    const DWORD now = GetTickCount();
+    if (!g_eventLog.dropFirstTick)
+    {
+        g_eventLog.dropFirstTick = now;
+    }
+    g_eventLog.dropLastTick = now;
+    g_eventLog.dropCounts[name] += 1;
+}
+
+void EmitDropWindowEvent()
+{
+    if (!g_eventLog.dropFirstTick)
+    {
+        return;
+    }
+    int total = 0;
+    for (const auto& entry : g_eventLog.dropCounts)
+    {
+        total += entry.second;
+    }
+    std::string summary;
+    if (total == 1)
+    {
+        summary = "Dropped " + g_eventLog.dropCounts.begin()->first;
+    }
+    else
+    {
+        char head[48]{};
+        std::snprintf(head, sizeof(head), "Dropped %d items", total);
+        summary = head;
+        int shown = 0;
+        for (const auto& entry : g_eventLog.dropCounts)
+        {
+            if (shown == 3)
+            {
+                break;
+            }
+            summary += (shown == 0) ? " incl. " : ", ";
+            summary += entry.first;
+            if (entry.second > 1)
+            {
+                char suffix[16]{};
+                std::snprintf(suffix, sizeof(suffix), " x%d", entry.second);
+                summary += suffix;
+            }
+            ++shown;
+        }
+    }
+    g_eventLog.dropFirstTick = 0;
+    g_eventLog.dropLastTick = 0;
+    g_eventLog.dropCounts.clear();
+    QueueGameEvent("item", summary);
+}
+
+// Out-of-combat shooting: an isolated shot or burst (hunting, target practice,
+// a warning shot) becomes ONE event when the burst goes quiet. If real combat
+// starts mid-burst, EmitCombatEncounterEvent supersedes it and this is dropped.
+void EmitShootingEvent()
+{
+    if (!g_eventLog.shootFirstTick)
+    {
+        return;
+    }
+    const int shots = g_eventLog.shootShots;
+    const std::string weapon = g_eventLog.shootWeapon;
+    g_eventLog.shootFirstTick = 0;
+    g_eventLog.shootLastTick = 0;
+    g_eventLog.shootShots = 0;
+    g_eventLog.shootWeapon.clear();
+
+    std::string summary;
+    if (shots <= 1)
+    {
+        summary = weapon.empty() ? "Took a shot" : ("Fired a shot from your " + weapon);
+    }
+    else
+    {
+        char head[96]{};
+        std::snprintf(head, sizeof(head), "Fired %d rounds", shots);
+        summary = head;
+        if (!weapon.empty())
+        {
+            summary += " from your " + weapon;
+        }
+    }
+    QueueGameEvent("shooting", summary);
+}
+
+void OnDropEventHandler(TESObjectREFR* /*thisObj*/, void* parameters)
+{
+    if (!parameters)
+    {
+        return;
+    }
+    void** params = static_cast<void**>(parameters);
+    auto* first = static_cast<TESObjectREFR*>(params[0]);
+    auto* second = static_cast<TESForm*>(params[1]);
+    if (g_eventLog.loggedHookFirstFire.insert("ondrop").second)
+    {
+        LogLine("event-log: hook ondrop fired for the first time this session (p0 type=%u, p1 type=%u).",
+            first ? static_cast<unsigned>(first->typeID) : 0,
+            second ? static_cast<unsigned>(second->typeID) : 0);
+    }
+    PlayerCharacter* player = GetPlayer();
+    if (!player)
+    {
+        return;
+    }
+    // Classic OnDrop marks the dropping actor with the item base as the object;
+    // accept the swapped orientation too.
+    if (first == static_cast<TESObjectREFR*>(player) && second)
+    {
+        RecordPlayerItemDrop(second);
+    }
+    else if (second == static_cast<TESForm*>(player) && first && first->baseForm)
+    {
+        RecordPlayerItemDrop(first->baseForm);
+    }
+}
+
+void OnFireEventHandler(TESObjectREFR* /*thisObj*/, void* parameters)
+{
+    if (!parameters)
+    {
+        return;
+    }
+    void** params = static_cast<void**>(parameters);
+    auto* first = static_cast<TESObjectREFR*>(params[0]);
+    auto* second = static_cast<TESForm*>(params[1]);
+    if (g_eventLog.loggedHookFirstFire.insert("onfire").second)
+    {
+        LogLine("event-log: hook onfire fired for the first time this session (p0 type=%u, p1 type=%u).",
+            first ? static_cast<unsigned>(first->typeID) : 0,
+            second ? static_cast<unsigned>(second->typeID) : 0);
+    }
+    // Only the PLAYER firing, and only while NOT in a combat encounter (in
+    // combat the shots are part of the fight and would be pure noise).
+    PlayerCharacter* player = GetPlayer();
+    if (!player)
+    {
+        return;
+    }
+    const bool playerFired = (first == static_cast<TESObjectREFR*>(player))
+        || (second == static_cast<TESForm*>(player));
+    if (!playerFired || g_eventLog.combatActive || player->unk104)
+    {
+        return;
+    }
+    const DWORD now = GetTickCount();
+    if (!g_eventLog.shootFirstTick)
+    {
+        g_eventLog.shootFirstTick = now;
+        g_eventLog.shootShots = 0;
+        TESObjectWEAP* weapon = player->GetEquippedWeapon();
+        g_eventLog.shootWeapon = weapon ? GetDisplayNameSafe(weapon) : "";
+    }
+    g_eventLog.shootLastTick = now;
+    g_eventLog.shootShots += 1;
 }
 
 void RegisterGameEventHandlers()
@@ -15081,6 +15311,8 @@ void RegisterGameEventHandlers()
         { "onhit", OnHitEventHandler },
         { "onadd", OnAddEventHandler },
         { "onactorequip", OnActorEquipEventHandler },
+        { "ondrop", OnDropEventHandler },
+        { "onfire", OnFireEventHandler },
     };
     for (const HookSpec& hook : hooks)
     {
@@ -15107,6 +15339,14 @@ void ResetGameEventRuntime(const char* reason)
     g_eventLog.lootCounts.clear();
     g_eventLog.lootNotables.clear();
     g_eventLog.recentEquips.clear();
+    g_eventLog.recentConsumables.clear();
+    g_eventLog.dropFirstTick = 0;
+    g_eventLog.dropLastTick = 0;
+    g_eventLog.dropCounts.clear();
+    g_eventLog.shootFirstTick = 0;
+    g_eventLog.shootLastTick = 0;
+    g_eventLog.shootShots = 0;
+    g_eventLog.shootWeapon.clear();
     g_eventLog.knownTeammates.clear();
     g_eventLog.questObjectiveStatus.clear();
     g_eventLog.lastConversationNpcKey.clear();
@@ -15385,6 +15625,18 @@ void UpdateGameEventLog()
         && (now - g_eventLog.lootLastTick) >= kLootWindowQuietMs)
     {
         EmitLootWindowEvent();
+    }
+    if (g_eventLog.dropFirstTick
+        && g_eventLog.dropLastTick
+        && (now - g_eventLog.dropLastTick) >= kDropWindowQuietMs)
+    {
+        EmitDropWindowEvent();
+    }
+    if (g_eventLog.shootFirstTick
+        && g_eventLog.shootLastTick
+        && (now - g_eventLog.shootLastTick) >= kShootWindowQuietMs)
+    {
+        EmitShootingEvent();
     }
     FlushGameEvents(false);
 }
