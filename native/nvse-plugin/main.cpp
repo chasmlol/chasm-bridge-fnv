@@ -29,18 +29,10 @@
 #include <dsound.h>
 #include <mmsystem.h>
 #include <winhttp.h>
-// Persona capture: read the presented frame off the game's own D3D9 device
-// (header-only COM vtable calls; no d3d9.lib import needed) and JPEG-encode it
-// with GDI+ on a background thread. objidl.h supplies IStream for gdiplus.
-#include <d3d9.h>
-#include <objidl.h>
-#include <gdiplus.h>
 #include <memory>
 
 #pragma comment(lib, "winmm.lib")
 #pragma comment(lib, "winhttp.lib")
-#pragma comment(lib, "gdiplus.lib")
-#pragma comment(lib, "ole32.lib")
 
 #include "common/ITypes.h"
 #include "nvse/containers.h"
@@ -55,6 +47,8 @@
 #include "nvse/GameEffects.h"
 #include "nvse/GameOSDepend.h"
 #include "nvse/GameUI.h"
+
+#include "facegen_age.h"
 
 PluginHandle g_pluginHandle = kPluginHandle_Invalid;
 NVSEInterface* g_nvse = nullptr;
@@ -565,20 +559,7 @@ struct DebugConfig
     // http_port regardless of `transport` (chasm's HTTP server runs even when
     // dialogue turns ride the file bridge). ---
     bool personaEnabled = true;              // master switch for the whole feature
-    bool personaScreenshotEnabled = true;    // false = stats-only uploads (no camera swing)
-    bool personaCaptureOnAutosave = false;   // let autosaves (door transitions...) trigger too
     std::string personaHttpPath = "/api/game/v1/persona";
-    DWORD personaDebounceMs = 30000;         // min gap between capture sequences (quicksave spam)
-    float personaCameraDistanceUnits = 220.0f; // portrait camera distance in front of the player
-    float personaCameraHeightUnits = 100.0f;   // portrait camera eye height above the player's feet
-    int personaPortraitSize = 1024;          // offscreen portrait height (width = 3/4 of this)
-    float personaPortraitFovDeg = 48.0f;     // full-body framing: camera vertical FOV (degrees)
-    bool personaFaceFraming = true;          // frame the head (tracked via Bip01 Head) instead of the full body
-    float personaFaceDistanceUnits = 70.0f;  // face framing: camera distance in front of the head
-    float personaFaceFovDeg = 30.0f;         // face framing: camera vertical FOV (degrees)
-    bool personaPortraitMirror = false;      // flip horizontally if the render comes out mirrored
-    int personaMaxImageWidth = 1280;         // downscale bound before JPEG encode
-    int personaJpegQuality = 85;             // GDI+ JPEG quality (30..100)
 };
 
 RuntimeState g_state;
@@ -2755,27 +2736,12 @@ void WriteDefaultDebugConfigIfMissing()
         << "http_host=127.0.0.1\r\n"
         << "http_port=7341\r\n"
         << "http_turn_path=/api/game/v1/turn\r\n"
-        << "# Player persona capture (docs/persona.md): when the game is saved (quicksave or\r\n"
-        << "# manual save), render the player model OFF-SCREEN (isolated, blank background -\r\n"
-        << "# nothing visible in-game) + snap a stats snapshot and POST them to chasm\r\n"
-        << "# (http_host:http_port, used even when transport=file). persona_screenshot=0\r\n"
-        << "# sends stats only; persona_capture_on_autosave=1 lets autosaves trigger too.\r\n"
-        << "# persona_portrait_mirror=1 flips the portrait if it renders mirrored.\r\n"
+        << "# Player persona capture (docs/persona.md): EVERY game save (manual, quicksave,\r\n"
+        << "# autosave) snaps the player's stats + appearance data (sex, race, hair, eyes,\r\n"
+        << "# facial hair, outfit - no screenshot, nothing rendered) and POSTs it to chasm\r\n"
+        << "# (http_host:http_port, used even when transport=file).\r\n"
         << "persona=1\r\n"
-        << "persona_screenshot=1\r\n"
-        << "persona_capture_on_autosave=0\r\n"
-        << "persona_http_path=/api/game/v1/persona\r\n"
-        << "persona_debounce_ms=30000\r\n"
-        << "persona_camera_distance_units=220.0\r\n"
-        << "persona_camera_height_units=100.0\r\n"
-        << "persona_portrait_framing=face\r\n"
-        << "persona_face_distance_units=70.0\r\n"
-        << "persona_face_fov_deg=30.0\r\n"
-        << "persona_portrait_size=1024\r\n"
-        << "persona_portrait_fov_deg=48.0\r\n"
-        << "persona_portrait_mirror=0\r\n"
-        << "persona_max_image_width=1280\r\n"
-        << "persona_jpeg_quality=85\r\n";
+        << "persona_http_path=/api/game/v1/persona\r\n";
 }
 
 void LoadDebugConfigIfNeeded(bool force)
@@ -3013,99 +2979,16 @@ void LoadDebugConfigIfNeeded(bool force)
         {
             config.personaEnabled = ParseConfigBool(value, config.personaEnabled);
         }
-        else if (key == "persona_screenshot")
-        {
-            config.personaScreenshotEnabled = ParseConfigBool(value, config.personaScreenshotEnabled);
-        }
-        else if (key == "persona_capture_on_autosave")
-        {
-            config.personaCaptureOnAutosave = ParseConfigBool(value, config.personaCaptureOnAutosave);
-        }
+        // The screenshot feature is fully retired: persona_screenshot,
+        // persona_capture_on_autosave, persona_debounce_ms and every
+        // persona_camera_* / persona_portrait_* / persona_face_* /
+        // persona_max_image_width / persona_jpeg_quality key is ignored if
+        // present in an old cfg (captures are data-only, on every save).
         else if (key == "persona_http_path")
         {
             if (!value.empty() && value[0] == '/')
             {
                 config.personaHttpPath = value;
-            }
-        }
-        else if (key == "persona_debounce_ms")
-        {
-            const int interval = std::atoi(value.c_str());
-            if (interval >= 5000 && interval <= 600000)
-            {
-                config.personaDebounceMs = static_cast<DWORD>(interval);
-            }
-        }
-        else if (key == "persona_camera_distance_units")
-        {
-            const float distance = static_cast<float>(std::atof(value.c_str()));
-            if (distance >= 40.0f && distance <= 600.0f)
-            {
-                config.personaCameraDistanceUnits = distance;
-            }
-        }
-        else if (key == "persona_camera_height_units")
-        {
-            const float height = static_cast<float>(std::atof(value.c_str()));
-            if (height >= 0.0f && height <= 300.0f)
-            {
-                config.personaCameraHeightUnits = height;
-            }
-        }
-        else if (key == "persona_portrait_framing")
-        {
-            config.personaFaceFraming = value != "body";
-        }
-        else if (key == "persona_face_distance_units")
-        {
-            const float distance = static_cast<float>(std::atof(value.c_str()));
-            if (distance >= 15.0f && distance <= 300.0f)
-            {
-                config.personaFaceDistanceUnits = distance;
-            }
-        }
-        else if (key == "persona_face_fov_deg")
-        {
-            const float fov = static_cast<float>(std::atof(value.c_str()));
-            if (fov >= 10.0f && fov <= 90.0f)
-            {
-                config.personaFaceFovDeg = fov;
-            }
-        }
-        else if (key == "persona_portrait_size")
-        {
-            const int size = std::atoi(value.c_str());
-            if (size >= 256 && size <= 2048)
-            {
-                config.personaPortraitSize = size;
-            }
-        }
-        else if (key == "persona_portrait_fov_deg")
-        {
-            const float fov = static_cast<float>(std::atof(value.c_str()));
-            if (fov >= 15.0f && fov <= 100.0f)
-            {
-                config.personaPortraitFovDeg = fov;
-            }
-        }
-        else if (key == "persona_portrait_mirror")
-        {
-            config.personaPortraitMirror = value == "1" || value == "true";
-        }
-        else if (key == "persona_max_image_width")
-        {
-            const int width = std::atoi(value.c_str());
-            if (width >= 320 && width <= 3840)
-            {
-                config.personaMaxImageWidth = width;
-            }
-        }
-        else if (key == "persona_jpeg_quality")
-        {
-            const int quality = std::atoi(value.c_str());
-            if (quality >= 30 && quality <= 100)
-            {
-                config.personaJpegQuality = quality;
             }
         }
     }
@@ -13144,64 +13027,28 @@ void UpdateVoiceCaptureHotkey()
 // =====================================================================================
 // Player persona capture (frozen contract: docs/persona.md).
 //
-// SAVE-DRIVEN: capturing fires when the player saves the game. The NVSE SaveGame
+// SAVE-DRIVEN, UNCONDITIONAL: EVERY save captures — manual, quicksave, and
+// autosave alike, with no debounce and no idle gating. The NVSE SaveGame
 // message (the same detection point the save-sync machinery uses) classifies the
-// save by file name — quicksave*.fos -> "quicksave", autosave*.fos -> "autosave"
-// (ignored unless persona_capture_on_autosave=1), anything else -> "save" — and,
-// debounced to one sequence per personaDebounceMs, marks a capture PENDING. The
-// pending capture is taken the moment the idle gates below have held for
-// kPersonaGateStabilityMs (a save from a menu or mid-combat simply defers it);
-// if the gates stay closed for kPersonaPendingMaxAgeMs the pending capture
-// degrades to a stats-only upload so the save still refreshes the persona.
-// Saves always regenerate server-side, even with identical stats (fresh
-// screenshot -> fresh description). When a capture runs, the plugin:
+// save by file name — quicksave*.fos -> "quicksave", autosave*.fos -> "autosave",
+// anything else -> "save" — and marks a capture pending; the main-loop driver
+// takes it on the next frame (saves in a burst coalesce while an upload is in
+// flight — one upload runs end-to-end at a time, latest stats win). Saves always
+// regenerate server-side, even with identical data.
 //
-//   1. snapshots the stats as JSON fields (the same display strings the macros send),
-//   2. renders the player's 3rd-person model OFF-SCREEN: it walks the player's
-//      scene-graph subtree (player->GetNiNode() — maintained by the engine even in
-//      first person; this is how player shadows work), CPU-skins the skinned
-//      tri-shapes from the live skeleton pose, and draws everything fixed-function
-//      textured into a PRIVATE render target cleared to a flat studio background,
-//      viewed by a synthetic camera placed in front of the player's facing. The
-//      visible frame, the game camera, and the HUD are never touched — the player
-//      sees NOTHING, and the portrait has a clean blank background (the model is
-//      isolated; the world is never drawn),
-//   3. reads the private target back and hands the pixels to a detached background
-//      thread that downscales, JPEG-encodes (GDI+), base64s, and POSTs
-//      `{stats..., image_format, image_base64}` to chasm's POST /api/game/v1/persona
-//      with bounded timeouts (fire-and-forget; a dead backend costs nothing but a
-//      log line). Any render failure still uploads stats (chasm falls back to
-//      stats-only persona generation), and the scene-graph pass is SEH-guarded so a
-//      bad pointer aborts the capture instead of the game.
-//
-// Cost, honestly: one-time CPU skinning + ~a few hundred draw calls on the game
-// thread (~1-3 ms) at most once per debounce window, plus a GetRenderTargetData
-// readback of a private 1024-class surface (no front-buffer stall, no visible
-// artifact of any kind).
-//
-// Engine layout sources (Fallout: New Vegas 1.4.0.525): the NiDX9Renderer singleton
-// + device offset from JIP LN NVSE internal/netimmerse.h (*(NiDX9Renderer**)0x11F4748,
-// device at +0x288); scene-graph/geometry/skinning layouts cross-checked between
-// TESReloaded's GameNi.h NEWVEGAS block and JIP LN NVSE internal/netimmerse.h (see
-// the portrait namespace below); isUsingScope 64F + pcInCombat DF0 from JIP
-// GameObjects.h, cross-checked against the xNVSE SDK comment block.
+// DATA-ONLY: the capture is a pure game-data snapshot — stats (the same display
+// strings the gamestate macros send) plus the player's appearance records (sex,
+// race, hair style/color/length, eye color, facial hair head parts, worn
+// apparel). Nothing is rendered, screenshotted, or encoded; the old offscreen
+// portrait renderer is fully retired (it depended on the engine's lazily built
+// 3rd-person head and produced garbage faces in first-person sessions). A
+// detached background thread POSTs the JSON to chasm's /api/game/v1/persona
+// with bounded timeouts (fire-and-forget; a dead backend costs one log line).
 // =====================================================================================
-
-constexpr UInt32 kNiDX9RendererSingletonAddress = 0x011F4748;
-constexpr UInt32 kNiDX9RendererDeviceOffset = 0x288;
-constexpr UInt32 kPlayerOffsetIsUsingScope = 0x64F;
-constexpr UInt32 kPlayerOffsetPcInCombat = 0xDF0;
-
-constexpr DWORD kPersonaGateStabilityMs = 1500;   // gates must hold this long before a capture
-constexpr DWORD kPersonaPendingMaxAgeMs = 5 * 60 * 1000; // pending save-capture -> stats-only after this
-constexpr float kPersonaPi = 3.14159265358979323846f;
 
 struct PersonaCaptureRuntime
 {
-    DWORD lastSequenceTick = 0;      // debounce anchor (also set by stats-only expiry uploads)
-    DWORD gatesSatisfiedSinceTick = 0;
-    bool capturePending = false;     // a save fired; capture when the gates next allow
-    DWORD pendingSinceTick = 0;      // when the save fired (drives the stats-only expiry)
+    bool capturePending = false;     // a save fired; capture on the next frame
     std::string pendingTrigger;      // "save" | "quicksave" | "autosave"
 };
 
@@ -13235,8 +13082,9 @@ std::string ClassifyPersonaSaveTrigger(const std::string& savePath)
 }
 
 // NVSE SaveGame hook (the same detection point the save-sync machinery uses):
-// classify the save, apply the autosave knob + the debounce, and mark a capture
-// pending. The main-loop driver takes it when the idle gates next allow.
+// classify the save and mark a capture pending — EVERY save, no debounce, no
+// autosave knob. The main-loop driver takes it on the next frame (a burst of
+// saves while an upload is in flight coalesces; latest trigger wins).
 void RequestPersonaCaptureForSave(const std::string& savePath)
 {
     if (!g_debugConfig.personaEnabled)
@@ -13244,35 +13092,99 @@ void RequestPersonaCaptureForSave(const std::string& savePath)
         return;
     }
     const std::string trigger = ClassifyPersonaSaveTrigger(savePath);
-    if (trigger == "autosave" && !g_debugConfig.personaCaptureOnAutosave)
-    {
-        return;
-    }
-
-    const DWORD now = GetTickCount();
-    if (g_persona.capturePending)
-    {
-        // Coalesce save bursts into the already-pending capture; keep the
-        // ORIGINAL pendingSinceTick so the stats-only expiry cannot be pushed
-        // out forever by repeated saves.
-        g_persona.pendingTrigger = trigger;
-        return;
-    }
-    if (g_persona.lastSequenceTick != 0 &&
-        (now - g_persona.lastSequenceTick) < g_debugConfig.personaDebounceMs)
-    {
-        LogLine("Persona: save (%s) within the debounce window; skipping capture.", trigger.c_str());
-        return;
-    }
-
     g_persona.capturePending = true;
-    g_persona.pendingSinceTick = now;
     g_persona.pendingTrigger = trigger;
     LogLine("Persona: capture pending (trigger=%s).", trigger.c_str());
 }
 
+// Reads `count` FaceGen coefficients into `out`. Layout verified against the
+// live process (2026-07-03): TESNPC::FaceGenData::values IS the float array
+// (begin pointer, despite the SDK's float** declaration), and useOffset /
+// maxOffset are the matching end/capacity pointers (begin + count*4) — a
+// begin/end/capacity triple. SEH-guarded and plausibility-checked (FaceGen
+// coefficients are small); returns false on fault or implausible data — the
+// caller then omits the age.
+bool ReadFaceGenCoeffsGuarded(const TESNPC::FaceGenData& fg, UInt32 count, float* out)
+{
+    __try
+    {
+        if (fg.count != count || fg.size != 1 || !fg.values)
+        {
+            return false;
+        }
+        if (fg.useOffset != reinterpret_cast<UInt32>(fg.values) + count * sizeof(float))
+        {
+            return false; // end pointer disagrees with the begin pointer
+        }
+        const float* src = reinterpret_cast<const float*>(fg.values);
+        for (UInt32 i = 0; i < count; ++i)
+        {
+            const float value = src[i];
+            if (!(value > -32.0f && value < 32.0f)) // NaN fails too
+            {
+                return false;
+            }
+        }
+        for (UInt32 i = 0; i < count; ++i)
+        {
+            out[i] = src[i];
+        }
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+// Estimates the player's age in years from the FaceGen coefficients — the
+// chargen Age slider bakes into these; the linear age/gender controls come
+// from the game's own facegen\si.ctl (see facegen_age.h). Age and gender are
+// each computed in the symmetric-shape and symmetric-texture subspaces and
+// averaged. Returns a negative value when the coefficients cannot be read or
+// fail the GENDER SELF-CHECK: the same coefficients must predict the
+// character's actual sex — a wrong prediction means the read was garbage, so
+// no age is reported rather than a wrong one.
+float EstimateFaceGenAgeYears(TESNPC* npc)
+{
+    float gs[facegen_age::kCoefficientCount];
+    float ts[facegen_age::kCoefficientCount];
+    // faceGenData[0] = geometry symmetric (50), [1] = geometry asymmetric
+    // (30), [2] = texture symmetric (50) — counts per the xNVSE SDK notes.
+    if (!ReadFaceGenCoeffsGuarded(npc->faceGenData[0], facegen_age::kCoefficientCount, gs) ||
+        !ReadFaceGenCoeffsGuarded(npc->faceGenData[2], facegen_age::kCoefficientCount, ts))
+    {
+        LogLine("Persona: FaceGen coefficients unavailable; age omitted.");
+        return -1.0f;
+    }
+    float ageShape = facegen_age::kAgeGsOffset;
+    float ageTexture = facegen_age::kAgeTsOffset;
+    float genderShape = facegen_age::kGenderGsOffset;
+    float genderTexture = facegen_age::kGenderTsOffset;
+    for (int i = 0; i < facegen_age::kCoefficientCount; ++i)
+    {
+        ageShape += gs[i] * facegen_age::kAgeGs[i];
+        ageTexture += ts[i] * facegen_age::kAgeTs[i];
+        genderShape += gs[i] * facegen_age::kGenderGs[i];
+        genderTexture += ts[i] * facegen_age::kGenderTs[i];
+    }
+    const float age = (ageShape + ageTexture) * 0.5f;
+    const float gender = (genderShape + genderTexture) * 0.5f; // -1 male .. +1 female
+    const bool female = npc->baseData.IsFemale();
+    if (gender < -4.0f || gender > 4.0f ||
+        (female && gender < -0.5f) || (!female && gender > 0.5f))
+    {
+        LogLine("Persona: FaceGen gender self-check failed (%.2f for %s); age omitted.",
+            gender, female ? "female" : "male");
+        return -1.0f;
+    }
+    LogLine("Persona: FaceGen age estimate %.1f years (shape %.1f, texture %.1f; gender %.2f).",
+        age, ageShape, ageTexture, gender);
+    return age;
+}
+
 // The capture's stats snapshot as JSON object FIELDS (no braces) so the sender
-// thread can splice the image fields in. Keys are the frozen vocabulary of
+// thread can splice extra fields in. Keys are the frozen vocabulary of
 // docs/persona.md; every value is the same display string the gamestate macros
 // send, and any unreadable field is omitted (the backend tolerates absence).
 std::string BuildPersonaStatsJsonFields(PlayerCharacter* player, const std::string& trigger)
@@ -13300,14 +13212,52 @@ std::string BuildPersonaStatsJsonFields(PlayerCharacter* player, const std::stri
         {
             AppendJsonMacro(out, first, "race", GetDisplayNameSafe(npc->race.race));
         }
+        // The chargen Age slider, recovered from the FaceGen coefficients
+        // (clamped to a plausible adult range; omitted when unreadable).
+        const float ageYears = EstimateFaceGenAgeYears(npc);
+        if (ageYears > 0.0f)
+        {
+            const int clamped = (std::clamp)(static_cast<int>(ageYears + 0.5f), 18, 70);
+            AppendJsonMacro(out, first, "age_years", std::to_string(clamped));
+        }
         if (npc->hair)
         {
             AppendJsonMacro(out, first, "hair_style", GetDisplayNameSafe(npc->hair));
+            // GECK hair-length slider, 0..1 (scales the chosen style's mesh).
+            if (npc->hairLength >= 0.0f && npc->hairLength <= 1.0f)
+            {
+                char length[16]{};
+                std::snprintf(length, sizeof(length), "%.2f", npc->hairLength);
+                AppendJsonMacro(out, first, "hair_length", length);
+            }
         }
         if (npc->eyes)
         {
             AppendJsonMacro(out, first, "eye_color", GetDisplayNameSafe(npc->eyes));
         }
+        // Facial hair: beards/mustaches are BGSHeadPart forms on the NPC (the
+        // list the barber menu edits). Join the named ones; empty when none
+        // (AppendJsonMacro drops empty values, so the key is simply absent).
+        std::string facialHair;
+        for (auto iter = npc->headPart.Begin(); !iter.End(); ++iter)
+        {
+            BGSHeadPart* part = iter.Get();
+            if (!part)
+            {
+                continue;
+            }
+            const std::string partName = GetDisplayNameSafe(part);
+            if (partName.empty())
+            {
+                continue;
+            }
+            if (!facialHair.empty())
+            {
+                facialHair += ", ";
+            }
+            facialHair += partName;
+        }
+        AppendJsonMacro(out, first, "facial_hair", facialHair);
         char hairHex[8]{};
         std::snprintf(hairHex, sizeof(hairHex), "#%02X%02X%02X",
             static_cast<unsigned>(npc->hairColor & 0xFF),
@@ -13327,1272 +13277,6 @@ std::string BuildPersonaStatsJsonFields(PlayerCharacter* player, const std::stri
     }
     AppendJsonMacro(out, first, "location", locationLabel);
     return out.str();
-}
-
-template <typename T>
-T ReadPlayerRaw(const PlayerCharacter* player, UInt32 offset)
-{
-    return *reinterpret_cast<const T*>(reinterpret_cast<const BYTE*>(player) + offset);
-}
-
-// Any menu other than the HUD itself (Pip-Boy, dialogue, barter, level-up, loading,
-// main menu...) blocks persona capture.
-bool AnyBlockingMenuVisible()
-{
-    for (UInt32 menuType = kMenuType_Min; menuType <= kMenuType_Max; ++menuType)
-    {
-        if (menuType == kMenuType_HUDMain)
-        {
-            continue;
-        }
-        if (IsMenuVisible(menuType))
-        {
-            return true;
-        }
-    }
-    return false;
-}
-
-// True when the player is idle in normal gameplay: no combat, no menus, no
-// dialogue/bridge activity, no save-sync, not scoped, not moving, alive. The
-// caller has already checked window focus + loadedIntoGame.
-bool PersonaGatesSatisfied(PlayerCharacter* player)
-{
-    if (g_state.awaitingInput || g_state.awaitingReply || g_state.awaitingVoiceReply)
-    {
-        return false;
-    }
-    if (g_state.voiceCapture.active || g_state.conversationHold.active || g_state.saveStateSyncPending)
-    {
-        return false;
-    }
-    if (HasQueuedOrPlayingReply() || IsTextInputMenuActive() || AnyBlockingMenuVisible())
-    {
-        return false;
-    }
-    if (ReadPlayerRaw<UInt8>(player, kPlayerOffsetPcInCombat) != 0)
-    {
-        return false;
-    }
-    if (ReadPlayerRaw<UInt8>(player, kPlayerOffsetIsUsingScope) != 0)
-    {
-        return false;
-    }
-    if (ReadPlayerActorValueInt(player, eActorVal_Health) <= 0)
-    {
-        return false;
-    }
-    if (player->actorMover)
-    {
-        const UInt32 movementFlags = player->GetMovementFlags();
-        constexpr UInt32 kMovingMask = (1u << 7) | (1u << 8) | (1u << 11); // walking / running / swimming
-        if ((movementFlags & kMovingMask) != 0)
-        {
-            return false;
-        }
-    }
-    return true;
-}
-
-// --- Offscreen player portrait renderer -----------------------------------------------
-//
-// Draws the player's 3rd-person model into a private render target — the screen,
-// game camera, and HUD are never involved. Minimal NEW VEGAS Gamebryo mirrors below;
-// every offset is cross-checked between TESReloaded GameNi.h (NEWVEGAS block) and
-// JIP LN NVSE internal/netimmerse.h. Field reads are raw offsets on purpose: the
-// xNVSE SDK's NiGeometry layout disagrees with both (it lacks the property state),
-// so we trust the two sources that ship working renderers against this executable.
-namespace portrait
-{
-
-struct NiRttiMirror
-{
-    const char* name;
-    NiRttiMirror* parent;
-};
-
-struct Mtx33
-{
-    float m[3][3];
-};
-
-struct Xform // NiTransform: 0x34 bytes
-{
-    Mtx33 rot;
-    float pos[3];
-    float scale;
-};
-
-// NiObject vtable slots (JIP: /*08*/GetType, /*0C*/GetNiNode, /*18*/GetNiGeometry,
-// /*1C*/GetTriBasedGeom, /*20*/GetTriStrips, /*24*/GetTriShape — each "returns this"
-// when the object IS that type, else null; slots 0/1 are the dtor + Free).
-enum : UInt32
-{
-    kVt_GetType = 2,
-    kVt_GetNiNode = 3,
-    kVt_GetTriBasedGeom = 7,
-    kVt_GetTriStrips = 8,
-    kVt_GetTriShape = 9,
-};
-
-using VtFn = void*(__thiscall*)(void*);
-
-inline void* VCall(void* obj, UInt32 slot)
-{
-    if (!obj)
-    {
-        return nullptr;
-    }
-    VtFn* vtbl = *reinterpret_cast<VtFn**>(obj);
-    if (!vtbl)
-    {
-        return nullptr;
-    }
-    return vtbl[slot](obj);
-}
-
-inline const char* RttiName(void* obj)
-{
-    auto* rtti = static_cast<NiRttiMirror*>(VCall(obj, kVt_GetType));
-    return (rtti && rtti->name) ? rtti->name : "";
-}
-
-template <typename T>
-inline T Read(const void* base, UInt32 offset)
-{
-    return *reinterpret_cast<const T*>(static_cast<const BYTE*>(base) + offset);
-}
-
-// NiAVObject / NiNode / NiGeometry field offsets (NV).
-constexpr UInt32 kOffAvWorldXform = 0x68;   // NiTransform m_worldTransform
-constexpr UInt32 kOffAvLocalXform = 0x34;   // NiTransform m_localTransform
-constexpr UInt32 kOffNetName = 0x08;        // NiObjectNET: const char* m_pcName
-constexpr UInt32 kOffAvWorldBound = 0x20;   // NiSphere { float x,y,z,radius }
-constexpr UInt32 kOffNodeChildren = 0x9C;   // NiTArray<NiAVObject*>: data +4, capacity(UInt16) +8
-constexpr UInt32 kOffGeoPropState = 0x9C;   // NiProperty* prop[6]; 3 = shader, 5 = texturing
-constexpr UInt32 kOffGeoData = 0xB8;        // NiGeometryData*
-constexpr UInt32 kOffGeoSkin = 0xBC;        // NiSkinInstance*
-// NiGeometryData.
-constexpr UInt32 kOffGdNumVerts = 0x08;     // UInt16
-constexpr UInt32 kOffGdVertices = 0x20;     // NiVector3*
-constexpr UInt32 kOffGdUvCoords = 0x2C;     // NiPoint2*
-// NiTriShapeData / NiTriStripsData.
-constexpr UInt32 kOffTsNumTris = 0x40;      // UInt16 (NiTriBasedGeomData)
-constexpr UInt32 kOffTsTriangles = 0x48;    // UInt16 triples
-constexpr UInt32 kOffStNumStrips = 0x44;    // UInt16
-constexpr UInt32 kOffStStripLengths = 0x48; // UInt16*
-constexpr UInt32 kOffStStrips = 0x4C;       // UInt16* (concatenated)
-// NiSkinInstance.
-constexpr UInt32 kOffSiSkinData = 0x08;     // NiSkinData*
-constexpr UInt32 kOffSiBoneObjects = 0x14;  // NiAVObject**
-constexpr UInt32 kOffSiBoneCount = 0x1C;    // UInt32
-// NiSkinData: BoneData* at 0x40, bone count at 0x44. BoneData is the natural
-// packing of { NiTransform skinToBone; NiPoint3 center; float radius;
-// BoneVertData* weights; UInt16 numVerts; } = 0x4C stride (TESReloaded's comment
-// offsets for this struct are internally inconsistent; the field ORDER is theirs,
-// the packing is arithmetic). Validated at runtime before use — see below.
-constexpr UInt32 kOffSdBoneData = 0x40;
-constexpr UInt32 kOffSdBoneCount = 0x44;
-constexpr UInt32 kBoneDataStride = 0x4C;
-constexpr UInt32 kOffBdSkinToBone = 0x00;
-constexpr UInt32 kOffBdWeights = 0x44;
-constexpr UInt32 kOffBdNumVerts = 0x48;
-
-struct BoneVertData // MSVC default packing: 8 bytes
-{
-    UInt16 vertIndex;
-    UInt16 pad;
-    float weight;
-};
-
-// Texture plumbing: NiTexture::rendererData at 0x24 -> NiDX9TextureData::dTexture
-// at 0x64. BSShaderPPLightingProperty keeps NiTexture** srcTextures[6] at 0xAC
-// (slot 0 = diffuse); BSShaderNoLightingProperty keeps NiTexture* at 0x60;
-// classic NiTexturingProperty keeps NiTArray<Map*> at 0x1C with Map::srcTexture
-// at 0x08 (map 0 = base).
-constexpr UInt32 kOffTexRendererData = 0x24;
-constexpr UInt32 kOffTexDataDTexture = 0x64;
-constexpr UInt32 kOffPplSrcTextures = 0xAC;
-constexpr UInt32 kOffNolSrcTexture = 0x60;
-constexpr UInt32 kOffTexPropMaps = 0x1C;
-constexpr UInt32 kOffMapSrcTexture = 0x08;
-
-inline void XformPoint(const Xform& t, const float in[3], float out[3])
-{
-    const float x = in[0] * t.scale;
-    const float y = in[1] * t.scale;
-    const float z = in[2] * t.scale;
-    out[0] = t.rot.m[0][0] * x + t.rot.m[0][1] * y + t.rot.m[0][2] * z + t.pos[0];
-    out[1] = t.rot.m[1][0] * x + t.rot.m[1][1] * y + t.rot.m[1][2] * z + t.pos[1];
-    out[2] = t.rot.m[2][0] * x + t.rot.m[2][1] * y + t.rot.m[2][2] * z + t.pos[2];
-}
-
-// out = a ∘ b (apply b first, then a).
-inline void ComposeXform(const Xform& a, const Xform& b, Xform& out)
-{
-    for (int r = 0; r < 3; ++r)
-    {
-        for (int c = 0; c < 3; ++c)
-        {
-            out.rot.m[r][c] = a.rot.m[r][0] * b.rot.m[0][c] + a.rot.m[r][1] * b.rot.m[1][c] +
-                a.rot.m[r][2] * b.rot.m[2][c];
-        }
-    }
-    XformPoint(a, b.pos, out.pos);
-    out.scale = a.scale * b.scale;
-}
-
-struct Vtx
-{
-    float x, y, z;
-    float u, v;
-};
-
-// One drawable extracted from the scene graph (plain data; device-ready).
-struct DrawItem
-{
-    std::vector<Vtx> vertices;
-    std::vector<UInt16> indices;      // triangle list
-    std::vector<UInt16> stripLengths; // when non-empty: indices holds concatenated strips
-    IDirect3DBaseTexture9* texture = nullptr;
-    D3DCOLOR tint = D3DCOLOR_XRGB(255, 255, 255); // modulated over the texture (hair tint)
-};
-
-inline bool NameContainsI(const char* haystack, const char* needle)
-{
-    if (!haystack || !needle)
-    {
-        return false;
-    }
-    const size_t needleLen = std::strlen(needle);
-    for (const char* p = haystack; *p; ++p)
-    {
-        if (_strnicmp(p, needle, needleLen) == 0)
-        {
-            return true;
-        }
-    }
-    return false;
-}
-
-// FNV hair/brow/beard textures are GRAYSCALE; the engine multiplies them by the
-// character's chosen hair color. The authoritative color is TESNPC::hairColor on
-// the player's base form (passed in via ExtractStats::hairTint by the caller) —
-// reading it from the shader material proved unreliable. Applied only to
-// hair-named meshes so other materials are never stained.
-struct ExtractStats;
-D3DCOLOR HairTintOf(void* geo, const ExtractStats& stats);
-
-// One-line texture diagnostics for head-region meshes: which texture source the
-// portrait picked and (when it is a disk texture) its DDS path. This is what
-// tells us where the FaceGen composed skin actually lives when a face renders
-// with the wrong texture.
-void LogHeadTextureDiag(void* geo, const char* source, void* niTexture)
-{
-    const char* geoName = Read<const char*>(geo, kOffNetName);
-    void* parent = Read<void*>(geo, 0x18);
-    const char* parentName = parent ? Read<const char*>(parent, kOffNetName) : nullptr;
-    const bool headish =
-        NameContainsI(geoName, "head") || NameContainsI(geoName, "hair") ||
-        NameContainsI(geoName, "eye") || NameContainsI(geoName, "brow") ||
-        NameContainsI(geoName, "teeth") || NameContainsI(geoName, "mouth") ||
-        NameContainsI(geoName, "beard") || NameContainsI(geoName, "face") ||
-        NameContainsI(parentName, "head") || NameContainsI(parentName, "face");
-    if (!headish)
-    {
-        return;
-    }
-    const char* texRtti = niTexture ? RttiName(niTexture) : "none";
-    const char* path = "";
-    if (niTexture && std::strstr(texRtti, "SourceTexture"))
-    {
-        const char* dds = Read<const char*>(niTexture, 0x30); // NiSourceTexture::ddsPath
-        if (dds)
-        {
-            path = dds;
-        }
-    }
-    LogLine("Persona portrait tex: geo='%s' parent='%s' via=%s tex=%s path='%s'",
-        geoName ? geoName : "?", parentName ? parentName : "?", source, texRtti, path);
-}
-
-struct ExtractStats
-{
-    int geometries = 0;
-    int skinned = 0;
-    int bindPoseFallbacks = 0;
-    int textured = 0;
-    int skippedNoData = 0;
-    bool hasHead = false;         // Bip01 Head was found in the pose walk
-    float headWorld[3] = {};      // its recomputed world position (face-framing anchor)
-    D3DCOLOR hairTint = D3DCOLOR_XRGB(255, 255, 255); // IN: player's chosen hair color (TESNPC::hairColor)
-    int repairedScales = 0;       // nodes whose ~0 scale was repaired to 1 (1st-person body hiding)
-    int skippedDegenerate = 0;    // items whose geometry collapsed to a point anyway
-    char repairedNames[160] = {}; // first few repaired node names, comma-joined
-};
-
-// Recomputed world transforms, keyed by NiAVObject*. Built by walking the node
-// hierarchy from LOCAL transforms so that first-person body hiding (nodes scaled
-// to ~0, e.g. by the engine or Enhanced Camera-style mods) cannot collapse the
-// portrait: any ~0 local scale is repaired to 1 before composing. The live scene
-// graph is never modified.
-using PoseMap = std::unordered_map<const void*, Xform>;
-
-void BuildPose(void* avObject, const Xform& parentWorld, PoseMap& pose, ExtractStats& stats, int depth)
-{
-    if (!avObject || depth > 24 || pose.size() > 4096)
-    {
-        return;
-    }
-    Xform local = Read<Xform>(avObject, kOffAvLocalXform);
-    if (local.scale < 0.01f)
-    {
-        local.scale = 1.0f;
-        ++stats.repairedScales;
-        const char* name = Read<const char*>(avObject, kOffNetName);
-        if (name && *name)
-        {
-            const size_t used = std::strlen(stats.repairedNames);
-            const size_t nameLen = std::strlen(name);
-            if (used + nameLen + 2 < sizeof(stats.repairedNames))
-            {
-                if (used)
-                {
-                    stats.repairedNames[used] = ',';
-                    std::memcpy(stats.repairedNames + used + 1, name, nameLen + 1);
-                }
-                else
-                {
-                    std::memcpy(stats.repairedNames, name, nameLen + 1);
-                }
-            }
-        }
-    }
-    Xform world{};
-    ComposeXform(parentWorld, local, world);
-    pose.emplace(avObject, world);
-    if (!stats.hasHead)
-    {
-        const char* nodeName = Read<const char*>(avObject, kOffNetName);
-        if (nodeName && _stricmp(nodeName, "Bip01 Head") == 0)
-        {
-            stats.hasHead = true;
-            stats.headWorld[0] = world.pos[0];
-            stats.headWorld[1] = world.pos[1];
-            stats.headWorld[2] = world.pos[2];
-        }
-    }
-    if (!VCall(avObject, kVt_GetNiNode))
-    {
-        return;
-    }
-    void** children = Read<void**>(avObject, kOffNodeChildren + 4);
-    const UInt16 capacity = Read<UInt16>(avObject, kOffNodeChildren + 8);
-    if (!children)
-    {
-        return;
-    }
-    for (UInt16 i = 0; i < capacity; ++i)
-    {
-        if (children[i])
-        {
-            BuildPose(children[i], world, pose, stats, depth + 1);
-        }
-    }
-}
-
-inline Xform PoseOf(const PoseMap& pose, const void* avObject, UInt32 fallbackOffset)
-{
-    const auto it = pose.find(avObject);
-    if (it != pose.end())
-    {
-        return it->second;
-    }
-    return Read<Xform>(avObject, fallbackOffset);
-}
-
-D3DCOLOR HairTintOf(void* geo, const ExtractStats& stats)
-{
-    const char* geoName = Read<const char*>(geo, kOffNetName);
-    void* parent = Read<void*>(geo, 0x18); // NiAVObject::m_parent
-    const char* parentName = parent ? Read<const char*>(parent, kOffNetName) : nullptr;
-    const bool hairish =
-        NameContainsI(geoName, "hair") || NameContainsI(parentName, "hair") ||
-        NameContainsI(geoName, "brow") || NameContainsI(geoName, "beard") ||
-        NameContainsI(geoName, "stache") || NameContainsI(geoName, "sideburn");
-    if (!hairish)
-    {
-        return D3DCOLOR_XRGB(255, 255, 255);
-    }
-    return stats.hairTint;
-}
-
-IDirect3DBaseTexture9* DiffuseTextureOf(void* geo)
-{
-    void* shaderProp = Read<void*>(geo, kOffGeoPropState + 3 * 4);
-    if (shaderProp)
-    {
-        const char* rtti = RttiName(shaderProp);
-        void* niTexture = nullptr;
-        const char* source = "ppl0";
-        if (std::strstr(rtti, "PPLighting") || std::strstr(rtti, "Lighting30"))
-        {
-            void** diffuseSlot = Read<void**>(shaderProp, kOffPplSrcTextures);
-            if (diffuseSlot)
-            {
-                niTexture = *diffuseSlot;
-            }
-        }
-        else if (std::strstr(rtti, "NoLighting"))
-        {
-            niTexture = Read<void*>(shaderProp, kOffNolSrcTexture);
-            source = "nolighting";
-        }
-        if (niTexture)
-        {
-            LogHeadTextureDiag(geo, source, niTexture);
-            void* rendererData = Read<void*>(niTexture, kOffTexRendererData);
-            if (rendererData)
-            {
-                return Read<IDirect3DBaseTexture9*>(rendererData, kOffTexDataDTexture);
-            }
-        }
-    }
-    void* texProp = Read<void*>(geo, kOffGeoPropState + 5 * 4);
-    if (texProp)
-    {
-        void** maps = Read<void**>(texProp, kOffTexPropMaps + 4);
-        const UInt16 capacity = Read<UInt16>(texProp, kOffTexPropMaps + 8);
-        if (maps && capacity > 0 && maps[0])
-        {
-            void* srcTexture = Read<void*>(maps[0], kOffMapSrcTexture);
-            if (srcTexture)
-            {
-                LogHeadTextureDiag(geo, "texturing", srcTexture);
-                void* rendererData = Read<void*>(srcTexture, kOffTexRendererData);
-                if (rendererData)
-                {
-                    return Read<IDirect3DBaseTexture9*>(rendererData, kOffTexDataDTexture);
-                }
-            }
-        }
-    }
-    LogHeadTextureDiag(geo, "NONE", nullptr);
-    return nullptr;
-}
-
-// Validates the assumed NiSkinData::BoneData layout against live data before
-// trusting it: every bone's weight list must be a readable array of plausible
-// (index < numVerts, 0 <= weight <= 1.02) entries. One failed bone rejects the
-// skin (that geometry falls back to bind pose + node transform).
-bool SkinLooksValid(void* skinData, UInt32 boneCount, UInt16 numVerts)
-{
-    const BYTE* boneData = Read<const BYTE*>(skinData, kOffSdBoneData);
-    if (!boneData || boneCount == 0 || boneCount > 256)
-    {
-        return false;
-    }
-    for (UInt32 b = 0; b < boneCount; ++b)
-    {
-        const BYTE* bone = boneData + b * kBoneDataStride;
-        const auto* weights = *reinterpret_cast<const BoneVertData* const*>(bone + kOffBdWeights);
-        const UInt16 boneVerts = *reinterpret_cast<const UInt16*>(bone + kOffBdNumVerts);
-        if (!weights || boneVerts == 0 || boneVerts > numVerts)
-        {
-            return false;
-        }
-        // Spot-check first + last entries (full scan happens during accumulation).
-        const BoneVertData& first = weights[0];
-        const BoneVertData& last = weights[boneVerts - 1];
-        if (first.vertIndex >= numVerts || last.vertIndex >= numVerts)
-        {
-            return false;
-        }
-        if (!(first.weight >= -0.01f && first.weight <= 1.02f) ||
-            !(last.weight >= -0.01f && last.weight <= 1.02f))
-        {
-            return false;
-        }
-    }
-    return true;
-}
-
-// Extracts one geometry into a DrawItem: world-space positions (CPU-skinned when a
-// valid skin is present, else bind pose x node world transform), UVs, indices, and
-// the diffuse texture. Returns false when the geometry has nothing drawable.
-bool ExtractGeometry(void* geo, const PoseMap& pose, DrawItem& item, ExtractStats& stats)
-{
-    void* data = Read<void*>(geo, kOffGeoData);
-    if (!data)
-    {
-        ++stats.skippedNoData;
-        return false;
-    }
-    const UInt16 numVerts = Read<UInt16>(data, kOffGdNumVerts);
-    const float* bindVerts = Read<const float*>(data, kOffGdVertices);
-    const float* uvs = Read<const float*>(data, kOffGdUvCoords);
-    if (!numVerts || !bindVerts)
-    {
-        ++stats.skippedNoData;
-        return false;
-    }
-
-    // Indices first — no point skinning something we cannot draw.
-    if (VCall(geo, kVt_GetTriShape))
-    {
-        const UInt16 numTris = Read<UInt16>(data, kOffTsNumTris);
-        const UInt16* tris = Read<const UInt16*>(data, kOffTsTriangles);
-        if (!numTris || !tris)
-        {
-            ++stats.skippedNoData;
-            return false;
-        }
-        item.indices.assign(tris, tris + static_cast<size_t>(numTris) * 3);
-    }
-    else if (VCall(geo, kVt_GetTriStrips))
-    {
-        const UInt16 numStrips = Read<UInt16>(data, kOffStNumStrips);
-        const UInt16* lengths = Read<const UInt16*>(data, kOffStStripLengths);
-        const UInt16* strips = Read<const UInt16*>(data, kOffStStrips);
-        if (!numStrips || !lengths || !strips)
-        {
-            ++stats.skippedNoData;
-            return false;
-        }
-        size_t total = 0;
-        for (UInt16 s = 0; s < numStrips; ++s)
-        {
-            total += lengths[s];
-        }
-        if (!total || total > 200000)
-        {
-            ++stats.skippedNoData;
-            return false;
-        }
-        item.stripLengths.assign(lengths, lengths + numStrips);
-        item.indices.assign(strips, strips + total);
-    }
-    else
-    {
-        return false; // not a tri-based geometry (particles etc.)
-    }
-
-    // Positions: CPU skinning from the live skeleton pose when possible.
-    std::vector<float> world(static_cast<size_t>(numVerts) * 3, 0.0f);
-    bool skinned = false;
-    void* skin = Read<void*>(geo, kOffGeoSkin);
-    void* skinData = skin ? Read<void*>(skin, kOffSiSkinData) : nullptr;
-    if (skinData)
-    {
-        const UInt32 boneCount = Read<UInt32>(skinData, kOffSdBoneCount);
-        void** boneObjects = Read<void**>(skin, kOffSiBoneObjects);
-        const UInt32 instanceBones = Read<UInt32>(skin, kOffSiBoneCount);
-        if (boneObjects && instanceBones == boneCount && SkinLooksValid(skinData, boneCount, numVerts))
-        {
-            std::vector<float> accumulated(static_cast<size_t>(numVerts), 0.0f);
-            const BYTE* boneData = Read<const BYTE*>(skinData, kOffSdBoneData);
-            for (UInt32 b = 0; b < boneCount; ++b)
-            {
-                void* boneNode = boneObjects[b];
-                if (!boneNode)
-                {
-                    continue;
-                }
-                const Xform boneWorld = PoseOf(pose, boneNode, kOffAvWorldXform);
-                const BYTE* bone = boneData + b * kBoneDataStride;
-                const Xform skinToBone = *reinterpret_cast<const Xform*>(bone + kOffBdSkinToBone);
-                Xform toWorld{};
-                ComposeXform(boneWorld, skinToBone, toWorld);
-                const auto* weights = *reinterpret_cast<const BoneVertData* const*>(bone + kOffBdWeights);
-                const UInt16 boneVerts = *reinterpret_cast<const UInt16*>(bone + kOffBdNumVerts);
-                for (UInt16 w = 0; w < boneVerts; ++w)
-                {
-                    const UInt16 index = weights[w].vertIndex;
-                    const float weight = weights[w].weight;
-                    if (index >= numVerts || weight <= 0.0f)
-                    {
-                        continue;
-                    }
-                    float p[3];
-                    XformPoint(toWorld, bindVerts + static_cast<size_t>(index) * 3, p);
-                    float* out = world.data() + static_cast<size_t>(index) * 3;
-                    out[0] += p[0] * weight;
-                    out[1] += p[1] * weight;
-                    out[2] += p[2] * weight;
-                    accumulated[index] += weight;
-                }
-            }
-            // Renormalize (weights should sum to ~1; guard drift) and catch
-            // unweighted verts.
-            const Xform geoWorld = PoseOf(pose, geo, kOffAvWorldXform);
-            for (UInt16 v = 0; v < numVerts; ++v)
-            {
-                float* out = world.data() + static_cast<size_t>(v) * 3;
-                const float total = accumulated[v];
-                if (total > 0.05f)
-                {
-                    out[0] /= total;
-                    out[1] /= total;
-                    out[2] /= total;
-                }
-                else
-                {
-                    XformPoint(geoWorld, bindVerts + static_cast<size_t>(v) * 3, out);
-                }
-            }
-            skinned = true;
-            ++stats.skinned;
-        }
-    }
-    if (!skinned)
-    {
-        const Xform geoWorld = PoseOf(pose, geo, kOffAvWorldXform);
-        for (UInt16 v = 0; v < numVerts; ++v)
-        {
-            XformPoint(geoWorld, bindVerts + static_cast<size_t>(v) * 3,
-                world.data() + static_cast<size_t>(v) * 3);
-        }
-        if (skinData)
-        {
-            ++stats.bindPoseFallbacks;
-        }
-    }
-
-    item.vertices.resize(numVerts);
-    for (UInt16 v = 0; v < numVerts; ++v)
-    {
-        Vtx& out = item.vertices[v];
-        const float* p = world.data() + static_cast<size_t>(v) * 3;
-        out.x = p[0];
-        out.y = p[1];
-        out.z = p[2];
-        out.u = uvs ? uvs[static_cast<size_t>(v) * 2] : 0.0f;
-        out.v = uvs ? uvs[static_cast<size_t>(v) * 2 + 1] : 0.0f;
-    }
-
-    // A part that still collapsed to a point (hidden by something scale-repair
-    // could not see) must not leave specks in the portrait.
-    float minC[3] = { FLT_MAX, FLT_MAX, FLT_MAX };
-    float maxC[3] = { -FLT_MAX, -FLT_MAX, -FLT_MAX };
-    for (const Vtx& v : item.vertices)
-    {
-        minC[0] = (std::min)(minC[0], v.x); maxC[0] = (std::max)(maxC[0], v.x);
-        minC[1] = (std::min)(minC[1], v.y); maxC[1] = (std::max)(maxC[1], v.y);
-        minC[2] = (std::min)(minC[2], v.z); maxC[2] = (std::max)(maxC[2], v.z);
-    }
-    const float extent = (maxC[0] - minC[0]) + (maxC[1] - minC[1]) + (maxC[2] - minC[2]);
-    if (extent < 1.0f)
-    {
-        ++stats.skippedDegenerate;
-        return false;
-    }
-
-    item.texture = DiffuseTextureOf(geo);
-    if (item.texture)
-    {
-        ++stats.textured;
-        item.tint = HairTintOf(geo, stats);
-    }
-    ++stats.geometries;
-    return true;
-}
-
-void CollectGeometry(void* avObject, const PoseMap& pose, std::vector<DrawItem>& items, ExtractStats& stats, int depth)
-{
-    if (!avObject || depth > 24 || items.size() >= 512)
-    {
-        return;
-    }
-    if (VCall(avObject, kVt_GetTriBasedGeom))
-    {
-        DrawItem item;
-        if (ExtractGeometry(avObject, pose, item, stats))
-        {
-            items.push_back(std::move(item));
-        }
-        return;
-    }
-    if (!VCall(avObject, kVt_GetNiNode))
-    {
-        return;
-    }
-    void** children = Read<void**>(avObject, kOffNodeChildren + 4);
-    const UInt16 capacity = Read<UInt16>(avObject, kOffNodeChildren + 8);
-    if (!children)
-    {
-        return;
-    }
-    for (UInt16 i = 0; i < capacity; ++i)
-    {
-        if (children[i])
-        {
-            CollectGeometry(children[i], pose, items, stats, depth + 1);
-        }
-    }
-}
-
-// SEH around the scene-graph pass: raw engine pointers are involved, and a wild
-// read must abort the capture, not the game. No unwindable locals in this frame.
-bool CollectGeometryGuarded(void* root, PoseMap* pose, std::vector<DrawItem>* items, ExtractStats* stats)
-{
-    __try
-    {
-        // The root placement is trusted (it is the actor position); the pose
-        // below it is recomputed from locals with scale repair. Composing
-        // children against the root stored world keeps world-space placement.
-        Xform rootWorld = *reinterpret_cast<const Xform*>(static_cast<const BYTE*>(root) + kOffAvWorldXform);
-        if (rootWorld.scale < 0.01f)
-        {
-            rootWorld.scale = 1.0f;
-            ++stats->repairedScales;
-        }
-        pose->emplace(root, rootWorld);
-        void** children = *reinterpret_cast<void***>(static_cast<BYTE*>(root) + kOffNodeChildren + 4);
-        const UInt16 capacity = *reinterpret_cast<const UInt16*>(static_cast<const BYTE*>(root) + kOffNodeChildren + 8);
-        if (children)
-        {
-            for (UInt16 i = 0; i < capacity; ++i)
-            {
-                if (children[i])
-                {
-                    BuildPose(children[i], rootWorld, *pose, *stats, 1);
-                }
-            }
-        }
-        CollectGeometry(root, *pose, *items, *stats, 0);
-        return true;
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-        return false;
-    }
-}
-
-// Row-vector 4x4 (D3D fixed-function convention).
-struct Mtx44
-{
-    float m[4][4];
-};
-
-inline void LookAt(const float eye[3], const float at[3], bool mirror, Mtx44& out)
-{
-    float f[3] = { at[0] - eye[0], at[1] - eye[1], at[2] - eye[2] };
-    const float fLen = std::sqrt(f[0] * f[0] + f[1] * f[1] + f[2] * f[2]);
-    if (fLen < 0.001f)
-    {
-        f[0] = 0.0f;
-        f[1] = 1.0f;
-        f[2] = 0.0f;
-    }
-    else
-    {
-        f[0] /= fLen;
-        f[1] /= fLen;
-        f[2] /= fLen;
-    }
-    const float up[3] = { 0.0f, 0.0f, 1.0f };
-    float r[3] = { up[1] * f[2] - up[2] * f[1], up[2] * f[0] - up[0] * f[2], up[0] * f[1] - up[1] * f[0] };
-    const float rLen = std::sqrt(r[0] * r[0] + r[1] * r[1] + r[2] * r[2]);
-    if (rLen < 0.001f)
-    {
-        r[0] = 1.0f;
-        r[1] = 0.0f;
-        r[2] = 0.0f;
-    }
-    else
-    {
-        r[0] /= rLen;
-        r[1] /= rLen;
-        r[2] /= rLen;
-    }
-    if (mirror)
-    {
-        r[0] = -r[0];
-        r[1] = -r[1];
-        r[2] = -r[2];
-    }
-    const float u[3] = { f[1] * r[2] - f[2] * r[1], f[2] * r[0] - f[0] * r[2], f[0] * r[1] - f[1] * r[0] };
-    out = {};
-    out.m[0][0] = r[0]; out.m[0][1] = u[0]; out.m[0][2] = f[0];
-    out.m[1][0] = r[1]; out.m[1][1] = u[1]; out.m[1][2] = f[1];
-    out.m[2][0] = r[2]; out.m[2][1] = u[2]; out.m[2][2] = f[2];
-    out.m[3][0] = -(r[0] * eye[0] + r[1] * eye[1] + r[2] * eye[2]);
-    out.m[3][1] = -(u[0] * eye[0] + u[1] * eye[1] + u[2] * eye[2]);
-    out.m[3][2] = -(f[0] * eye[0] + f[1] * eye[1] + f[2] * eye[2]);
-    out.m[3][3] = 1.0f;
-}
-
-inline void PerspectiveFov(float fovYRadians, float aspect, float zn, float zf, Mtx44& out)
-{
-    const float yScale = 1.0f / std::tan(fovYRadians * 0.5f);
-    out = {};
-    out.m[0][0] = yScale / aspect;
-    out.m[1][1] = yScale;
-    out.m[2][2] = zf / (zf - zn);
-    out.m[2][3] = 1.0f;
-    out.m[3][2] = -zn * zf / (zf - zn);
-}
-
-} // namespace portrait
-
-IDirect3DDevice9* GetGameD3D9Device();
-
-// Renders the player's isolated 3rd-person model to a private render target and
-// returns tightly packed BGRA pixels. Runs on the game thread. Returns false on
-// any failure — the capture then degrades to a stats-only upload.
-bool RenderPlayerPortraitPixels(PlayerCharacter* player, std::vector<BYTE>& outBgra,
-    int& outWidth, int& outHeight)
-{
-    outBgra.clear();
-    outWidth = 0;
-    outHeight = 0;
-
-    IDirect3DDevice9* device = GetGameD3D9Device();
-    if (!device)
-    {
-        LogLine("Persona portrait: D3D9 device unavailable.");
-        return false;
-    }
-    // The 3RD-PERSON body, explicitly: player->GetNiNode() returns the ACTIVE
-    // node, which in first person is the 1st-person viewmodel skeleton (floating
-    // hands/arms - exactly the wrong thing to portrait). The refr render state's
-    // niNode is the world model (3rd-person skeleton) regardless of camera mode.
-    NiNode* root = player->renderState ? player->renderState->niNode : nullptr;
-    const char* rootSource = "renderState";
-    if (!root)
-    {
-        root = player->GetNiNode();
-        rootSource = "GetNiNode";
-    }
-    if (!root)
-    {
-        LogLine("Persona portrait: player has no 3D loaded.");
-        return false;
-    }
-    LogLine("Persona portrait: using %s node.", rootSource);
-
-    const DWORD extractStart = GetTickCount();
-    std::vector<portrait::DrawItem> items;
-    portrait::PoseMap pose;
-    portrait::ExtractStats stats;
-    if (player->baseForm && player->baseForm->typeID == kFormType_TESNPC)
-    {
-        const UInt32 color = static_cast<TESNPC*>(player->baseForm)->hairColor;
-        stats.hairTint = D3DCOLOR_XRGB(static_cast<int>(color & 0xFF),
-            static_cast<int>((color >> 8) & 0xFF), static_cast<int>((color >> 16) & 0xFF));
-    }
-    if (!portrait::CollectGeometryGuarded(root, &pose, &items, &stats))
-    {
-        LogLine("Persona portrait: scene-graph pass faulted (SEH); capture aborted.");
-        return false;
-    }
-    if (items.empty())
-    {
-        LogLine("Persona portrait: no drawable geometry under the player node.");
-        return false;
-    }
-
-    // Camera. FACE framing (default): tracked to the recomputed Bip01 Head
-    // position, so body animation cannot move the face out of frame and the
-    // head fills the render target natively (no digital zoom, full quality).
-    // BODY framing (persona_portrait_framing=body, or head bone not found):
-    // in front of the player's facing, aimed at the model's world bound center.
-    // Bethesda heading convention: forward = (sin rotZ, cos rotZ).
-    const float yaw = player->rotZ;
-    const bool faceShot = g_debugConfig.personaFaceFraming && stats.hasHead;
-    float eye[3];
-    float at[3];
-    float fovDeg;
-    if (faceShot)
-    {
-        const float distance = g_debugConfig.personaFaceDistanceUnits;
-        eye[0] = stats.headWorld[0] + std::sin(yaw) * distance;
-        eye[1] = stats.headWorld[1] + std::cos(yaw) * distance;
-        eye[2] = stats.headWorld[2] + 3.0f;
-        // Aim a touch above the head's center so hair/hats keep headroom.
-        at[0] = stats.headWorld[0];
-        at[1] = stats.headWorld[1];
-        at[2] = stats.headWorld[2] + 3.0f;
-        fovDeg = g_debugConfig.personaFaceFovDeg;
-    }
-    else
-    {
-        const float distance = g_debugConfig.personaCameraDistanceUnits;
-        const float eyeHeight = g_debugConfig.personaCameraHeightUnits;
-        eye[0] = player->posX + std::sin(yaw) * distance;
-        eye[1] = player->posY + std::cos(yaw) * distance;
-        eye[2] = player->posZ + eyeHeight;
-        at[0] = player->posX;
-        at[1] = player->posY;
-        at[2] = player->posZ + eyeHeight * 0.82f;
-        const float boundCenterZ = portrait::Read<float>(root, portrait::kOffAvWorldBound + 8);
-        const float boundRadius = portrait::Read<float>(root, portrait::kOffAvWorldBound + 12);
-        if (boundRadius > 1.0f && boundRadius < 500.0f)
-        {
-            at[0] = portrait::Read<float>(root, portrait::kOffAvWorldBound);
-            at[1] = portrait::Read<float>(root, portrait::kOffAvWorldBound + 4);
-            at[2] = boundCenterZ;
-        }
-        fovDeg = g_debugConfig.personaPortraitFovDeg;
-    }
-
-    const int size = g_debugConfig.personaPortraitSize;
-    const int width = (size * 3) / 4; // portrait 3:4
-    const int height = size;
-
-    portrait::Mtx44 view;
-    portrait::LookAt(eye, at, g_debugConfig.personaPortraitMirror, view);
-    portrait::Mtx44 projection;
-    LogLine("Persona portrait: %s framing%s.", faceShot ? "face" : "body",
-        (g_debugConfig.personaFaceFraming && !stats.hasHead) ? " (Bip01 Head not found - fell back to body)" : "");
-    portrait::PerspectiveFov(fovDeg * (kPersonaPi / 180.0f),
-        static_cast<float>(width) / static_cast<float>(height), 8.0f, 4096.0f, projection);
-    portrait::Mtx44 identity{};
-    identity.m[0][0] = identity.m[1][1] = identity.m[2][2] = identity.m[3][3] = 1.0f;
-
-    // --- Device work: private target; every touched state saved + restored. ---
-    IDirect3DSurface9* previousTarget = nullptr;
-    IDirect3DSurface9* previousDepth = nullptr;
-    D3DVIEWPORT9 previousViewport{};
-    IDirect3DStateBlock9* stateBlock = nullptr;
-    IDirect3DSurface9* renderTarget = nullptr;
-    IDirect3DSurface9* depthSurface = nullptr;
-    IDirect3DSurface9* readback = nullptr;
-    bool ok = false;
-    bool begunScene = false;
-
-    device->GetRenderTarget(0, &previousTarget);
-    device->GetDepthStencilSurface(&previousDepth);
-    device->GetViewport(&previousViewport);
-
-    do
-    {
-        if (FAILED(device->CreateStateBlock(D3DSBT_ALL, &stateBlock)) || !stateBlock)
-        {
-            LogLine("Persona portrait: CreateStateBlock failed.");
-            break;
-        }
-        if (FAILED(device->CreateRenderTarget(width, height, D3DFMT_X8R8G8B8,
-                D3DMULTISAMPLE_NONE, 0, FALSE, &renderTarget, nullptr)) || !renderTarget)
-        {
-            LogLine("Persona portrait: CreateRenderTarget %dx%d failed.", width, height);
-            break;
-        }
-        if (FAILED(device->CreateDepthStencilSurface(width, height, D3DFMT_D24S8,
-                D3DMULTISAMPLE_NONE, 0, TRUE, &depthSurface, nullptr)) || !depthSurface)
-        {
-            LogLine("Persona portrait: depth surface failed.");
-            break;
-        }
-
-        device->SetRenderTarget(0, renderTarget);
-        device->SetDepthStencilSurface(depthSurface);
-        D3DVIEWPORT9 viewport{ 0, 0, static_cast<DWORD>(width), static_cast<DWORD>(height), 0.0f, 1.0f };
-        device->SetViewport(&viewport);
-        device->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER,
-            D3DCOLOR_XRGB(110, 110, 112), 1.0f, 0);
-
-        begunScene = SUCCEEDED(device->BeginScene());
-
-        device->SetVertexShader(nullptr);
-        device->SetPixelShader(nullptr);
-        device->SetFVF(D3DFVF_XYZ | D3DFVF_TEX1);
-        device->SetTransform(D3DTS_WORLD, reinterpret_cast<const D3DMATRIX*>(&identity));
-        device->SetTransform(D3DTS_VIEW, reinterpret_cast<const D3DMATRIX*>(&view));
-        device->SetTransform(D3DTS_PROJECTION, reinterpret_cast<const D3DMATRIX*>(&projection));
-
-        device->SetRenderState(D3DRS_LIGHTING, FALSE);
-        device->SetRenderState(D3DRS_ZENABLE, D3DZB_TRUE);
-        device->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
-        device->SetRenderState(D3DRS_ZFUNC, D3DCMP_LESSEQUAL);
-        device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
-        device->SetRenderState(D3DRS_FILLMODE, D3DFILL_SOLID);
-        device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
-        device->SetRenderState(D3DRS_ALPHATESTENABLE, TRUE);
-        device->SetRenderState(D3DRS_ALPHAREF, 96);
-        device->SetRenderState(D3DRS_ALPHAFUNC, D3DCMP_GREATEREQUAL);
-        device->SetRenderState(D3DRS_FOGENABLE, FALSE);
-        device->SetRenderState(D3DRS_STENCILENABLE, FALSE);
-        device->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
-        device->SetRenderState(D3DRS_CLIPPLANEENABLE, 0);
-        device->SetRenderState(D3DRS_SRGBWRITEENABLE, FALSE);
-        device->SetRenderState(D3DRS_TEXTUREFACTOR, D3DCOLOR_XRGB(150, 148, 145));
-        device->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
-        device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
-        device->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_LINEAR);
-        device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
-        device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
-        device->SetSamplerState(0, D3DSAMP_SRGBTEXTURE, FALSE);
-        device->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
-        device->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
-
-        for (const portrait::DrawItem& item : items)
-        {
-            if (item.vertices.empty() || item.indices.empty())
-            {
-                continue;
-            }
-            if (item.texture)
-            {
-                device->SetTexture(0, item.texture);
-                device->SetRenderState(D3DRS_TEXTUREFACTOR, item.tint);
-                device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_MODULATE);
-                device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
-                device->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_TFACTOR);
-                device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
-                device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
-            }
-            else
-            {
-                device->SetTexture(0, nullptr);
-                device->SetRenderState(D3DRS_TEXTUREFACTOR, D3DCOLOR_XRGB(150, 148, 145));
-                device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG2);
-                device->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_TFACTOR);
-                device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG2);
-                device->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_TFACTOR);
-            }
-            const UINT vertexCount = static_cast<UINT>(item.vertices.size());
-            if (item.stripLengths.empty())
-            {
-                device->DrawIndexedPrimitiveUP(D3DPT_TRIANGLELIST, 0, vertexCount,
-                    static_cast<UINT>(item.indices.size() / 3), item.indices.data(),
-                    D3DFMT_INDEX16, item.vertices.data(), sizeof(portrait::Vtx));
-            }
-            else
-            {
-                const UInt16* strip = item.indices.data();
-                for (UInt16 length : item.stripLengths)
-                {
-                    if (length >= 3)
-                    {
-                        device->DrawIndexedPrimitiveUP(D3DPT_TRIANGLESTRIP, 0, vertexCount,
-                            static_cast<UINT>(length - 2), strip, D3DFMT_INDEX16,
-                            item.vertices.data(), sizeof(portrait::Vtx));
-                    }
-                    strip += length;
-                }
-            }
-        }
-
-        if (begunScene)
-        {
-            device->EndScene();
-            begunScene = false;
-        }
-
-        if (FAILED(device->CreateOffscreenPlainSurface(width, height, D3DFMT_X8R8G8B8,
-                D3DPOOL_SYSTEMMEM, &readback, nullptr)) || !readback)
-        {
-            LogLine("Persona portrait: readback surface failed.");
-            break;
-        }
-        if (FAILED(device->GetRenderTargetData(renderTarget, readback)))
-        {
-            LogLine("Persona portrait: GetRenderTargetData failed.");
-            break;
-        }
-        D3DLOCKED_RECT locked{};
-        if (FAILED(readback->LockRect(&locked, nullptr, D3DLOCK_READONLY)) || !locked.pBits)
-        {
-            LogLine("Persona portrait: LockRect failed.");
-            break;
-        }
-        outBgra.resize(static_cast<size_t>(width) * static_cast<size_t>(height) * 4u);
-        const BYTE* pixels = static_cast<const BYTE*>(locked.pBits);
-        for (int row = 0; row < height; ++row)
-        {
-            std::memcpy(outBgra.data() + static_cast<size_t>(row) * width * 4u,
-                pixels + static_cast<size_t>(row) * locked.Pitch,
-                static_cast<size_t>(width) * 4u);
-        }
-        readback->UnlockRect();
-        outWidth = width;
-        outHeight = height;
-        ok = true;
-    } while (false);
-
-    if (begunScene)
-    {
-        device->EndScene();
-    }
-    device->SetRenderTarget(0, previousTarget);
-    device->SetDepthStencilSurface(previousDepth);
-    device->SetViewport(&previousViewport);
-    if (stateBlock)
-    {
-        stateBlock->Apply();
-        stateBlock->Release();
-    }
-    if (previousTarget)
-    {
-        previousTarget->Release();
-    }
-    if (previousDepth)
-    {
-        previousDepth->Release();
-    }
-    if (renderTarget)
-    {
-        renderTarget->Release();
-    }
-    if (depthSurface)
-    {
-        depthSurface->Release();
-    }
-    if (readback)
-    {
-        readback->Release();
-    }
-
-    if (ok)
-    {
-        LogLine("Persona portrait: rendered %d geometries (%d skinned, %d bind-pose, %d textured, %d skipped, %d degenerate) in %lu ms at %dx%d.",
-            stats.geometries, stats.skinned, stats.bindPoseFallbacks, stats.textured,
-            stats.skippedNoData, stats.skippedDegenerate,
-            static_cast<unsigned long>(GetTickCount() - extractStart), width, height);
-        if (stats.repairedScales > 0)
-        {
-            LogLine("Persona portrait: repaired %d hidden-node scale(s) [%s] (1st-person body hiding).",
-                stats.repairedScales, stats.repairedNames[0] ? stats.repairedNames : "unnamed");
-        }
-    }
-    return ok;
-}
-
-IDirect3DDevice9* GetGameD3D9Device()
-{
-    BYTE* renderer = *reinterpret_cast<BYTE**>(kNiDX9RendererSingletonAddress);
-    if (!renderer)
-    {
-        return nullptr;
-    }
-    return *reinterpret_cast<IDirect3DDevice9**>(renderer + kNiDX9RendererDeviceOffset);
-}
-
-// --- JPEG encoding (GDI+; sender thread only) ----------------------------------------
-
-bool EnsureGdiplusStarted()
-{
-    static std::once_flag s_once;
-    static bool s_started = false;
-    std::call_once(s_once, [] {
-        Gdiplus::GdiplusStartupInput input;
-        ULONG_PTR token = 0;
-        s_started = Gdiplus::GdiplusStartup(&token, &input, nullptr) == Gdiplus::Ok;
-        // The token is deliberately never shut down: GDI+ stays for the process.
-    });
-    return s_started;
-}
-
-bool GetJpegEncoderClsid(CLSID& outClsid)
-{
-    UINT count = 0;
-    UINT bytes = 0;
-    if (Gdiplus::GetImageEncodersSize(&count, &bytes) != Gdiplus::Ok || bytes == 0)
-    {
-        return false;
-    }
-    std::vector<BYTE> buffer(bytes);
-    auto* encoders = reinterpret_cast<Gdiplus::ImageCodecInfo*>(buffer.data());
-    if (Gdiplus::GetImageEncoders(count, bytes, encoders) != Gdiplus::Ok)
-    {
-        return false;
-    }
-    for (UINT index = 0; index < count; ++index)
-    {
-        if (encoders[index].MimeType && wcscmp(encoders[index].MimeType, L"image/jpeg") == 0)
-        {
-            outClsid = encoders[index].Clsid;
-            return true;
-        }
-    }
-    return false;
-}
-
-// Downscales (bounded by maxWidth) and JPEG-encodes a tightly packed BGRA frame.
-// `bgra` must stay alive for the duration (the source Bitmap wraps it in place).
-bool EncodeBgraToJpeg(std::vector<BYTE>& bgra, int width, int height, int maxWidth, int quality,
-    std::vector<BYTE>& outJpeg)
-{
-    outJpeg.clear();
-    if (bgra.empty() || width <= 0 || height <= 0 || !EnsureGdiplusStarted())
-    {
-        return false;
-    }
-
-    // PixelFormat32bppRGB = B,G,R,pad byte order in memory — exactly the
-    // D3DFMT_A8R8G8B8 layout (the front buffer's alpha is garbage; ignore it).
-    Gdiplus::Bitmap source(width, height, width * 4, PixelFormat32bppRGB, bgra.data());
-    if (source.GetLastStatus() != Gdiplus::Ok)
-    {
-        return false;
-    }
-
-    Gdiplus::Bitmap* toSave = &source;
-    std::unique_ptr<Gdiplus::Bitmap> scaled;
-    if (maxWidth > 0 && width > maxWidth)
-    {
-        const int destWidth = maxWidth;
-        const int destHeight = (std::max)(1, static_cast<int>(
-            (static_cast<long long>(height) * destWidth + width / 2) / width));
-        scaled = std::make_unique<Gdiplus::Bitmap>(destWidth, destHeight, PixelFormat24bppRGB);
-        if (scaled->GetLastStatus() != Gdiplus::Ok)
-        {
-            return false;
-        }
-        Gdiplus::Graphics graphics(scaled.get());
-        graphics.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
-        graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
-        if (graphics.DrawImage(&source, Gdiplus::Rect(0, 0, destWidth, destHeight),
-                0, 0, width, height, Gdiplus::UnitPixel) != Gdiplus::Ok)
-        {
-            return false;
-        }
-        toSave = scaled.get();
-    }
-
-    CLSID jpegClsid{};
-    if (!GetJpegEncoderClsid(jpegClsid))
-    {
-        return false;
-    }
-
-    IStream* stream = nullptr;
-    if (FAILED(CreateStreamOnHGlobal(nullptr, TRUE, &stream)) || !stream)
-    {
-        return false;
-    }
-
-    ULONG qualityValue = static_cast<ULONG>((std::max)(30, (std::min)(100, quality)));
-    Gdiplus::EncoderParameters parameters{};
-    parameters.Count = 1;
-    parameters.Parameter[0].Guid = Gdiplus::EncoderQuality;
-    parameters.Parameter[0].Type = Gdiplus::EncoderParameterValueTypeLong;
-    parameters.Parameter[0].NumberOfValues = 1;
-    parameters.Parameter[0].Value = &qualityValue;
-
-    bool ok = toSave->Save(stream, &jpegClsid, &parameters) == Gdiplus::Ok;
-    if (ok)
-    {
-        HGLOBAL hglobal = nullptr;
-        ok = SUCCEEDED(GetHGlobalFromStream(stream, &hglobal)) && hglobal;
-        if (ok)
-        {
-            const SIZE_T size = GlobalSize(hglobal);
-            const void* bytes = GlobalLock(hglobal);
-            if (bytes && size > 0)
-            {
-                outJpeg.assign(static_cast<const BYTE*>(bytes), static_cast<const BYTE*>(bytes) + size);
-                GlobalUnlock(hglobal);
-            }
-            else
-            {
-                ok = false;
-            }
-        }
-    }
-    stream->Release();
-    return ok && !outJpeg.empty();
 }
 
 // --- HTTP upload (sender thread only) -------------------------------------------------
@@ -14695,12 +13379,11 @@ bool PostPersonaCapture(const std::string& url, const std::string& body, std::st
     return ok;
 }
 
-// Fire-and-forget upload on a detached thread: JPEG-encode (when pixels exist),
-// base64, splice the image fields into the stats snapshot, POST. The thread only
-// touches its own moved-in data, LogLine (already called from the HTTP turn worker
-// thread today), and the two persona atomics — never game state. Detached on
-// purpose: a hung POST can never wedge game exit; process teardown reaps it.
-void StartPersonaUpload(std::string statsJsonFields, std::vector<BYTE> bgra, int width, int height)
+// Fire-and-forget upload on a detached thread. The thread only touches its own
+// moved-in data, LogLine (already called from the HTTP turn worker thread
+// today), and the persona atomic — never game state. Detached on purpose: a
+// hung POST can never wedge game exit; process teardown reaps it.
+void StartPersonaUpload(std::string statsJsonFields)
 {
     if (g_personaSendInFlight.exchange(true))
     {
@@ -14711,93 +13394,38 @@ void StartPersonaUpload(std::string statsJsonFields, std::vector<BYTE> bgra, int
     url << "http://" << g_debugConfig.httpHost << ":" << g_debugConfig.httpPort
         << g_debugConfig.personaHttpPath;
 
-    const int maxWidth = g_debugConfig.personaMaxImageWidth;
-    const int quality = g_debugConfig.personaJpegQuality;
-
-    std::thread([statsJsonFields = std::move(statsJsonFields), bgra = std::move(bgra),
-                    width, height, url = url.str(), maxWidth, quality]() mutable {
-        std::string imageBase64;
-        if (!bgra.empty())
-        {
-            std::vector<BYTE> jpeg;
-            if (EncodeBgraToJpeg(bgra, width, height, maxWidth, quality, jpeg))
-            {
-                imageBase64 = EncodeBase64(jpeg.data(), jpeg.size());
-            }
-            else
-            {
-                LogLine("Persona upload: JPEG encode failed; sending stats only.");
-            }
-        }
-
-        std::ostringstream body;
-        body << "{" << statsJsonFields;
-        if (!imageBase64.empty())
-        {
-            // base64 uses a JSON-safe alphabet; no escaping needed.
-            body << ",\"image_format\":\"jpeg\",\"image_base64\":\"" << imageBase64 << "\"";
-        }
-        body << "}";
-
+    std::thread([statsJsonFields = std::move(statsJsonFields), url = url.str()]() mutable {
         std::string summary;
-        const bool ok = PostPersonaCapture(url, body.str(), summary);
-        LogLine("Persona upload %s (%s, image=%s).", ok ? "succeeded" : "failed",
-            summary.c_str(), imageBase64.empty() ? "none" : "jpeg");
+        const bool ok = PostPersonaCapture(url, "{" + statsJsonFields + "}", summary);
+        LogLine("Persona upload %s (%s).", ok ? "succeeded" : "failed", summary.c_str());
         g_personaSendInFlight.store(false);
     }).detach();
 }
 
 // --- The capture (game thread) ---------------------------------------------------------
 
-// Takes the pending save-triggered capture in ONE frame: snapshot stats, render the
-// offscreen portrait (nothing visible happens), hand off the upload. Every failure
-// path still uploads the stats snapshot (chasm generates stats-only personas).
-void TakePersonaCapture(PlayerCharacter* player, DWORD now)
+// Takes the pending save-triggered capture in ONE frame: snapshot the stats +
+// appearance data and hand off the upload. Pure data — nothing is rendered.
+void TakePersonaCapture(PlayerCharacter* player)
 {
-    std::string statsJson = BuildPersonaStatsJsonFields(player, g_persona.pendingTrigger);
-    g_persona.lastSequenceTick = now;
-
-    std::vector<BYTE> bgra;
-    int width = 0;
-    int height = 0;
-    if (!g_debugConfig.personaScreenshotEnabled)
-    {
-        LogLine("Persona: screenshots disabled; uploading stats only (trigger=%s).",
-            g_persona.pendingTrigger.c_str());
-    }
-    else if (!RenderPlayerPortraitPixels(player, bgra, width, height))
-    {
-        bgra.clear();
-        width = 0;
-        height = 0;
-        LogLine("Persona: portrait render failed; uploading stats only (trigger=%s).",
-            g_persona.pendingTrigger.c_str());
-    }
-    else
-    {
-        LogLine("Persona: captured %dx%d portrait (trigger=%s).", width, height,
-            g_persona.pendingTrigger.c_str());
-    }
-    StartPersonaUpload(std::move(statsJson), std::move(bgra), width, height);
+    LogLine("Persona: captured data snapshot (trigger=%s).", g_persona.pendingTrigger.c_str());
+    StartPersonaUpload(BuildPersonaStatsJsonFields(player, g_persona.pendingTrigger));
 }
 
-// Session reset (load / new game / exit to menu): drop all transient state. The
-// offscreen capture leaves nothing behind mid-flight (no camera/HUD toggles to
-// undo). A pending capture is dropped too — the freshly loaded state supersedes
+// Session reset (load / new game / exit to menu): drop all transient state.
+// A pending capture is dropped too — the freshly loaded state supersedes
 // the save that queued it.
 void ResetPersonaStateForSession()
 {
-    g_persona.gatesSatisfiedSinceTick = 0;
     g_persona.capturePending = false;
-    g_persona.pendingSinceTick = 0;
     g_persona.pendingTrigger.clear();
-    // lastSequenceTick survives: the debounce spans loads on purpose
-    // (quickload+quicksave loops should not double-capture).
 }
 
 // Per-frame driver, called from OnMainGameLoop once loadedIntoGame + player are
-// established. Never blocks: all heavy work (encode/POST) lives on the sender
-// thread; the only game-thread cost is the capture frame's GetFrontBufferData.
+// established. A pending save-capture fires on the very next frame — no gating,
+// no debounce; the only wait is for an already-in-flight upload to finish (one
+// capture runs end-to-end at a time; a save burst coalesces into the pending
+// one). Never blocks: the POST lives on the sender thread.
 void UpdatePersonaCapture()
 {
     PlayerCharacter* player = GetPlayer();
@@ -14805,8 +13433,6 @@ void UpdatePersonaCapture()
     {
         return;
     }
-
-    const DWORD now = GetTickCount();
 
     if (!g_debugConfig.personaEnabled)
     {
@@ -14820,42 +13446,13 @@ void UpdatePersonaCapture()
         return;
     }
 
-    // A pending capture that the gates have blocked for too long (endless
-    // combat, the player parked in a menu...) degrades to a stats-only upload:
-    // the save still refreshes the persona, just without a new screenshot.
-    if ((now - g_persona.pendingSinceTick) > kPersonaPendingMaxAgeMs)
-    {
-        LogLine("Persona: pending capture (trigger=%s) expired before the gates allowed a screenshot; uploading stats only.",
-            g_persona.pendingTrigger.c_str());
-        g_persona.capturePending = false;
-        g_persona.lastSequenceTick = now;
-        StartPersonaUpload(BuildPersonaStatsJsonFields(player, g_persona.pendingTrigger), {}, 0, 0);
-        return;
-    }
-
-    // Gates must hold continuously before we trust the moment.
-    if (!PersonaGatesSatisfied(player))
-    {
-        g_persona.gatesSatisfiedSinceTick = 0;
-        return;
-    }
-    if (g_persona.gatesSatisfiedSinceTick == 0)
-    {
-        g_persona.gatesSatisfiedSinceTick = now;
-        return;
-    }
-    if ((now - g_persona.gatesSatisfiedSinceTick) < kPersonaGateStabilityMs)
-    {
-        return;
-    }
-
     if (g_personaSendInFlight.load())
     {
         return; // one capture end-to-end at a time
     }
 
     g_persona.capturePending = false;
-    TakePersonaCapture(player, now);
+    TakePersonaCapture(player);
 }
 
 void OnMainGameLoop()
@@ -14887,7 +13484,6 @@ void OnMainGameLoop()
         {
             AbortVoiceCapture("voice_capture_focus_lost", false);
         }
-        g_persona.gatesSatisfiedSinceTick = 0; // persona gates re-arm after refocus
         return;
     }
 
