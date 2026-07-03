@@ -572,7 +572,10 @@ struct DebugConfig
     float personaCameraDistanceUnits = 220.0f; // portrait camera distance in front of the player
     float personaCameraHeightUnits = 100.0f;   // portrait camera eye height above the player's feet
     int personaPortraitSize = 1024;          // offscreen portrait height (width = 3/4 of this)
-    float personaPortraitFovDeg = 48.0f;     // portrait camera vertical FOV (degrees)
+    float personaPortraitFovDeg = 48.0f;     // full-body framing: camera vertical FOV (degrees)
+    bool personaFaceFraming = true;          // frame the head (tracked via Bip01 Head) instead of the full body
+    float personaFaceDistanceUnits = 70.0f;  // face framing: camera distance in front of the head
+    float personaFaceFovDeg = 30.0f;         // face framing: camera vertical FOV (degrees)
     bool personaPortraitMirror = false;      // flip horizontally if the render comes out mirrored
     int personaMaxImageWidth = 1280;         // downscale bound before JPEG encode
     int personaJpegQuality = 85;             // GDI+ JPEG quality (30..100)
@@ -2765,6 +2768,9 @@ void WriteDefaultDebugConfigIfMissing()
         << "persona_debounce_ms=30000\r\n"
         << "persona_camera_distance_units=220.0\r\n"
         << "persona_camera_height_units=100.0\r\n"
+        << "persona_portrait_framing=face\r\n"
+        << "persona_face_distance_units=70.0\r\n"
+        << "persona_face_fov_deg=30.0\r\n"
         << "persona_portrait_size=1024\r\n"
         << "persona_portrait_fov_deg=48.0\r\n"
         << "persona_portrait_mirror=0\r\n"
@@ -3044,6 +3050,26 @@ void LoadDebugConfigIfNeeded(bool force)
             if (height >= 0.0f && height <= 300.0f)
             {
                 config.personaCameraHeightUnits = height;
+            }
+        }
+        else if (key == "persona_portrait_framing")
+        {
+            config.personaFaceFraming = value != "body";
+        }
+        else if (key == "persona_face_distance_units")
+        {
+            const float distance = static_cast<float>(std::atof(value.c_str()));
+            if (distance >= 15.0f && distance <= 300.0f)
+            {
+                config.personaFaceDistanceUnits = distance;
+            }
+        }
+        else if (key == "persona_face_fov_deg")
+        {
+            const float fov = static_cast<float>(std::atof(value.c_str()));
+            if (fov >= 10.0f && fov <= 90.0f)
+            {
+                config.personaFaceFovDeg = fov;
             }
         }
         else if (key == "persona_portrait_size")
@@ -4871,6 +4897,29 @@ std::string BuildPlayerMacros(PlayerCharacter* player, const LocationSnapshot* l
     AppendJsonMacro(out, first, "perks", BuildPerksMacro(player));
     AppendJsonMacro(out, first, "equipped_weapon", GetDisplayNameSafe(player->GetEquippedWeapon()));
     AppendJsonMacro(out, first, "equipped_apparel", BuildEquippedApparelMacro(player));
+    if (player->baseForm && player->baseForm->typeID == kFormType_TESNPC)
+    {
+        auto* npc = static_cast<TESNPC*>(player->baseForm);
+        AppendJsonMacro(out, first, "sex", npc->baseData.IsFemale() ? "female" : "male");
+        if (npc->race.race)
+        {
+            AppendJsonMacro(out, first, "race", GetDisplayNameSafe(npc->race.race));
+        }
+        if (npc->hair)
+        {
+            AppendJsonMacro(out, first, "hair_style", GetDisplayNameSafe(npc->hair));
+        }
+        if (npc->eyes)
+        {
+            AppendJsonMacro(out, first, "eye_color", GetDisplayNameSafe(npc->eyes));
+        }
+        char hairHex[8]{};
+        std::snprintf(hairHex, sizeof(hairHex), "#%02X%02X%02X",
+            static_cast<unsigned>(npc->hairColor & 0xFF),
+            static_cast<unsigned>((npc->hairColor >> 8) & 0xFF),
+            static_cast<unsigned>((npc->hairColor >> 16) & 0xFF));
+        AppendJsonMacro(out, first, "hair_color", hairHex);
+    }
     AppendJsonMacro(out, first, "inventory", BuildInventoryMacro(player));
 
     std::string quests;
@@ -13243,6 +13292,29 @@ std::string BuildPersonaStatsJsonFields(PlayerCharacter* player, const std::stri
     AppendJsonMacro(out, first, "perks", BuildPerksMacro(player));
     AppendJsonMacro(out, first, "equipped_weapon", GetDisplayNameSafe(player->GetEquippedWeapon()));
     AppendJsonMacro(out, first, "equipped_apparel", BuildEquippedApparelMacro(player));
+    if (player->baseForm && player->baseForm->typeID == kFormType_TESNPC)
+    {
+        auto* npc = static_cast<TESNPC*>(player->baseForm);
+        AppendJsonMacro(out, first, "sex", npc->baseData.IsFemale() ? "female" : "male");
+        if (npc->race.race)
+        {
+            AppendJsonMacro(out, first, "race", GetDisplayNameSafe(npc->race.race));
+        }
+        if (npc->hair)
+        {
+            AppendJsonMacro(out, first, "hair_style", GetDisplayNameSafe(npc->hair));
+        }
+        if (npc->eyes)
+        {
+            AppendJsonMacro(out, first, "eye_color", GetDisplayNameSafe(npc->eyes));
+        }
+        char hairHex[8]{};
+        std::snprintf(hairHex, sizeof(hairHex), "#%02X%02X%02X",
+            static_cast<unsigned>(npc->hairColor & 0xFF),
+            static_cast<unsigned>((npc->hairColor >> 8) & 0xFF),
+            static_cast<unsigned>((npc->hairColor >> 16) & 0xFF));
+        AppendJsonMacro(out, first, "hair_color", hairHex);
+    }
     const LocationSnapshot location = CapturePlayerLocation();
     std::string locationLabel = location.minor;
     if (!location.major.empty())
@@ -13393,6 +13465,8 @@ inline T Read(const void* base, UInt32 offset)
 
 // NiAVObject / NiNode / NiGeometry field offsets (NV).
 constexpr UInt32 kOffAvWorldXform = 0x68;   // NiTransform m_worldTransform
+constexpr UInt32 kOffAvLocalXform = 0x34;   // NiTransform m_localTransform
+constexpr UInt32 kOffNetName = 0x08;        // NiObjectNET: const char* m_pcName
 constexpr UInt32 kOffAvWorldBound = 0x20;   // NiSphere { float x,y,z,radius }
 constexpr UInt32 kOffNodeChildren = 0x9C;   // NiTArray<NiAVObject*>: data +4, capacity(UInt16) +8
 constexpr UInt32 kOffGeoPropState = 0x9C;   // NiProperty* prop[6]; 3 = shader, 5 = texturing
@@ -13481,7 +13555,66 @@ struct DrawItem
     std::vector<UInt16> indices;      // triangle list
     std::vector<UInt16> stripLengths; // when non-empty: indices holds concatenated strips
     IDirect3DBaseTexture9* texture = nullptr;
+    D3DCOLOR tint = D3DCOLOR_XRGB(255, 255, 255); // modulated over the texture (hair tint)
 };
+
+inline bool NameContainsI(const char* haystack, const char* needle)
+{
+    if (!haystack || !needle)
+    {
+        return false;
+    }
+    const size_t needleLen = std::strlen(needle);
+    for (const char* p = haystack; *p; ++p)
+    {
+        if (_strnicmp(p, needle, needleLen) == 0)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+// FNV hair/brow/beard textures are GRAYSCALE; the engine multiplies them by the
+// character's chosen hair color. The authoritative color is TESNPC::hairColor on
+// the player's base form (passed in via ExtractStats::hairTint by the caller) —
+// reading it from the shader material proved unreliable. Applied only to
+// hair-named meshes so other materials are never stained.
+struct ExtractStats;
+D3DCOLOR HairTintOf(void* geo, const ExtractStats& stats);
+
+// One-line texture diagnostics for head-region meshes: which texture source the
+// portrait picked and (when it is a disk texture) its DDS path. This is what
+// tells us where the FaceGen composed skin actually lives when a face renders
+// with the wrong texture.
+void LogHeadTextureDiag(void* geo, const char* source, void* niTexture)
+{
+    const char* geoName = Read<const char*>(geo, kOffNetName);
+    void* parent = Read<void*>(geo, 0x18);
+    const char* parentName = parent ? Read<const char*>(parent, kOffNetName) : nullptr;
+    const bool headish =
+        NameContainsI(geoName, "head") || NameContainsI(geoName, "hair") ||
+        NameContainsI(geoName, "eye") || NameContainsI(geoName, "brow") ||
+        NameContainsI(geoName, "teeth") || NameContainsI(geoName, "mouth") ||
+        NameContainsI(geoName, "beard") || NameContainsI(geoName, "face") ||
+        NameContainsI(parentName, "head") || NameContainsI(parentName, "face");
+    if (!headish)
+    {
+        return;
+    }
+    const char* texRtti = niTexture ? RttiName(niTexture) : "none";
+    const char* path = "";
+    if (niTexture && std::strstr(texRtti, "SourceTexture"))
+    {
+        const char* dds = Read<const char*>(niTexture, 0x30); // NiSourceTexture::ddsPath
+        if (dds)
+        {
+            path = dds;
+        }
+    }
+    LogLine("Persona portrait tex: geo='%s' parent='%s' via=%s tex=%s path='%s'",
+        geoName ? geoName : "?", parentName ? parentName : "?", source, texRtti, path);
+}
 
 struct ExtractStats
 {
@@ -13490,7 +13623,109 @@ struct ExtractStats
     int bindPoseFallbacks = 0;
     int textured = 0;
     int skippedNoData = 0;
+    bool hasHead = false;         // Bip01 Head was found in the pose walk
+    float headWorld[3] = {};      // its recomputed world position (face-framing anchor)
+    D3DCOLOR hairTint = D3DCOLOR_XRGB(255, 255, 255); // IN: player's chosen hair color (TESNPC::hairColor)
+    int repairedScales = 0;       // nodes whose ~0 scale was repaired to 1 (1st-person body hiding)
+    int skippedDegenerate = 0;    // items whose geometry collapsed to a point anyway
+    char repairedNames[160] = {}; // first few repaired node names, comma-joined
 };
+
+// Recomputed world transforms, keyed by NiAVObject*. Built by walking the node
+// hierarchy from LOCAL transforms so that first-person body hiding (nodes scaled
+// to ~0, e.g. by the engine or Enhanced Camera-style mods) cannot collapse the
+// portrait: any ~0 local scale is repaired to 1 before composing. The live scene
+// graph is never modified.
+using PoseMap = std::unordered_map<const void*, Xform>;
+
+void BuildPose(void* avObject, const Xform& parentWorld, PoseMap& pose, ExtractStats& stats, int depth)
+{
+    if (!avObject || depth > 24 || pose.size() > 4096)
+    {
+        return;
+    }
+    Xform local = Read<Xform>(avObject, kOffAvLocalXform);
+    if (local.scale < 0.01f)
+    {
+        local.scale = 1.0f;
+        ++stats.repairedScales;
+        const char* name = Read<const char*>(avObject, kOffNetName);
+        if (name && *name)
+        {
+            const size_t used = std::strlen(stats.repairedNames);
+            const size_t nameLen = std::strlen(name);
+            if (used + nameLen + 2 < sizeof(stats.repairedNames))
+            {
+                if (used)
+                {
+                    stats.repairedNames[used] = ',';
+                    std::memcpy(stats.repairedNames + used + 1, name, nameLen + 1);
+                }
+                else
+                {
+                    std::memcpy(stats.repairedNames, name, nameLen + 1);
+                }
+            }
+        }
+    }
+    Xform world{};
+    ComposeXform(parentWorld, local, world);
+    pose.emplace(avObject, world);
+    if (!stats.hasHead)
+    {
+        const char* nodeName = Read<const char*>(avObject, kOffNetName);
+        if (nodeName && _stricmp(nodeName, "Bip01 Head") == 0)
+        {
+            stats.hasHead = true;
+            stats.headWorld[0] = world.pos[0];
+            stats.headWorld[1] = world.pos[1];
+            stats.headWorld[2] = world.pos[2];
+        }
+    }
+    if (!VCall(avObject, kVt_GetNiNode))
+    {
+        return;
+    }
+    void** children = Read<void**>(avObject, kOffNodeChildren + 4);
+    const UInt16 capacity = Read<UInt16>(avObject, kOffNodeChildren + 8);
+    if (!children)
+    {
+        return;
+    }
+    for (UInt16 i = 0; i < capacity; ++i)
+    {
+        if (children[i])
+        {
+            BuildPose(children[i], world, pose, stats, depth + 1);
+        }
+    }
+}
+
+inline Xform PoseOf(const PoseMap& pose, const void* avObject, UInt32 fallbackOffset)
+{
+    const auto it = pose.find(avObject);
+    if (it != pose.end())
+    {
+        return it->second;
+    }
+    return Read<Xform>(avObject, fallbackOffset);
+}
+
+D3DCOLOR HairTintOf(void* geo, const ExtractStats& stats)
+{
+    const char* geoName = Read<const char*>(geo, kOffNetName);
+    void* parent = Read<void*>(geo, 0x18); // NiAVObject::m_parent
+    const char* parentName = parent ? Read<const char*>(parent, kOffNetName) : nullptr;
+    const bool hairish =
+        NameContainsI(geoName, "hair") || NameContainsI(parentName, "hair") ||
+        NameContainsI(geoName, "brow") || NameContainsI(geoName, "beard") ||
+        NameContainsI(geoName, "stache") || NameContainsI(geoName, "sideburn");
+    if (!hairish)
+    {
+        return D3DCOLOR_XRGB(255, 255, 255);
+    }
+    return stats.hairTint;
+}
 
 IDirect3DBaseTexture9* DiffuseTextureOf(void* geo)
 {
@@ -13499,6 +13734,7 @@ IDirect3DBaseTexture9* DiffuseTextureOf(void* geo)
     {
         const char* rtti = RttiName(shaderProp);
         void* niTexture = nullptr;
+        const char* source = "ppl0";
         if (std::strstr(rtti, "PPLighting") || std::strstr(rtti, "Lighting30"))
         {
             void** diffuseSlot = Read<void**>(shaderProp, kOffPplSrcTextures);
@@ -13510,9 +13746,11 @@ IDirect3DBaseTexture9* DiffuseTextureOf(void* geo)
         else if (std::strstr(rtti, "NoLighting"))
         {
             niTexture = Read<void*>(shaderProp, kOffNolSrcTexture);
+            source = "nolighting";
         }
         if (niTexture)
         {
+            LogHeadTextureDiag(geo, source, niTexture);
             void* rendererData = Read<void*>(niTexture, kOffTexRendererData);
             if (rendererData)
             {
@@ -13530,6 +13768,7 @@ IDirect3DBaseTexture9* DiffuseTextureOf(void* geo)
             void* srcTexture = Read<void*>(maps[0], kOffMapSrcTexture);
             if (srcTexture)
             {
+                LogHeadTextureDiag(geo, "texturing", srcTexture);
                 void* rendererData = Read<void*>(srcTexture, kOffTexRendererData);
                 if (rendererData)
                 {
@@ -13538,6 +13777,7 @@ IDirect3DBaseTexture9* DiffuseTextureOf(void* geo)
             }
         }
     }
+    LogHeadTextureDiag(geo, "NONE", nullptr);
     return nullptr;
 }
 
@@ -13580,7 +13820,7 @@ bool SkinLooksValid(void* skinData, UInt32 boneCount, UInt16 numVerts)
 // Extracts one geometry into a DrawItem: world-space positions (CPU-skinned when a
 // valid skin is present, else bind pose x node world transform), UVs, indices, and
 // the diffuse texture. Returns false when the geometry has nothing drawable.
-bool ExtractGeometry(void* geo, DrawItem& item, ExtractStats& stats)
+bool ExtractGeometry(void* geo, const PoseMap& pose, DrawItem& item, ExtractStats& stats)
 {
     void* data = Read<void*>(geo, kOffGeoData);
     if (!data)
@@ -13658,7 +13898,7 @@ bool ExtractGeometry(void* geo, DrawItem& item, ExtractStats& stats)
                 {
                     continue;
                 }
-                const Xform boneWorld = Read<Xform>(boneNode, kOffAvWorldXform);
+                const Xform boneWorld = PoseOf(pose, boneNode, kOffAvWorldXform);
                 const BYTE* bone = boneData + b * kBoneDataStride;
                 const Xform skinToBone = *reinterpret_cast<const Xform*>(bone + kOffBdSkinToBone);
                 Xform toWorld{};
@@ -13684,7 +13924,7 @@ bool ExtractGeometry(void* geo, DrawItem& item, ExtractStats& stats)
             }
             // Renormalize (weights should sum to ~1; guard drift) and catch
             // unweighted verts.
-            const Xform geoWorld = Read<Xform>(geo, kOffAvWorldXform);
+            const Xform geoWorld = PoseOf(pose, geo, kOffAvWorldXform);
             for (UInt16 v = 0; v < numVerts; ++v)
             {
                 float* out = world.data() + static_cast<size_t>(v) * 3;
@@ -13706,7 +13946,7 @@ bool ExtractGeometry(void* geo, DrawItem& item, ExtractStats& stats)
     }
     if (!skinned)
     {
-        const Xform geoWorld = Read<Xform>(geo, kOffAvWorldXform);
+        const Xform geoWorld = PoseOf(pose, geo, kOffAvWorldXform);
         for (UInt16 v = 0; v < numVerts; ++v)
         {
             XformPoint(geoWorld, bindVerts + static_cast<size_t>(v) * 3,
@@ -13730,16 +13970,34 @@ bool ExtractGeometry(void* geo, DrawItem& item, ExtractStats& stats)
         out.v = uvs ? uvs[static_cast<size_t>(v) * 2 + 1] : 0.0f;
     }
 
+    // A part that still collapsed to a point (hidden by something scale-repair
+    // could not see) must not leave specks in the portrait.
+    float minC[3] = { FLT_MAX, FLT_MAX, FLT_MAX };
+    float maxC[3] = { -FLT_MAX, -FLT_MAX, -FLT_MAX };
+    for (const Vtx& v : item.vertices)
+    {
+        minC[0] = (std::min)(minC[0], v.x); maxC[0] = (std::max)(maxC[0], v.x);
+        minC[1] = (std::min)(minC[1], v.y); maxC[1] = (std::max)(maxC[1], v.y);
+        minC[2] = (std::min)(minC[2], v.z); maxC[2] = (std::max)(maxC[2], v.z);
+    }
+    const float extent = (maxC[0] - minC[0]) + (maxC[1] - minC[1]) + (maxC[2] - minC[2]);
+    if (extent < 1.0f)
+    {
+        ++stats.skippedDegenerate;
+        return false;
+    }
+
     item.texture = DiffuseTextureOf(geo);
     if (item.texture)
     {
         ++stats.textured;
+        item.tint = HairTintOf(geo, stats);
     }
     ++stats.geometries;
     return true;
 }
 
-void CollectGeometry(void* avObject, std::vector<DrawItem>& items, ExtractStats& stats, int depth)
+void CollectGeometry(void* avObject, const PoseMap& pose, std::vector<DrawItem>& items, ExtractStats& stats, int depth)
 {
     if (!avObject || depth > 24 || items.size() >= 512)
     {
@@ -13748,7 +14006,7 @@ void CollectGeometry(void* avObject, std::vector<DrawItem>& items, ExtractStats&
     if (VCall(avObject, kVt_GetTriBasedGeom))
     {
         DrawItem item;
-        if (ExtractGeometry(avObject, item, stats))
+        if (ExtractGeometry(avObject, pose, item, stats))
         {
             items.push_back(std::move(item));
         }
@@ -13768,18 +14026,40 @@ void CollectGeometry(void* avObject, std::vector<DrawItem>& items, ExtractStats&
     {
         if (children[i])
         {
-            CollectGeometry(children[i], items, stats, depth + 1);
+            CollectGeometry(children[i], pose, items, stats, depth + 1);
         }
     }
 }
 
 // SEH around the scene-graph pass: raw engine pointers are involved, and a wild
 // read must abort the capture, not the game. No unwindable locals in this frame.
-bool CollectGeometryGuarded(void* root, std::vector<DrawItem>* items, ExtractStats* stats)
+bool CollectGeometryGuarded(void* root, PoseMap* pose, std::vector<DrawItem>* items, ExtractStats* stats)
 {
     __try
     {
-        CollectGeometry(root, *items, *stats, 0);
+        // The root placement is trusted (it is the actor position); the pose
+        // below it is recomputed from locals with scale repair. Composing
+        // children against the root stored world keeps world-space placement.
+        Xform rootWorld = *reinterpret_cast<const Xform*>(static_cast<const BYTE*>(root) + kOffAvWorldXform);
+        if (rootWorld.scale < 0.01f)
+        {
+            rootWorld.scale = 1.0f;
+            ++stats->repairedScales;
+        }
+        pose->emplace(root, rootWorld);
+        void** children = *reinterpret_cast<void***>(static_cast<BYTE*>(root) + kOffNodeChildren + 4);
+        const UInt16 capacity = *reinterpret_cast<const UInt16*>(static_cast<const BYTE*>(root) + kOffNodeChildren + 8);
+        if (children)
+        {
+            for (UInt16 i = 0; i < capacity; ++i)
+            {
+                if (children[i])
+                {
+                    BuildPose(children[i], rootWorld, *pose, *stats, 1);
+                }
+            }
+        }
+        CollectGeometry(root, *pose, *items, *stats, 0);
         return true;
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
@@ -13873,17 +14153,35 @@ bool RenderPlayerPortraitPixels(PlayerCharacter* player, std::vector<BYTE>& outB
         LogLine("Persona portrait: D3D9 device unavailable.");
         return false;
     }
-    NiNode* root = player->GetNiNode();
+    // The 3RD-PERSON body, explicitly: player->GetNiNode() returns the ACTIVE
+    // node, which in first person is the 1st-person viewmodel skeleton (floating
+    // hands/arms - exactly the wrong thing to portrait). The refr render state's
+    // niNode is the world model (3rd-person skeleton) regardless of camera mode.
+    NiNode* root = player->renderState ? player->renderState->niNode : nullptr;
+    const char* rootSource = "renderState";
+    if (!root)
+    {
+        root = player->GetNiNode();
+        rootSource = "GetNiNode";
+    }
     if (!root)
     {
         LogLine("Persona portrait: player has no 3D loaded.");
         return false;
     }
+    LogLine("Persona portrait: using %s node.", rootSource);
 
     const DWORD extractStart = GetTickCount();
     std::vector<portrait::DrawItem> items;
+    portrait::PoseMap pose;
     portrait::ExtractStats stats;
-    if (!portrait::CollectGeometryGuarded(root, &items, &stats))
+    if (player->baseForm && player->baseForm->typeID == kFormType_TESNPC)
+    {
+        const UInt32 color = static_cast<TESNPC*>(player->baseForm)->hairColor;
+        stats.hairTint = D3DCOLOR_XRGB(static_cast<int>(color & 0xFF),
+            static_cast<int>((color >> 8) & 0xFF), static_cast<int>((color >> 16) & 0xFF));
+    }
+    if (!portrait::CollectGeometryGuarded(root, &pose, &items, &stats))
     {
         LogLine("Persona portrait: scene-graph pass faulted (SEH); capture aborted.");
         return false;
@@ -13894,25 +14192,48 @@ bool RenderPlayerPortraitPixels(PlayerCharacter* player, std::vector<BYTE>& outB
         return false;
     }
 
-    // Camera: in front of the player's facing, aimed at the model's world bound
-    // center (falls back to pos + half height). Bethesda heading convention:
-    // forward = (sin rotZ, cos rotZ).
+    // Camera. FACE framing (default): tracked to the recomputed Bip01 Head
+    // position, so body animation cannot move the face out of frame and the
+    // head fills the render target natively (no digital zoom, full quality).
+    // BODY framing (persona_portrait_framing=body, or head bone not found):
+    // in front of the player's facing, aimed at the model's world bound center.
+    // Bethesda heading convention: forward = (sin rotZ, cos rotZ).
     const float yaw = player->rotZ;
-    const float distance = g_debugConfig.personaCameraDistanceUnits;
-    const float eyeHeight = g_debugConfig.personaCameraHeightUnits;
-    const float eye[3] = {
-        player->posX + std::sin(yaw) * distance,
-        player->posY + std::cos(yaw) * distance,
-        player->posZ + eyeHeight,
-    };
-    float at[3] = { player->posX, player->posY, player->posZ + eyeHeight * 0.82f };
-    const float boundCenterZ = portrait::Read<float>(root, portrait::kOffAvWorldBound + 8);
-    const float boundRadius = portrait::Read<float>(root, portrait::kOffAvWorldBound + 12);
-    if (boundRadius > 1.0f && boundRadius < 500.0f)
+    const bool faceShot = g_debugConfig.personaFaceFraming && stats.hasHead;
+    float eye[3];
+    float at[3];
+    float fovDeg;
+    if (faceShot)
     {
-        at[0] = portrait::Read<float>(root, portrait::kOffAvWorldBound);
-        at[1] = portrait::Read<float>(root, portrait::kOffAvWorldBound + 4);
-        at[2] = boundCenterZ;
+        const float distance = g_debugConfig.personaFaceDistanceUnits;
+        eye[0] = stats.headWorld[0] + std::sin(yaw) * distance;
+        eye[1] = stats.headWorld[1] + std::cos(yaw) * distance;
+        eye[2] = stats.headWorld[2] + 3.0f;
+        // Aim a touch above the head's center so hair/hats keep headroom.
+        at[0] = stats.headWorld[0];
+        at[1] = stats.headWorld[1];
+        at[2] = stats.headWorld[2] + 3.0f;
+        fovDeg = g_debugConfig.personaFaceFovDeg;
+    }
+    else
+    {
+        const float distance = g_debugConfig.personaCameraDistanceUnits;
+        const float eyeHeight = g_debugConfig.personaCameraHeightUnits;
+        eye[0] = player->posX + std::sin(yaw) * distance;
+        eye[1] = player->posY + std::cos(yaw) * distance;
+        eye[2] = player->posZ + eyeHeight;
+        at[0] = player->posX;
+        at[1] = player->posY;
+        at[2] = player->posZ + eyeHeight * 0.82f;
+        const float boundCenterZ = portrait::Read<float>(root, portrait::kOffAvWorldBound + 8);
+        const float boundRadius = portrait::Read<float>(root, portrait::kOffAvWorldBound + 12);
+        if (boundRadius > 1.0f && boundRadius < 500.0f)
+        {
+            at[0] = portrait::Read<float>(root, portrait::kOffAvWorldBound);
+            at[1] = portrait::Read<float>(root, portrait::kOffAvWorldBound + 4);
+            at[2] = boundCenterZ;
+        }
+        fovDeg = g_debugConfig.personaPortraitFovDeg;
     }
 
     const int size = g_debugConfig.personaPortraitSize;
@@ -13922,7 +14243,9 @@ bool RenderPlayerPortraitPixels(PlayerCharacter* player, std::vector<BYTE>& outB
     portrait::Mtx44 view;
     portrait::LookAt(eye, at, g_debugConfig.personaPortraitMirror, view);
     portrait::Mtx44 projection;
-    portrait::PerspectiveFov(g_debugConfig.personaPortraitFovDeg * (kPersonaPi / 180.0f),
+    LogLine("Persona portrait: %s framing%s.", faceShot ? "face" : "body",
+        (g_debugConfig.personaFaceFraming && !stats.hasHead) ? " (Bip01 Head not found - fell back to body)" : "");
+    portrait::PerspectiveFov(fovDeg * (kPersonaPi / 180.0f),
         static_cast<float>(width) / static_cast<float>(height), 8.0f, 4096.0f, projection);
     portrait::Mtx44 identity{};
     identity.m[0][0] = identity.m[1][1] = identity.m[2][2] = identity.m[3][3] = 1.0f;
@@ -14012,14 +14335,17 @@ bool RenderPlayerPortraitPixels(PlayerCharacter* player, std::vector<BYTE>& outB
             if (item.texture)
             {
                 device->SetTexture(0, item.texture);
-                device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+                device->SetRenderState(D3DRS_TEXTUREFACTOR, item.tint);
+                device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_MODULATE);
                 device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+                device->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_TFACTOR);
                 device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
                 device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
             }
             else
             {
                 device->SetTexture(0, nullptr);
+                device->SetRenderState(D3DRS_TEXTUREFACTOR, D3DCOLOR_XRGB(150, 148, 145));
                 device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG2);
                 device->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_TFACTOR);
                 device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG2);
@@ -14120,10 +14446,15 @@ bool RenderPlayerPortraitPixels(PlayerCharacter* player, std::vector<BYTE>& outB
 
     if (ok)
     {
-        LogLine("Persona portrait: rendered %d geometries (%d skinned, %d bind-pose, %d textured, %d skipped) in %lu ms at %dx%d.",
+        LogLine("Persona portrait: rendered %d geometries (%d skinned, %d bind-pose, %d textured, %d skipped, %d degenerate) in %lu ms at %dx%d.",
             stats.geometries, stats.skinned, stats.bindPoseFallbacks, stats.textured,
-            stats.skippedNoData, static_cast<unsigned long>(GetTickCount() - extractStart),
-            width, height);
+            stats.skippedNoData, stats.skippedDegenerate,
+            static_cast<unsigned long>(GetTickCount() - extractStart), width, height);
+        if (stats.repairedScales > 0)
+        {
+            LogLine("Persona portrait: repaired %d hidden-node scale(s) [%s] (1st-person body hiding).",
+                stats.repairedScales, stats.repairedNames[0] ? stats.repairedNames : "unnamed");
+        }
     }
     return ok;
 }

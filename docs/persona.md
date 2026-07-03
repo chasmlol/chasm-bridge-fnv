@@ -140,10 +140,15 @@ Technique (one game-thread pass per capture):
    fails validation falls back to bind pose + node transform, logged.
 3. Draw everything fixed-function textured (each mesh's own diffuse texture,
    alpha-tested for hair/lashes) into a `persona_portrait_size`-tall 3:4
-   render target cleared to neutral gray, viewed by a synthetic camera
-   `persona_camera_distance_units` (220) in front of the player's facing at
-   eye height `persona_camera_height_units` (100), aimed at the model's
-   bound center, `persona_portrait_fov_deg` (48) vertical FOV.
+   render target cleared to neutral gray. Default framing
+   (`persona_portrait_framing=face`) tracks the recomputed **Bip01 Head**
+   position: the camera sits `persona_face_distance_units` (45) in front of
+   the head along the body's facing at `persona_face_fov_deg` (30) vertical
+   FOV, so the face fills the frame natively (full render quality, no digital
+   zoom) and body animation cannot move it out of frame. `body` framing
+   instead shoots from `persona_camera_distance_units` (220) at eye height
+   `persona_camera_height_units` (100), aimed at the model's bound center,
+   `persona_portrait_fov_deg` (48) FOV.
 4. Read the target back (private surface — no front-buffer stall), then JPEG
    encode + base64 + POST on the background sender thread. Every device
    state touched is saved and restored around the pass (state block + render
@@ -183,6 +188,9 @@ Residual risks, stated plainly:
 | `persona_debounce_ms` | `30000` | min gap between capture sequences (5000–600000) |
 | `persona_camera_distance_units` | `220.0` | portrait camera distance in front of the player (40–600) |
 | `persona_camera_height_units` | `100.0` | portrait camera eye height above the player's feet (0–300) |
+| `persona_portrait_framing` | `face` | `face` = head close-up tracked to Bip01 Head; `body` = full figure |
+| `persona_face_distance_units` | `45.0` | face framing: camera distance in front of the head (15-300) |
+| `persona_face_fov_deg` | `30.0` | face framing: vertical FOV in degrees (10-90) |
 | `persona_portrait_size` | `1024` | offscreen portrait height; width is 3/4 of it (256–2048) |
 | `persona_portrait_fov_deg` | `48.0` | portrait camera vertical FOV in degrees (15–100) |
 | `persona_portrait_mirror` | `0` | set `1` if the portrait renders left/right mirrored |
