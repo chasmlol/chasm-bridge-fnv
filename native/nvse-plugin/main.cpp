@@ -562,6 +562,20 @@ struct DebugConfig
     std::string personaHttpPath = "/api/game/v1/persona";
 };
 
+// The four configurable in-game input bindings, as Win32 virtual keys. Chasm
+// writes them to <bridge>\control\hotkeys.cfg (decimal VK codes; see
+// LoadHotkeysConfigIfNeeded for the wire format); a missing/invalid file
+// leaves the plugin's original hardcoded defaults in place. Note the
+// TextEditMenu submit watcher stays hardwired to VK_RETURN — the game menu
+// itself always submits on Enter; only the "open chat / talk" keys rebind.
+struct HotkeyBindings
+{
+    SHORT chatVk = kChatVirtualKey;             // enter text (NPCs)
+    SHORT voiceVk = kVoiceChatVirtualKey;       // push to talk (NPCs)
+    SHORT adminChatVk = kAdminChatVirtualKey;   // enter text (Todd)
+    SHORT adminVoiceVk = kAdminVoiceChatVirtualKey; // push to talk (Todd)
+};
+
 RuntimeState g_state;
 Script* g_openTextInputScript = nullptr;
 Script* g_closeTextInputScript = nullptr;
@@ -589,6 +603,10 @@ std::unordered_map<std::string, ModLocalFormCacheEntry> g_modLocalFormCache;
 DebugConfig g_debugConfig;
 fs::file_time_type g_debugConfigWriteTime{};
 bool g_debugConfigLoaded = false;
+HotkeyBindings g_hotkeys;
+fs::file_time_type g_hotkeysWriteTime{};
+bool g_hotkeysLoaded = false;
+DWORD g_hotkeysLastPollTick = 0;
 
 constexpr UInt32 kInterfaceManagerSingletonAddress = 0x011D8A80;
 constexpr UInt32 kPlayerSingletonAddress = 0x011DEA3C;
@@ -772,7 +790,9 @@ void FinishVoiceCaptureAndSubmit();
 bool GameWindowHasFocus();
 void ResetTextInputKeyWatcher();
 void ClearTextInputKeyWatcher();
+void PrimeHotkeyEdgeStateFromKeyboard();
 void LoadDebugConfigIfNeeded(bool force = false);
+void LoadHotkeysConfigIfNeeded(bool force = false);
 void WriteRuntimeHeartbeatIfNeeded(bool force = false);
 void UpdatePersonaCapture();
 void ResetPersonaStateForSession();
@@ -1051,6 +1071,13 @@ fs::path ScriptRunnerTracePath()
 fs::path DebugConfigPath()
 {
     return DefaultBridgeDir() / "native_debug.cfg";
+}
+
+fs::path HotkeysConfigPath()
+{
+    // Written by chasm (ui::hotkeys save + bridge startup), read-only here.
+    // Lives with the other chasm<->plugin control files under BridgeDir().
+    return BridgeDir() / "control" / "hotkeys.cfg";
 }
 
 fs::path RuntimeHeartbeatPath()
@@ -3136,6 +3163,121 @@ void LoadDebugConfigIfNeeded(bool force)
                 { "autostart_stack", g_debugConfig.autoStartStack },
                 { "has_bridge_root_override", !g_debugConfig.bridgeRootPath.empty() },
             });
+    }
+}
+
+// Reload <bridge>\control\hotkeys.cfg when its mtime changes (1s poll, same
+// pattern as LoadDebugConfigIfNeeded), so rebinding in the chasm UI takes
+// effect in a running game without a restart.
+//
+// WIRE FORMAT (written by chasm — chasm-core/src/hotkeys.rs is the writer and
+// must stay in sync): `key=value` lines, `#` comments, CRLF. Values are
+// DECIMAL Win32 virtual-key codes. Keys:
+//   chat_vk        enter text (NPCs)      default VK_RETURN (13)
+//   voice_vk       push to talk (NPCs)    default VK_MENU   (18)
+//   admin_chat_vk  enter text (Todd)      default 'O'       (79)
+//   admin_voice_vk push to talk (Todd)    default 'H'       (72)
+// Out-of-range (not 1..254) or VK_ESCAPE values are ignored (Escape is the
+// cancel key); a missing file resets to the built-in defaults.
+void LoadHotkeysConfigIfNeeded(bool force)
+{
+    const DWORD now = GetTickCount();
+    if (!force && g_hotkeysLastPollTick && (now - g_hotkeysLastPollTick) < kDebugConfigPollMs)
+    {
+        return;
+    }
+    g_hotkeysLastPollTick = now;
+
+    std::error_code ec;
+    if (!fs::exists(HotkeysConfigPath(), ec))
+    {
+        if (g_hotkeysLoaded)
+        {
+            g_hotkeys = HotkeyBindings{};
+            g_hotkeysLoaded = false;
+            LogLine("Hotkeys config removed; reverting to default bindings.");
+        }
+        return;
+    }
+
+    const auto writeTime = fs::last_write_time(HotkeysConfigPath(), ec);
+    if (!force && g_hotkeysLoaded && !ec && writeTime == g_hotkeysWriteTime)
+    {
+        return;
+    }
+
+    std::ifstream in(HotkeysConfigPath(), std::ios::binary);
+    if (!in)
+    {
+        return;
+    }
+
+    HotkeyBindings bindings{};
+    auto applyKey = [](SHORT& slot, const std::string& value)
+    {
+        const int vk = std::atoi(value.c_str());
+        if (vk >= 1 && vk <= 254 && vk != VK_ESCAPE)
+        {
+            slot = static_cast<SHORT>(vk);
+        }
+    };
+
+    std::string line;
+    while (std::getline(in, line))
+    {
+        if (!line.empty() && line.back() == '\r')
+        {
+            line.pop_back();
+        }
+        line = Trim(line);
+        if (line.empty() || line[0] == '#')
+        {
+            continue;
+        }
+        const size_t equals = line.find('=');
+        if (equals == std::string::npos)
+        {
+            continue;
+        }
+        const std::string key = ToLowerAscii(Trim(line.substr(0, equals)));
+        const std::string value = Trim(line.substr(equals + 1));
+        if (key == "chat_vk")
+        {
+            applyKey(bindings.chatVk, value);
+        }
+        else if (key == "voice_vk")
+        {
+            applyKey(bindings.voiceVk, value);
+        }
+        else if (key == "admin_chat_vk")
+        {
+            applyKey(bindings.adminChatVk, value);
+        }
+        else if (key == "admin_voice_vk")
+        {
+            applyKey(bindings.adminVoiceVk, value);
+        }
+        // "version" and unknown keys: ignored (forward compatibility).
+    }
+
+    const bool changed = !g_hotkeysLoaded
+        || bindings.chatVk != g_hotkeys.chatVk
+        || bindings.voiceVk != g_hotkeys.voiceVk
+        || bindings.adminChatVk != g_hotkeys.adminChatVk
+        || bindings.adminVoiceVk != g_hotkeys.adminVoiceVk;
+    g_hotkeys = bindings;
+    g_hotkeysLoaded = true;
+    if (!ec)
+    {
+        g_hotkeysWriteTime = writeTime;
+    }
+    if (changed)
+    {
+        LogLine("Hotkeys loaded: chat_vk=%d voice_vk=%d admin_chat_vk=%d admin_voice_vk=%d.",
+            static_cast<int>(g_hotkeys.chatVk), static_cast<int>(g_hotkeys.voiceVk),
+            static_cast<int>(g_hotkeys.adminChatVk), static_cast<int>(g_hotkeys.adminVoiceVk));
+        // Re-prime edge detection so a key held across the swap doesn't fire.
+        PrimeHotkeyEdgeStateFromKeyboard();
     }
 }
 
@@ -11827,6 +11969,7 @@ void PlayQueuedAudioChunk()
 void ResetRuntimeState()
 {
     LoadDebugConfigIfNeeded(true);
+    LoadHotkeysConfigIfNeeded(true);
     CancelHttpTurn();
     ResetPersonaStateForSession();
     AbortVoiceCapture("runtime_reset_voice", false);
@@ -12322,7 +12465,10 @@ void ForceCloseTextInputMenu(const char* reason)
 
 void ResetTextInputKeyWatcher()
 {
-    g_state.inputEnterDownLastFrame = (GetAsyncKeyState(kChatVirtualKey) & 0x8000) != 0;
+    // Hardwired VK_RETURN (not g_hotkeys.chatVk): this watches the TextEditMenu's
+    // own submit key, which is always Enter regardless of the rebindable
+    // open-chat hotkey.
+    g_state.inputEnterDownLastFrame = (GetAsyncKeyState(VK_RETURN) & 0x8000) != 0;
     g_state.inputEscapeDownLastFrame = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
     g_state.inputEmptyEnterCancelTick = 0;
 }
@@ -12336,10 +12482,10 @@ void ClearTextInputKeyWatcher()
 
 void PrimeHotkeyEdgeStateFromKeyboard()
 {
-    g_state.keyDownLastFrame = (GetAsyncKeyState(kChatVirtualKey) & 0x8000) != 0;
-    g_state.adminKeyDownLastFrame = (GetAsyncKeyState(kAdminChatVirtualKey) & 0x8000) != 0;
-    g_state.voiceCapture.keyDownLastFrame = (GetAsyncKeyState(kVoiceChatVirtualKey) & 0x8000) != 0;
-    g_state.voiceCapture.adminKeyDownLastFrame = (GetAsyncKeyState(kAdminVoiceChatVirtualKey) & 0x8000) != 0;
+    g_state.keyDownLastFrame = (GetAsyncKeyState(g_hotkeys.chatVk) & 0x8000) != 0;
+    g_state.adminKeyDownLastFrame = (GetAsyncKeyState(g_hotkeys.adminChatVk) & 0x8000) != 0;
+    g_state.voiceCapture.keyDownLastFrame = (GetAsyncKeyState(g_hotkeys.voiceVk) & 0x8000) != 0;
+    g_state.voiceCapture.adminKeyDownLastFrame = (GetAsyncKeyState(g_hotkeys.adminVoiceVk) & 0x8000) != 0;
     ResetTextInputKeyWatcher();
 }
 
@@ -12406,7 +12552,9 @@ void CancelAwaitingTextInput(const char* reason, const char* diagnosticKey)
 
 bool ConsumeTextInputMenuCloseHotkeys(bool menuVisible)
 {
-    const bool enterDown = (GetAsyncKeyState(kChatVirtualKey) & 0x8000) != 0;
+    // Hardwired VK_RETURN: the TextEditMenu always submits on Enter (see
+    // ResetTextInputKeyWatcher).
+    const bool enterDown = (GetAsyncKeyState(VK_RETURN) & 0x8000) != 0;
     const bool escapeDown = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
     const bool enterPressed = enterDown && !g_state.inputEnterDownLastFrame;
     const bool escapePressed = escapeDown && !g_state.inputEscapeDownLastFrame;
@@ -13096,8 +13244,8 @@ void UpdateVoiceCaptureHotkey()
     }
     g_state.ignoreHotkeysUntilTick = 0;
 
-    const bool keyDown = (GetAsyncKeyState(kVoiceChatVirtualKey) & 0x8000) != 0;
-    const bool adminKeyDown = (GetAsyncKeyState(kAdminVoiceChatVirtualKey) & 0x8000) != 0;
+    const bool keyDown = (GetAsyncKeyState(g_hotkeys.voiceVk) & 0x8000) != 0;
+    const bool adminKeyDown = (GetAsyncKeyState(g_hotkeys.adminVoiceVk) & 0x8000) != 0;
     const bool pressedNow = keyDown && !capture.keyDownLastFrame;
     const bool adminPressedNow = adminKeyDown && !capture.adminKeyDownLastFrame;
     const bool releasedNow = !keyDown && capture.keyDownLastFrame;
@@ -13667,6 +13815,7 @@ void OnMainGameLoop()
 
     UpdateVoiceBootstrapStatus();
     LoadDebugConfigIfNeeded(false);
+    LoadHotkeysConfigIfNeeded(false);
     PollNativeActionCommands();
     PollCompanionCommands();
     UpdateCompanionFaceDesignSession();
@@ -13770,16 +13919,16 @@ void OnMainGameLoop()
 
     if (g_state.awaitingInput || g_state.voiceCapture.active || IsTextInputMenuActive())
     {
-        g_state.keyDownLastFrame = (GetAsyncKeyState(kChatVirtualKey) & 0x8000) != 0;
-        g_state.adminKeyDownLastFrame = (GetAsyncKeyState(kAdminChatVirtualKey) & 0x8000) != 0;
+        g_state.keyDownLastFrame = (GetAsyncKeyState(g_hotkeys.chatVk) & 0x8000) != 0;
+        g_state.adminKeyDownLastFrame = (GetAsyncKeyState(g_hotkeys.adminChatVk) & 0x8000) != 0;
         return;
     }
 
-    const bool adminKeyDown = (GetAsyncKeyState(kAdminChatVirtualKey) & 0x8000) != 0;
+    const bool adminKeyDown = (GetAsyncKeyState(g_hotkeys.adminChatVk) & 0x8000) != 0;
     const bool adminPressedNow = adminKeyDown && !g_state.adminKeyDownLastFrame;
     g_state.adminKeyDownLastFrame = adminKeyDown;
 
-    const bool keyDown = (GetAsyncKeyState(kChatVirtualKey) & 0x8000) != 0;
+    const bool keyDown = (GetAsyncKeyState(g_hotkeys.chatVk) & 0x8000) != 0;
     const bool pressedNow = keyDown && !g_state.keyDownLastFrame;
     g_state.keyDownLastFrame = keyDown;
 
