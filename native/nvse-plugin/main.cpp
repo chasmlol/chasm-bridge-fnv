@@ -2,6 +2,7 @@
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cfloat>
 #include <cstdlib>
 #include <cmath>
@@ -343,6 +344,10 @@ struct ActiveSpeechAnimation
     DWORD startedTick = 0;
     DWORD durationMs = 0;
     DWORD envelopeWindowMs = kSpeechEnvelopeWindowMs;
+    // Extra mouth-open multiplier on top of the global speechWeightScale. 1.0 for
+    // normal speech; songs use a higher value so the singing lip movement is
+    // exaggerated + readable (a sung mix is quieter/flatter than clean speech).
+    float weightGain = 1.0f;
     DWORD lastBindingAttemptTick = 0;
     DWORD lastBindingValidationTick = 0;
     DWORD lastWeightsUpdateTick = 0;
@@ -514,6 +519,25 @@ struct RuntimeState
     DWORD stackBootstrapAttemptTick = 0;
     bool stackBootstrapAttempted = false;
     VoiceCaptureState voiceCapture;
+
+    // --- Music: play-a-song (guitar) performance (task/music) ------------------
+    // A generated song is delivered out-of-band via the control/songs queue (which
+    // is polled unconditionally, unlike the turn-scoped reply) and played
+    // positionally from the NPC by ProcessSongDeliveries(). The guitar idle is
+    // re-asserted for the song's duration and stopped at the end.
+    DWORD songScanTick = 0;          // last control/songs scan (throttle)
+    bool songActive = false;         // a performance is live (guitar out and/or song playing)
+    DWORD songUntilTick = 0;         // GetTickCount() when the performance ends
+    DWORD songReissueTick = 0;       // last guitar-idle re-assert
+    SpeakerSnapshot songSpeaker;     // the performing NPC (to re-assert/stop the idle)
+    // The guitar is DEFERRED until this turn's spoken reply (TTS) finishes, so the
+    // NPC doesn't whip out a guitar mid-sentence while still accepting the request.
+    bool pendingGuitar = false;      // a performance is waiting for TTS to end
+    SpeakerSnapshot pendingGuitarSpeaker;
+    // Which idle the current/pending performance uses: false = guitar
+    // (SpecialIdleNVGuitar), true = rap/vocal (SpecialIdleSinging). Set from the
+    // action that started it and read by RunGuitarIdle when (re)asserting the idle.
+    bool performIsRap = false;
 };
 
 enum class BridgeTransport
@@ -605,6 +629,12 @@ Script* g_applyNoMovePackageScript = nullptr;
 bool g_applyNoMovePackageScriptAttempted = false;
 Script* g_runBatchScript = nullptr;
 Script* g_consoleCommandScript = nullptr;
+// Music (task/music): performance idle re-assert + stop, lazily compiled. Guitar =
+// SpecialIdleNVGuitar (play-a-song); Sing = SpecialIdleSinging (rap/vocal).
+Script* g_playGuitarIdleScript = nullptr;
+Script* g_playSingIdleScript = nullptr;
+Script* g_stopGuitarIdleScript = nullptr;
+bool g_guitarIdleScriptsAttempted = false;
 std::unordered_map<std::string, Script*> g_trustedExecutionScripts;
 std::unordered_map<std::string, ModLocalFormCacheEntry> g_modLocalFormCache;
 DebugConfig g_debugConfig;
@@ -749,6 +779,8 @@ void ClearDialogSubtitle();
 bool ShowDialogSubtitle(const std::string& speaker, const std::string& text, float seconds);
 std::string ToUiAscii(std::string_view value);
 void InterruptBridgeReplyAndPlayback(const char* reason);
+void StopGuitarPerformance(const char* reason);
+bool SetActorRestrainedState(TESObjectREFR* actorRef, bool restrained);
 void CancelHttpTurn();
 bool HasPendingChunkFiles();
 void ClearOutboxArtifacts(const char* reason);
@@ -5579,6 +5611,37 @@ bool TriggerTrustedActionBinding(const ResponsePayload& response)
 
     const std::string actionNpcKey = ActionNpcKey(response);
     const std::string actionNpcName = ActionNpcName(response);
+
+    // Music (task/music): DEFER the performance idle until this turn's spoken reply
+    // (TTS) has finished. Otherwise the NPC yanks out a guitar / strikes a pose while
+    // still speaking the "give me a minute" line. We stash the actor + which idle
+    // (guitar for play-a-song, singing for rap) and let UpdateActiveSong() fire it
+    // once the reply audio ends; the generated song is likewise held until speech ends.
+    const bool isSongGuitar = response.actionId == "npc.play_song_guitar"
+        || response.executionTemplateId.rfind("npc.play_song_guitar", 0) == 0;
+    const bool isSongRap = response.actionId == "npc.play_song_rap"
+        || response.executionTemplateId.rfind("npc.play_song_rap", 0) == 0;
+    if (isSongGuitar || isSongRap)
+    {
+        const SpeakerSnapshot snap = ResolveActionSpeaker(response);
+        if (snap.valid)
+        {
+            g_state.pendingGuitar = true;
+            g_state.pendingGuitarSpeaker = snap;
+            g_state.performIsRap = isSongRap;
+            // Root the performer in place RIGHT NOW (the game_master action just
+            // dropped the conversation hold, so without this they'd wander off
+            // during the acceptance line before the performance even starts).
+            if (TESObjectREFR* ref = ResolveSpeakerRef(snap))
+            {
+                SetActorRestrainedState(ref, true);
+            }
+            LogLine("Music: %s deferred until turn speech ends (npc=%s).",
+                isSongRap ? "rap" : "guitar", actionNpcName.c_str());
+            return true; // handled — do NOT play the idle now
+        }
+    }
+
     TESObjectREFR* actorRef = ResolveSpeakerRef(ResolveActionSpeaker(response));
     PlayerCharacter* player = GetPlayer();
     if (!player)
@@ -5828,7 +5891,18 @@ bool TriggerGameMasterAction(const ResponsePayload& response, std::string* outTr
         return false;
     }
 
-    ReleaseConversationHold("game_master_action");
+    // Only DROP the conversation hold for actions that actually move the NPC
+    // (follow, attack, go sit/wait/sandbox, spawn, etc.). Non-locomotion actions —
+    // gestures and the song/rap performances — should KEEP the NPC held in the
+    // conversation instead of returning them to a wandering state. This is the
+    // general "the moment they do an action they wander off" fix; performances also
+    // SetRestrained on top for a hard hold.
+    const bool keepsHold = response.actionId.rfind("npc.gesture_", 0) == 0
+        || response.actionId.rfind("npc.play_song", 0) == 0;
+    if (!keepsHold)
+    {
+        ReleaseConversationHold("game_master_action");
+    }
 
     if (!response.executionScript.empty())
     {
@@ -6365,6 +6439,12 @@ void ClearIdleOutboxArtifacts(const char* reason)
 
 void InterruptBridgeReplyAndPlayback(const char* reason)
 {
+    // Any interrupt (push-to-talk, a new turn, teardown) also ends a guitar
+    // performance — otherwise the NPC keeps strumming while you talk over them.
+    // Runs before the reply-state gate below because a guitar-out-awaiting-song
+    // phase has no reply audio and would otherwise skip cleanup.
+    StopGuitarPerformance(reason ? reason : "reply_interrupted");
+
     // Match the gate (HasQueuedOrPlayingReply) exactly. The old guard omitted
     // `streamActive`, so when a streaming reply had finished generating
     // (awaitingReply already false) but was still audibly playing out the stream
@@ -10758,7 +10838,7 @@ std::array<float, kFaceGenPhonemeCount> BuildSpeechWeights(const ActiveSpeechAni
 
     const VisemeCue& cue = animation.visemes[cueIndex];
     const float baseWeight = (std::clamp)(kSpeechMinWeight + (amplitude * (kSpeechMaxWeight - kSpeechMinWeight)), 0.0f, kSpeechMaxWeight);
-    const float scaledBaseWeight = (std::clamp)(baseWeight * g_debugConfig.speechWeightScale, 0.0f, 1.0f);
+    const float scaledBaseWeight = (std::clamp)(baseWeight * g_debugConfig.speechWeightScale * animation.weightGain, 0.0f, 1.0f);
     weights[cue.phonemeId] = scaledBaseWeight * cue.emphasis;
 
     const DWORD cueSpan = cue.endMs > cue.startMs ? (cue.endMs - cue.startMs) : 1;
@@ -10840,7 +10920,7 @@ void StopSpeechAnimation()
     WriteRuntimeHeartbeatIfNeeded(true);
 }
 
-void StartSpeechAnimation(const WavData& wavData, const QueuedAudioChunk& chunk, const SpeakerSnapshot& speaker, DWORD durationMs)
+void StartSpeechAnimation(const WavData& wavData, const QueuedAudioChunk& chunk, const SpeakerSnapshot& speaker, DWORD durationMs, float weightGain = 1.0f)
 {
     if (!g_debugConfig.speechAnimationEnabled)
     {
@@ -10878,6 +10958,7 @@ void StartSpeechAnimation(const WavData& wavData, const QueuedAudioChunk& chunk,
     animation.startedTick = GetTickCount();
     animation.durationMs = durationMs;
     animation.envelopeWindowMs = kSpeechEnvelopeWindowMs;
+    animation.weightGain = weightGain;
     animation.envelope = BuildSpeechEnvelope(wavData, animation.envelopeWindowMs);
     animation.visemes = BuildVisemeTimeline(chunk.subtitleText.empty() ? chunk.audioFile : chunk.subtitleText, durationMs);
     if (canReuseBinding)
@@ -12027,6 +12108,7 @@ void ResetRuntimeState()
     AbortVoiceCapture("runtime_reset_voice", false);
     ReleaseConversationHold("runtime_reset");
     StopSpeechAnimation();
+    StopGuitarPerformance("runtime_reset");
     ClearDialogSubtitle();
     g_state.awaitingInput = false;
     g_state.bridgeTextInputOwned = false;
@@ -13796,6 +13878,379 @@ void UpdatePersonaCapture()
     TakePersonaCapture(player);
 }
 
+// ===========================================================================
+// Music: play-a-song (guitar) delivery + performance  (task/music)
+// ===========================================================================
+//
+// A generated song arrives out-of-band as a line-based file in
+// `<bridge>/control/songs/<id>.txt` (written by chasm's music module AFTER the
+// turn completes — the normal reply path is turn-scoped and won't play unsolicited
+// audio). This queue is polled UNCONDITIONALLY, like the durable action queue.
+// Format:
+//     NVBRIDGE_SONG_V1
+//     <songId>
+//     <npcKey>
+//     <npcName>
+//     <absolute wav path>
+//     <durationMs>
+//     <title>
+// We resolve the NPC, play the WAV positionally from them (reusing PlayVoiceWav —
+// one static DirectSound buffer for the whole song), and run the guitar idle for
+// the song's duration, stopping it at the end. Clearly separated from the
+// turn/speech audio path so it doesn't disturb the in-flight audio work.
+
+fs::path SongDeliveryDir()
+{
+    return SaveStateControlDir() / "songs";
+}
+
+// Lazily compile the guitar-idle helper scripts (mirrors the SetRestrained etc.
+// helpers). `PlayIdle SpecialIdleNVGuitar` is the vanilla seated guitar-strum idle
+// (the Lonesome Drifter's performance); EvaluatePackage ends it by re-running AI.
+void EnsureGuitarIdleScripts()
+{
+    if (g_guitarIdleScriptsAttempted)
+    {
+        return;
+    }
+    g_guitarIdleScriptsAttempted = true;
+    if (!g_scriptInterface)
+    {
+        return;
+    }
+    constexpr char kPlayGuitarIdleScript[] = R"(
+ref rActor
+
+Begin Function { rActor }
+    if rActor
+        rActor.PlayIdle SpecialIdleNVGuitar
+    endif
+End
+)";
+    // Rap/vocal performance: Bruce Isaac's standing lounge-singer idle. No
+    // instrument baked in, PlayIdle-compatible on any humanoid — reads as an MC.
+    constexpr char kPlaySingIdleScript[] = R"(
+ref rActor
+
+Begin Function { rActor }
+    if rActor
+        rActor.PlayIdle SpecialIdleSinging
+    endif
+End
+)";
+    // Stopping a forced special-idle: PlayIdle/EvaluatePackage alone can't break a
+    // looping performance idle. The vanilla game stops exactly these idles by playing
+    // a DIFFERENT idle over them (VMSLonesomeDrifterSCRIPT breaks the guitar with
+    // `PlayIdle LooseDefensiveIdleA`). So we override with a brief neutral idle, then
+    // ResetAI + EvaluatePackage returns the actor to their normal AI standing idle.
+    constexpr char kStopGuitarIdleScript[] = R"(
+ref rActor
+
+Begin Function { rActor }
+    if rActor
+        rActor.PlayIdle LooseDefensiveIdleA
+        rActor.ResetAI
+        rActor.EvaluatePackage
+    endif
+End
+)";
+    g_playGuitarIdleScript = g_scriptInterface->CompileScript(kPlayGuitarIdleScript);
+    g_playSingIdleScript = g_scriptInterface->CompileScript(kPlaySingIdleScript);
+    g_stopGuitarIdleScript = g_scriptInterface->CompileScript(kStopGuitarIdleScript);
+    if (!g_playGuitarIdleScript || !g_playSingIdleScript || !g_stopGuitarIdleScript)
+    {
+        LogLine("Music: failed to compile performance-idle helper script(s); animation will rely on the action-book kick only.");
+    }
+}
+
+// Runs the play- or stop-performance-idle helper on `actorRef`. On play it picks the
+// guitar or the singing (rap) idle from g_state.performIsRap; stop is shared.
+// Best-effort.
+void RunGuitarIdle(TESObjectREFR* actorRef, bool play)
+{
+    EnsureGuitarIdleScripts();
+    Script* script;
+    if (!play)
+    {
+        script = g_stopGuitarIdleScript;
+    }
+    else
+    {
+        script = g_state.performIsRap ? g_playSingIdleScript : g_playGuitarIdleScript;
+    }
+    if (!script || !actorRef || !g_scriptInterface)
+    {
+        return;
+    }
+    NVSEArrayVarInterface::Element result;
+    g_scriptInterface->CallFunction(script, actorRef, nullptr, &result, 1, actorRef);
+    // Root the performer in place while performing (SetRestrained), like the vanilla
+    // Lonesome Drifter, and release them when the performance stops. This is what
+    // keeps them from wandering off mid-song (a triggered action drops the normal
+    // conversation hold, so the idle alone isn't enough to hold them still).
+    SetActorRestrainedState(actorRef, play);
+}
+
+// Tears down any active/ pending guitar performance: stops the idle on the
+// performer(s) and clears ALL performance state, so a stale `songActive` can never
+// keep re-asserting the guitar (the "guitar stays locked" bug). Called on song end,
+// on save load / reset (via ResetRuntimeState), and on interrupt. Idempotent.
+void StopGuitarPerformance(const char* reason)
+{
+    const bool wasActive = g_state.songActive || g_state.pendingGuitar;
+    if (TESObjectREFR* ref = ResolveSpeakerRef(g_state.songSpeaker))
+    {
+        RunGuitarIdle(ref, false);
+    }
+    if (TESObjectREFR* ref = ResolveSpeakerRef(g_state.pendingGuitarSpeaker))
+    {
+        RunGuitarIdle(ref, false);
+    }
+    g_state.songActive = false;
+    g_state.pendingGuitar = false;
+    g_state.songUntilTick = 0;
+    g_state.songReissueTick = 0;
+    g_state.songSpeaker = {};
+    g_state.pendingGuitarSpeaker = {};
+    g_state.performIsRap = false;
+    if (wasActive)
+    {
+        LogLine("Music: performance stopped (%s).", reason ? reason : "cleanup");
+    }
+}
+
+// Whether this turn's spoken reply (TTS) is still being generated or played out.
+// The guitar + song wait for this to go false, so the NPC finishes accepting the
+// request ("give me a minute to tune up") before the performance begins.
+bool IsTurnSpeechActive()
+{
+    return g_state.awaitingReply
+        || g_state.streamActive
+        || (g_state.activeSpeechUntilTick && GetTickCount() < g_state.activeSpeechUntilTick);
+}
+
+// Plays one delivered song: resolve the NPC, play the WAV positionally, kick the
+// guitar idle, and arm the performance timer. Returns true when the delivery was
+// consumed (played OR unrecoverable — either way the file is removed by the caller).
+bool PlaySongDelivery(const std::vector<std::string>& lines)
+{
+    if (lines.size() < 6 || Trim(lines[0]) != "NVBRIDGE_SONG_V1")
+    {
+        return true; // malformed → consume (don't retry a bad file forever)
+    }
+    const std::string npcKey = Trim(lines[2]);
+    const std::string npcName = Trim(lines[3]);
+    const std::string wavPath = Trim(lines[4]);
+    long durationRaw = lines.size() > 5 ? std::atol(Trim(lines[5]).c_str()) : 0;
+    if (durationRaw < 0)
+    {
+        durationRaw = 0;
+    }
+    const DWORD durationMs = static_cast<DWORD>(durationRaw);
+
+    if (wavPath.empty())
+    {
+        LogLine("Music: song delivery has no wav path; dropping.");
+        return true;
+    }
+    const fs::path wav = fs::path(wavPath);
+    std::error_code ec;
+    if (!fs::exists(wav, ec))
+    {
+        LogLine("Music: song wav missing on disk (%s); dropping.", wavPath.c_str());
+        return true;
+    }
+
+    // Hold the song until this turn's spoken reply (TTS) has finished, so the NPC
+    // isn't singing over their own acceptance line. Retried on the next scan.
+    if (IsTurnSpeechActive())
+    {
+        return false; // not consumed — wait for speech to end
+    }
+
+    // Resolve the singer. If they aren't loaded/nearby, leave the delivery to retry
+    // (the player may be mid-walk to the NPC) — the caller ages it out.
+    const auto snapshot = ResolveSpeakerSnapshotForNpc(npcKey, npcName);
+    if (!snapshot.has_value() || !snapshot->valid)
+    {
+        return false; // not consumed — retry next scan
+    }
+    TESObjectREFR* actorRef = ResolveSpeakerRef(*snapshot);
+    if (!actorRef)
+    {
+        return false;
+    }
+
+    // Load the WAV once so we can both play it and drive the mouth from its envelope.
+    const auto wavData = LoadWavFile(wav);
+    if (!wavData.has_value())
+    {
+        LogLine("Music: could not load song wav (%s); dropping.", wavPath.c_str());
+        return true;
+    }
+    if (!PlayVoiceWav(wav, *snapshot, &*wavData))
+    {
+        LogLine("Music: PlayVoiceWav failed for %s.", wavPath.c_str());
+        return true; // consumed — don't spin on a bad buffer
+    }
+
+    const DWORD dur = durationMs > 0 ? durationMs : 60000; // fallback ~60s if unknown
+
+    // Lip-sync: drive the NPC's mouth from the song's amplitude envelope for its
+    // duration — the same envelope->viseme machinery TTS uses. Not phoneme-accurate,
+    // but the jaw moves with the singing so it reads as a genuine performance.
+    QueuedAudioChunk songChunk;
+    songChunk.requestId = Trim(lines[1]); // songId
+    songChunk.audioFile = wav.filename().string();
+    songChunk.speakerKey = npcKey;
+    songChunk.speakerName = npcName;
+    songChunk.chunkIndex = 0;
+    songChunk.nonPositional = false;
+    // Exaggerate the mouth movement for singing (2.2x): a sung/mixed track is
+    // quieter and flatter than clean speech, so at normal gain the lips barely move.
+    StartSpeechAnimation(*wavData, songChunk, *snapshot, dur, 2.2f);
+
+    // Guitar is already out (the deferred idle fired when speech ended). Re-assert it
+    // synced to the song and arm the performance timer to hold + stop it at the end.
+    RunGuitarIdle(actorRef, true);
+    g_state.songActive = true;
+    g_state.songSpeaker = *snapshot;
+    g_state.songReissueTick = GetTickCount();
+    g_state.songUntilTick = GetTickCount() + dur + 500; // small tail
+    g_state.pendingGuitar = false;                       // the song owns the performance now
+    LogLine("Music: performing song for '%s' (~%u ms) from %s.", npcName.c_str(), dur, wavPath.c_str());
+    return true;
+}
+
+// Scans the control/songs queue (throttled) and plays any ready deliveries.
+void ProcessSongDeliveries()
+{
+    const DWORD now = GetTickCount();
+    if (g_state.songScanTick != 0 && (now - g_state.songScanTick) < 500)
+    {
+        return; // throttle: song delivery is not latency-critical
+    }
+    g_state.songScanTick = now;
+
+    const fs::path dir = SongDeliveryDir();
+    std::error_code ec;
+    if (!fs::exists(dir, ec))
+    {
+        return;
+    }
+    for (const auto& entry : fs::directory_iterator(dir, ec))
+    {
+        std::error_code fileEc;
+        if (!entry.is_regular_file(fileEc))
+        {
+            continue;
+        }
+        const fs::path path = entry.path();
+        if (path.extension() != ".txt")
+        {
+            continue; // skip .tmp files still being written
+        }
+
+        std::ifstream in(path, std::ios::binary);
+        if (!in)
+        {
+            continue;
+        }
+        std::vector<std::string> lines;
+        std::string line;
+        while (std::getline(in, line))
+        {
+            if (!line.empty() && line.back() == '\r')
+            {
+                line.pop_back();
+            }
+            lines.push_back(line);
+        }
+        in.close();
+
+        const bool consumed = PlaySongDelivery(lines);
+        if (consumed)
+        {
+            fs::remove(path, fileEc);
+        }
+        else
+        {
+            // NPC not resolvable yet: age the delivery out after ~2 minutes so a
+            // song for an NPC the player never reaches doesn't linger forever.
+            const auto writeTime = fs::last_write_time(path, fileEc);
+            if (!fileEc)
+            {
+                const auto age = decltype(writeTime)::clock::now() - writeTime;
+                if (age > std::chrono::minutes(2))
+                {
+                    LogLine("Music: song delivery %s expired (NPC never resolved); dropping.",
+                        path.filename().string().c_str());
+                    fs::remove(path, fileEc);
+                }
+            }
+        }
+        // Only start one song per scan (avoid stacking overlapping performances).
+        if (consumed && g_state.songActive)
+        {
+            break;
+        }
+    }
+}
+
+// Keeps the guitar idle asserted through the song and stops it at the end. The
+// special idle can be broken by AI re-evaluation, so we re-issue it periodically.
+void UpdateActiveSong()
+{
+    const DWORD now = GetTickCount();
+
+    // Deferred guitar: fire the performance idle once this turn's spoken reply (TTS)
+    // has finished — the NPC pulls out the guitar AFTER accepting the request, then
+    // strums while the song generates. The song (arriving later) reuses this state.
+    if (g_state.pendingGuitar && !IsTurnSpeechActive())
+    {
+        g_state.pendingGuitar = false;
+        if (TESObjectREFR* ref = ResolveSpeakerRef(g_state.pendingGuitarSpeaker))
+        {
+            RunGuitarIdle(ref, true);
+            g_state.songActive = true;
+            g_state.songSpeaker = g_state.pendingGuitarSpeaker;
+            g_state.songReissueTick = now;
+            // Safety cap: if the song never arrives (generation failed / player left),
+            // stop strumming after 90s instead of locking the idle. PlaySongDelivery
+            // replaces this with the real song end when the audio arrives.
+            g_state.songUntilTick = now + 90000;
+            LogLine("Music: turn speech ended - guitar out, awaiting song.");
+        }
+    }
+
+    if (!g_state.songActive)
+    {
+        return;
+    }
+    TESObjectREFR* actorRef = ResolveSpeakerRef(g_state.songSpeaker);
+
+    // Performer no longer resolvable (unloaded / cell change / gone) — stop cleanly
+    // so we never keep re-asserting on a stale reference.
+    if (!actorRef)
+    {
+        StopGuitarPerformance("performer_unresolved");
+        return;
+    }
+
+    if (now >= g_state.songUntilTick)
+    {
+        StopGuitarPerformance("song_ended");
+        return;
+    }
+
+    // Re-assert the guitar idle every ~4s so it survives AI package re-evaluation.
+    if ((now - g_state.songReissueTick) >= 4000)
+    {
+        g_state.songReissueTick = now;
+        RunGuitarIdle(actorRef, true);
+    }
+}
+
 void OnMainGameLoop()
 {
     const bool gameWindowFocused = GameWindowHasFocus();
@@ -13961,6 +14416,12 @@ void OnMainGameLoop()
     }
 
     WriteRuntimeHeartbeatIfNeeded(false);
+
+    // Music (task/music): the song queue is polled UNCONDITIONALLY (it's delivered
+    // after the turn, so `awaitingReply` is already false), and the active
+    // performance's guitar idle is maintained every frame.
+    ProcessSongDeliveries();
+    UpdateActiveSong();
 
     if (g_state.ignoreHotkeysUntilTick && GetTickCount() < g_state.ignoreHotkeysUntilTick)
     {
