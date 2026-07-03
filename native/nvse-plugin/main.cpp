@@ -3992,8 +3992,21 @@ std::optional<std::pair<std::string, std::string>> ResolveMappedNpcImpl(TESObjec
         }
     }
     const auto resolveVisibleName = [ref, baseNpc, &isLikelyEditorRefName]() -> std::string {
+        // Prefer the real display name (GetTheName) over GetName(): in FNV,
+        // GetName() leaks the editor ID (e.g. "NobarkNoonan") for any NPC that
+        // isn't in the hardcoded roster above, which then fails to match its
+        // display-named character card. GetName() stays as a fallback so a
+        // truly-nameless ref keeps its previous behaviour.
         if (ref)
         {
+            if (const char* display = ref->GetTheName())
+            {
+                const std::string trimmed = Trim(display);
+                if (!trimmed.empty() && !isLikelyEditorRefName(trimmed))
+                {
+                    return trimmed;
+                }
+            }
             if (char* refName = ref->GetName())
             {
                 const std::string trimmed = Trim(refName);
@@ -4006,6 +4019,14 @@ std::optional<std::pair<std::string, std::string>> ResolveMappedNpcImpl(TESObjec
 
         if (ref && ref->baseForm && ref->baseForm != ref)
         {
+            if (const char* display = ref->baseForm->GetTheName())
+            {
+                const std::string trimmed = Trim(display);
+                if (!trimmed.empty())
+                {
+                    return trimmed;
+                }
+            }
             if (char* baseName = ref->baseForm->GetName())
             {
                 const std::string trimmed = Trim(baseName);
@@ -4018,6 +4039,14 @@ std::optional<std::pair<std::string, std::string>> ResolveMappedNpcImpl(TESObjec
 
         if (baseNpc && baseNpc->copyFrom)
         {
+            if (const char* display = baseNpc->copyFrom->GetTheName())
+            {
+                const std::string trimmed = Trim(display);
+                if (!trimmed.empty())
+                {
+                    return trimmed;
+                }
+            }
             if (char* templateName = baseNpc->copyFrom->GetName())
             {
                 const std::string trimmed = Trim(templateName);

@@ -1,10 +1,10 @@
 {
   "id": "fallout-new-vegas",
   "name": "Fallout: New Vegas",
-  "description": "Goodsprings starting area for Fallout: New Vegas. Ships with the Chasm Bridge FNV mod: the Goodsprings NPC roster as character cards, a unified Mojave/Goodsprings lorebook, the FNV action and quest books, and the generated entity/item spawn catalogs. Also carries the FNV voice extractor so chasm can clone each NPC's real in-game voice. Drop this folder into chasm (or let the mod copy it in) and the Goodsprings cast comes to life.",
-  "bundleVersion": 5,
+  "description": "Fallout: New Vegas content for the Chasm Bridge FNV mod: the Goodsprings and Novac NPC rosters as character cards, a unified Mojave lorebook (Goodsprings + Novac area lore and Mojave basics), the FNV action and quest books, and the generated entity/item spawn catalogs. Also carries the FNV voice extractor so chasm can clone each NPC's real in-game voice. Drop this folder into chasm (or let the mod copy it in) and the Mojave cast comes to life.",
+  "bundleVersion": 6,
   "game": "fallout-new-vegas",
-  "comment": "Authored game content + the per-game voice extractor. No chat logs, conversation history, live-chat state, embeddings, or save-sync snapshots are bundled — those are per-user runtime data. Voice CLIPS are not shipped either; extract_voices.py pulls them from the player's own game files when they clone. Named NPCs resolve to their own lines via 'edid'; generic/un-named NPCs use a 'voicetype' override.",
+  "comment": "Authored game content + the per-game voice extractor. No chat logs, conversation history, live-chat state, embeddings, or save-sync snapshots are bundled - those are per-user runtime data. Voice CLIPS are not shipped either; extract_voices.py pulls them from the player's own game files when they clone. Named NPCs resolve to their own lines via 'edid'; generic/un-named NPCs use a 'voicetype' override.",
   "voice": {
     "extractor": "extract_voices.py",
     "steam_app": "Fallout New Vegas",
@@ -56,6 +56,58 @@
     {
       "name": "Victor",
       "voicetype": "robotvictor"
+    },
+    {
+      "name": "Manny Vargas",
+      "edid": "MannyVargas"
+    },
+    {
+      "name": "Boone",
+      "edid": "CraigBoone"
+    },
+    {
+      "name": "Jeannie May Crawford",
+      "edid": "JeannieMayCrawford"
+    },
+    {
+      "name": "Cliff Briscoe",
+      "edid": "CliffBriscoe"
+    },
+    {
+      "name": "No-bark Noonan",
+      "edid": "NobarkNoonan"
+    },
+    {
+      "name": "Ranger Andy",
+      "edid": "RangerAndy"
+    },
+    {
+      "name": "Alice McBride",
+      "edid": "AliceMcBride"
+    },
+    {
+      "name": "Dusty McBride",
+      "edid": "DustyMcBride"
+    },
+    {
+      "name": "Daisy Whitman",
+      "edid": "VRemDaisyWhitman"
+    },
+    {
+      "name": "Bruce Isaac",
+      "edid": "VMSTopsBruceIsaac"
+    },
+    {
+      "name": "Dr. Ada Straus",
+      "edid": "AdaStraus"
+    },
+    {
+      "name": "Chris Haversam",
+      "edid": "ChrisHaversam"
+    },
+    {
+      "name": "Novac settler",
+      "edid": "NovacSettler01"
     }
   ],
   "companions": {
