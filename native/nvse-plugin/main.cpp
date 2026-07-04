@@ -14279,7 +14279,8 @@ void UpdateActiveSong()
 //
 // Sources:
 //   * xNVSE EventManager native handlers (ondeath, onstartcombat, oncombatend,
-//     onhit, onadd, onactorequip, ondrop, onfire) — registered at DeferredInit.
+//     onhit, onadd, onactorequip, onactorunequip, ondrop, onfire) — registered
+//     at DeferredInit.
 //   * A 1 Hz slow poll in the main loop for everything the engine has no event
 //     for: cell/worldspace travel, game-day change, level-ups, karma class,
 //     teammate roster, quest objectives, and the vanilla DialogMenu.
@@ -14366,8 +14367,9 @@ struct GameEventLogState
     std::map<std::string, int> lootCounts;            // display name -> count
     std::vector<std::string> lootNotables;
 
-    // Equip + consumable dedup.
+    // Equip / unequip / consumable dedup.
     std::unordered_map<UInt32, DWORD> recentEquips;      // item formId -> tick
+    std::unordered_map<UInt32, DWORD> recentUnequips;    // item formId -> tick
     std::unordered_map<UInt32, DWORD> recentConsumables; // aid formId -> tick
 
     // Drop window aggregation.
@@ -14419,34 +14421,85 @@ std::string CurrentGameTimeString()
     return buffer;
 }
 
-// A short, human place string for an event row. Prefers VISIBLE names — the
-// local/world map markers (already display strings) and the cell/worldspace
-// DISPLAY name ("Doc Mitchell's House") — never the editor id in
-// LocationSnapshot::cell. Uses the full location scan (map markers); events are
-// rare so the cost is fine here (the 1 Hz travel poll below does NOT use this).
-std::string ComposeEventPlace()
+// The player's current place, resolved to READABLE major/minor names — the
+// world/local map markers (already display strings) and cell/worldspace DISPLAY
+// names ("Doc Mitchell's House", "Mojave Wasteland") — never an editor id.
+struct EventPlace
 {
-    const LocationSnapshot location = CapturePlayerLocation();
-    if (!location.minor.empty())
-    {
-        return location.minor;
-    }
+    std::string major; // broad region: "Goodsprings", "Mojave Wasteland"
+    std::string minor; // specific spot:  "Prospector Saloon", "Goodsprings Cemetery"
+};
+
+EventPlace ResolveEventPlace()
+{
+    EventPlace place;
     PlayerCharacter* player = GetPlayer();
-    TESObjectCELL* cell = player ? player->parentCell : nullptr;
-    const std::string cellDisplay = cell ? GetDisplayNameSafe(cell) : std::string();
-    if (!cellDisplay.empty())
+    if (!player || !player->parentCell)
     {
-        return cellDisplay;
+        return place;
     }
-    if (!location.major.empty())
+    TESObjectCELL* cell = player->parentCell;
+    const bool interior = cell->worldSpace == nullptr;
+
+    // Major: nearest world-map marker, else the worldspace / inferred region.
+    place.major = FindNearestWorldMapLocation(player);
+    if (place.major.empty())
     {
-        return location.major;
+        if (interior)
+        {
+            place.major = InferMajorLocationFromCellIdentifier(GetFormNameSafe(cell));
+        }
+        else if (cell->worldSpace)
+        {
+            place.major = GetDisplayNameSafe(cell->worldSpace);
+        }
     }
-    if (cell && cell->worldSpace)
+
+    // Minor: the specific spot. Interiors use the cell's own display name;
+    // exteriors use the nearest named landmark (empty in open wilderness).
+    if (interior)
     {
-        return GetDisplayNameSafe(cell->worldSpace);
+        place.minor = GetDisplayNameSafe(cell);
+        if (place.minor.empty())
+        {
+            place.minor = FindNearestLocalMapLocation(player);
+        }
     }
-    return "";
+    else
+    {
+        place.minor = FindNearestLocalMapLocation(player);
+    }
+    if (!place.minor.empty() && place.minor == place.major)
+    {
+        place.minor.clear();
+    }
+    return place;
+}
+
+// Combined one-line place for an event row: "Prospector Saloon, Goodsprings".
+std::string ComposeEventPlace(const EventPlace& place)
+{
+    if (!place.minor.empty() && !place.major.empty() && place.minor != place.major)
+    {
+        return place.minor + ", " + place.major;
+    }
+    if (!place.minor.empty())
+    {
+        return place.minor;
+    }
+    return place.major;
+}
+
+// Elapsed in-game days since the save began (GameDaysPassed global). 1-based so
+// the first day reads "Day 1". -1 when the global is unavailable.
+int CurrentGameDay()
+{
+    const GameTimeGlobalsLayout* globals = GetGameTimeGlobals();
+    if (!globals || !globals->daysPassed)
+    {
+        return -1;
+    }
+    return static_cast<int>(globals->daysPassed->data) + 1;
 }
 
 void LogHookFirstFire(const char* hook)
@@ -14467,8 +14520,10 @@ void QueueGameEvent(const char* type, const std::string& summary,
     {
         return;
     }
-    const std::string place = locationOverride.empty() ? ComposeEventPlace() : locationOverride;
+    const EventPlace place = ResolveEventPlace();
+    const std::string location = locationOverride.empty() ? ComposeEventPlace(place) : locationOverride;
     const std::string gameTime = CurrentGameTimeString();
+    const int gameDay = CurrentGameDay();
 
     std::ostringstream json;
     json << "{\"id\":\"e" << static_cast<unsigned long>(GetTickCount()) << "-" << ++g_eventLog.eventSerial << "\"";
@@ -14479,9 +14534,13 @@ void QueueGameEvent(const char* type, const std::string& summary,
     {
         json << ",\"gameTime\":" << JsonEscape(gameTime);
     }
-    if (!place.empty())
+    if (gameDay >= 0)
     {
-        json << ",\"location\":" << JsonEscape(place);
+        json << ",\"gameDay\":" << gameDay;
+    }
+    if (!location.empty())
+    {
+        json << ",\"location\":" << JsonEscape(location);
     }
     if (!actors.empty())
     {
@@ -14502,6 +14561,27 @@ void QueueGameEvent(const char* type, const std::string& summary,
             json << "}";
         }
         json << "]";
+    }
+    // Structured major/minor place, for the future Gamemaster (the row shows the
+    // combined `location` above; these keep the parts machine-readable).
+    if (!place.major.empty() || !place.minor.empty())
+    {
+        json << ",\"data\":{";
+        bool first = true;
+        if (!place.major.empty())
+        {
+            json << "\"locationMajor\":" << JsonEscape(place.major);
+            first = false;
+        }
+        if (!place.minor.empty())
+        {
+            if (!first)
+            {
+                json << ",";
+            }
+            json << "\"locationMinor\":" << JsonEscape(place.minor);
+        }
+        json << "}";
     }
     json << "}";
 
@@ -14627,7 +14707,7 @@ void TouchCombatEncounter(TESObjectREFR* actorRef)
     {
         g_eventLog.combatActive = true;
         g_eventLog.combatStartTick = now;
-        g_eventLog.combatPlace = ComposeEventPlace();
+        g_eventLog.combatPlace = ComposeEventPlace(ResolveEventPlace());
         g_eventLog.combatParticipants.clear();
         g_eventLog.combatTeammates.clear();
         g_eventLog.combatKills.clear();
@@ -15119,6 +15199,54 @@ void OnActorEquipEventHandler(TESObjectREFR* /*thisObj*/, void* parameters)
     }
 }
 
+void OnActorUnequipEventHandler(TESObjectREFR* /*thisObj*/, void* parameters)
+{
+    if (!parameters)
+    {
+        return;
+    }
+    void** params = static_cast<void**>(parameters);
+    auto* first = static_cast<TESObjectREFR*>(params[0]);
+    auto* second = static_cast<TESForm*>(params[1]);
+    if (g_eventLog.loggedHookFirstFire.insert("onactorunequip").second)
+    {
+        LogLine("event-log: hook onactorunequip fired for the first time this session (p0 type=%u, p1 type=%u).",
+            first ? static_cast<unsigned>(first->typeID) : 0,
+            second ? static_cast<unsigned>(second->typeID) : 0);
+    }
+    PlayerCharacter* player = GetPlayer();
+    if (!player)
+    {
+        return;
+    }
+    TESForm* item = nullptr;
+    if (first == static_cast<TESObjectREFR*>(player) && second)
+    {
+        item = second;
+    }
+    else if (second == static_cast<TESForm*>(player) && first && first->baseForm)
+    {
+        item = first->baseForm;
+    }
+    // Only weapons and worn gear — unequipping ammo/tokens/etc. is noise.
+    if (!item || (item->typeID != kFormType_TESObjectWEAP && item->typeID != kFormType_TESObjectARMO))
+    {
+        return;
+    }
+    const DWORD now = GetTickCount();
+    const auto recent = g_eventLog.recentUnequips.find(item->refID);
+    if (recent != g_eventLog.recentUnequips.end() && (now - recent->second) < kEquipDedupMs)
+    {
+        return;
+    }
+    g_eventLog.recentUnequips[item->refID] = now;
+    const std::string name = GetDisplayNameSafe(item);
+    if (!name.empty())
+    {
+        QueueGameEvent("item", "Unequipped " + name);
+    }
+}
+
 // A dropped item feeds a short aggregation window, like loot (dropping a stack
 // or clearing junk shouldn't spam one event per item).
 void RecordPlayerItemDrop(TESForm* itemForm)
@@ -15311,6 +15439,7 @@ void RegisterGameEventHandlers()
         { "onhit", OnHitEventHandler },
         { "onadd", OnAddEventHandler },
         { "onactorequip", OnActorEquipEventHandler },
+        { "onactorunequip", OnActorUnequipEventHandler },
         { "ondrop", OnDropEventHandler },
         { "onfire", OnFireEventHandler },
     };
@@ -15339,6 +15468,7 @@ void ResetGameEventRuntime(const char* reason)
     g_eventLog.lootCounts.clear();
     g_eventLog.lootNotables.clear();
     g_eventLog.recentEquips.clear();
+    g_eventLog.recentUnequips.clear();
     g_eventLog.recentConsumables.clear();
     g_eventLog.dropFirstTick = 0;
     g_eventLog.dropLastTick = 0;
