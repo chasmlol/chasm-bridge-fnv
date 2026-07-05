@@ -370,6 +370,11 @@ struct ActiveSpeechAnimation
 struct ConversationHoldState
 {
     bool active = false;
+    // True while the held NPC is in combat: we deliberately do NOT lock them into
+    // the conversation package / restraint (that "freeze and face the player" is
+    // what clears their combat state and makes them chat calmly). They keep
+    // fighting and answer over the top.
+    bool combatMode = false;
     bool scriptPackageApplied = false;
     bool conversationIssued = false;
     bool preserveFurnitureState = false;
@@ -5150,21 +5155,346 @@ std::string BuildPlayerMacros(PlayerCharacter* player, const LocationSnapshot* l
     return out.str();
 }
 
+// --- Event-driven combat tracking (authoritative) --------------------------
+// The engine fires NVSE `onstartcombat` the instant an actor enters combat and
+// `oncombatend` when it truly ends. We record the (actor -> opponent) edge on
+// start and erase it on end, so the relationship is held for the WHOLE fight --
+// unaffected by the conversation package briefly clearing the IsInCombat flag or
+// by GetCombatTarget going null mid-conversation. This is the primary signal;
+// the polled/recency signals below are backups.
+struct CombatEdge
+{
+    UInt32 targetRefId = 0;
+    std::string targetName;
+    DWORD startTick = 0;   // GetTickCount() when onstartcombat last (re)fired
+};
+std::unordered_map<UInt32, CombatEdge> g_combatEdges;  // actor refID -> current opponent
+// NO artificial stickiness: an edge lives exactly from onstartcombat to
+// oncombatend. Mid-fight robustness comes from the signals themselves -- the
+// player's engine-sticky combat byte (0xDF0), the combat-controller targets, and
+// onstartcombat re-firing throughout a real fight -- so when the engine says the
+// fight is over, we read peaceful immediately.
+
+// NVSE native event handler signature is void(TESObjectREFR* thisObj, void* params).
+// For game events thisObj is null and params = { source, object } (verified against
+// EventManager.cpp): source[0] is the actor entering combat, object[1] its target.
+void CombatAlertOnStartCombat(TESObjectREFR*, void* parameters)
+{
+    auto** args = static_cast<void**>(parameters);
+    if (!args)
+    {
+        return;
+    }
+    auto* actor = static_cast<TESObjectREFR*>(args[0]);
+    auto* target = static_cast<TESForm*>(args[1]);
+    if (!actor)
+    {
+        return;
+    }
+    CombatEdge& edge = g_combatEdges[actor->refID];
+    edge.targetRefId = target ? target->refID : 0;
+    edge.targetName = target ? GetDisplayNameSafe(target) : std::string();
+    edge.startTick = GetTickCount();
+    LogLine("Combat event: onstartcombat '%s' -> '%s'.",
+        GetDisplayNameSafe(actor).c_str(),
+        edge.targetName.empty() ? "?" : edge.targetName.c_str());
+}
+
+void CombatAlertOnCombatEnd(TESObjectREFR*, void* parameters)
+{
+    auto** args = static_cast<void**>(parameters);
+    if (!args)
+    {
+        return;
+    }
+    auto* actor = static_cast<TESObjectREFR*>(args[0]);
+    if (!actor)
+    {
+        return;
+    }
+    if (g_combatEdges.erase(actor->refID) > 0)
+    {
+        LogLine("Combat event: oncombatend '%s'.", GetDisplayNameSafe(actor).c_str());
+    }
+}
+
+// Registers the combat event handlers once the event manager is available.
+void RegisterCombatEventHandlers()
+{
+    static bool registered = false;
+    if (registered || !g_eventManager)
+    {
+        return;
+    }
+    registered = true;
+    const bool a = g_eventManager->SetNativeEventHandler("onstartcombat", CombatAlertOnStartCombat);
+    const bool b = g_eventManager->SetNativeEventHandler("oncombatend", CombatAlertOnCombatEnd);
+    LogLine("Combat event handlers registered (onstartcombat=%d oncombatend=%d).", a ? 1 : 0, b ? 1 : 0);
+}
+
+// Looks up an authoritative combat edge for `refId` (onstartcombat fired, no
+// oncombatend yet). Fills the opponent when present.
+bool HasCombatEdge(UInt32 refId, UInt32* outTargetRefId, std::string* outTargetName)
+{
+    auto it = g_combatEdges.find(refId);
+    if (it == g_combatEdges.end())
+    {
+        return false;
+    }
+    if (outTargetRefId)
+    {
+        *outTargetRefId = it->second.targetRefId;
+    }
+    if (outTargetName)
+    {
+        *outTargetName = it->second.targetName;
+    }
+    return true;
+}
+
+// Wipes ALL combat tracking. Called from ResetRuntimeState on every load / new
+// game / exit-to-menu: a save load resets the engine's combat WITHOUT firing
+// `oncombatend`, so without this an actor that was fighting when you saved would
+// stay "in combat" forever (stale edge) after the load. Genuine ongoing combat
+// re-populates from the live IsInCombat() signal and the next `onstartcombat`.
+void ClearCombatTracking(const char* reason)
+{
+    if (!g_combatEdges.empty())
+    {
+        LogLine("Combat tracking cleared (%s): %zu edge(s).",
+            reason ? reason : "?", g_combatEdges.size());
+    }
+    g_combatEdges.clear();
+}
+
+// Per-turn combat awareness for the responding/mapped NPC. Detection uses ONLY
+// the two documented Actor virtuals (IsInCombat / GetCombatTarget) from the
+// xNVSE SDK -- no raw offset poking -- so it stays robust across game builds.
+struct SpeakerCombatInfo
+{
+    bool inCombat = false;
+    std::vector<std::string> combatWith;  // display names, deduped, primary first
+};
+
+// Detect whether `speakerRef` (the NPC being spoken to) is in combat and collect
+// the display name(s) of who it is fighting. Returns { false, {} } for a
+// non-actor / unloaded / peaceful ref, so callers that omit the fields leave
+// non-combat turns byte-identical.
+//
+// IMPORTANT: talking to an NPC drops it into a conversation package, which often
+// clears its OWN IsInCombat flag the instant the turn request is built — so
+// relying on the speaker's flag alone misses the common "player attacks a
+// friendly, then talks to them mid-fight" case. We therefore ALSO treat the
+// speaker as in combat when the PLAYER is fighting and locked onto this speaker
+// (or the speaker onto the player). The player's combat flag is stable through
+// the conversation, so this is the reliable signal for a violent scene.
+SpeakerCombatInfo DetectSpeakerCombat(TESObjectREFR* speakerRef, PlayerCharacter* player, const std::vector<NearbyNpcCandidate>& nearbyCandidates)
+{
+    SpeakerCombatInfo info;
+    if (!speakerRef)
+    {
+        return info;
+    }
+    auto* speaker = static_cast<Actor*>(speakerRef);
+    if (!speaker || !speaker->baseProcess)  // baseProcess gates "is a live, loaded actor"
+    {
+        return info;
+    }
+
+    // PlayerCharacter derives from Actor, so the same combat virtuals apply.
+    auto* playerActor = player ? static_cast<Actor*>(player) : nullptr;
+    Actor* speakerTarget = speaker->GetCombatTarget();
+    Actor* playerTarget = playerActor ? playerActor->GetCombatTarget() : nullptr;
+    const bool speakerInCombat = speaker->IsInCombat();
+    const bool playerFlagInCombat = playerActor && playerActor->IsInCombat();
+    // THE PLAYER'S OWN combat state. The player has dedicated combat tracking: a
+    // byte at PlayerCharacter+0xDF0 the engine keeps set for the WHOLE encounter
+    // (it drives the combat-music timeout), far stickier through a fight's lulls
+    // than any per-actor flag. Within the PlayerCharacter object -> safe to read.
+    const UInt8 playerCombatByte = player ? *(reinterpret_cast<const UInt8*>(player) + 0xDF0) : 0;
+    const bool playerInCombat = playerFlagInCombat || playerCombatByte != 0;
+
+    // AUTHORITATIVE, NON-FLICKERING: the combat CONTROLLER's target pointer. The
+    // IsInCombat() flag byte toggles moment-to-moment during a real firefight
+    // (target switch, LOS break) -- the log shows it dropping to 0 mid-fight --
+    // but GetCombatTarget() stays set for the whole engagement. This is the same
+    // data JIP LN NVSE's GetCombatTargets reads. Treat a live combat target as
+    // authoritative: the speaker fighting ANYONE, or the player fighting the
+    // speaker, is combat regardless of either "in combat" flag.
+    const bool speakerHasTarget = speakerTarget != nullptr;       // speaker is fighting someone
+    const bool playerTargetsSpeaker = playerTarget == speaker;    // player is fighting the speaker
+
+    // LIVE mutual check (flag-gated, kept as one more corroborating signal).
+    const bool fightingThePlayerNow =
+        playerInCombat && (playerTarget == speaker || speakerTarget == playerActor);
+
+    // AUTHORITATIVE: an onstartcombat edge for this speaker (or for the player
+    // against this speaker) that hasn't been cleared by oncombatend. Held for the
+    // whole fight regardless of the conversation package clearing the flag.
+    std::string speakerEdgeTarget;
+    const bool speakerHasEdge = HasCombatEdge(speakerRef->refID, nullptr, &speakerEdgeTarget);
+    UInt32 playerEdgeTargetRef = 0;
+    const bool playerHasEdge = playerActor && HasCombatEdge(playerActor->refID, &playerEdgeTargetRef, nullptr);
+    const bool playerEdgeVsSpeaker = playerHasEdge && playerEdgeTargetRef == speakerRef->refID;
+
+    // THE PLAYER'S ANGLE: is the PLAYER in combat, and is the speaker who with?
+    // The player's combat state (0xDF0 byte) is engine-sticky through lulls; the
+    // speaker counts as the opponent when either side targets the other or holds a
+    // live onstartcombat edge. This makes "I'm in a fight with this NPC" hold even
+    // when I look away to talk.
+    const bool speakerIsPlayerOpponent = playerTargetsSpeaker || speakerTarget == playerActor
+        || speakerHasEdge || playerEdgeVsSpeaker;
+    const bool playerFightingSpeaker = playerInCombat && speakerIsPlayerOpponent;
+
+    const bool inCombat = playerFightingSpeaker || speakerHasTarget || playerTargetsSpeaker
+        || speakerInCombat || fightingThePlayerNow || speakerHasEdge || playerEdgeVsSpeaker;
+
+    // Diagnostic: every candidate signal, so a single reproduction shows exactly
+    // which one(s) fire (or none) for a given NPC. `player[...]` = the player's own
+    // combat state; `target[...]` = the combat-controller target read.
+    LogLine("Combat detect '%s': player[flag=%d byte=%d vsSelf=%d] target[self=%s playerVsSelf=%d] now[self=%d] edge[self=%d(%s) playerVsSelf=%d] -> %s",
+        GetDisplayNameSafe(speakerRef).c_str(),
+        playerFlagInCombat, playerCombatByte, playerFightingSpeaker,
+        speakerHasTarget ? GetDisplayNameSafe(speakerTarget).c_str() : "-", playerTargetsSpeaker,
+        speakerInCombat,
+        speakerHasEdge, speakerEdgeTarget.empty() ? "-" : speakerEdgeTarget.c_str(), playerEdgeVsSpeaker,
+        inCombat ? "IN COMBAT" : "peaceful");
+
+    if (!inCombat)
+    {
+        return info;
+    }
+    info.inCombat = true;
+
+    std::vector<std::string>& names = info.combatWith;
+    const auto addName = [&names](const std::string& name) {
+        if (name.empty())
+        {
+            return;
+        }
+        for (const auto& existing : names)
+        {
+            if (_stricmp(existing.c_str(), name.c_str()) == 0)
+            {
+                return;  // dedupe (case-insensitive)
+            }
+        }
+        names.push_back(name);
+    };
+
+    // Live target: who the speaker is fighting this instant (may be null once the
+    // conversation package has cleared it — the edge/player reads recover it).
+    if (speakerTarget)
+    {
+        addName(GetDisplayNameSafe(speakerTarget));
+    }
+    // Authoritative opponent from the speaker's live onstartcombat edge.
+    addName(speakerEdgeTarget);
+    // The player, when the fight is between the player and this NPC. (addName
+    // dedupes, so this is harmless if the speaker's own target already resolved
+    // to the player's name.)
+    if (player && (playerFightingSpeaker || playerTargetsSpeaker || speakerTarget == playerActor
+        || playerEdgeVsSpeaker))
+    {
+        addName(GetDisplayNameSafe(player));
+    }
+    // Any nearby mapped actor in combat AND targeting the speaker -- the other
+    // attackers in a multi-actor fight.
+    for (const auto& candidate : nearbyCandidates)
+    {
+        if (!candidate.ref)
+        {
+            continue;
+        }
+        auto* other = static_cast<Actor*>(candidate.ref);
+        if (!other || other == speaker || !other->baseProcess)
+        {
+            continue;
+        }
+        if (other->IsInCombat() && other->GetCombatTarget() == speaker)
+        {
+            addName(GetDisplayNameSafe(other));
+        }
+    }
+    return info;
+}
+
+// Serialize combat info into JSON fields for the request metadata object. Empty
+// string when NOT in combat, so the fields are omitted and non-combat requests
+// are byte-identical to before this feature. Format (no braces, no outer comma):
+//   "in_combat":true,"combat_with":["Raider","Powder Ganger"]
+std::string BuildCombatMetadataFields(const SpeakerCombatInfo& info)
+{
+    if (!info.inCombat)
+    {
+        return {};
+    }
+    std::ostringstream out;
+    out << "\"in_combat\":true,\"combat_with\":[";
+    for (size_t index = 0; index < info.combatWith.size(); ++index)
+    {
+        if (index > 0)
+        {
+            out << ",";
+        }
+        out << JsonEscape(info.combatWith[index]);
+    }
+    out << "]";
+    return out.str();
+}
+
 std::string BuildTextRequestMetadata(PlayerCharacter* player, const SpeakerSnapshot* preferredSpeaker = nullptr, const LocationSnapshot* location = nullptr)
 {
     std::vector<NearbyNpcCandidate> nearbyCandidates = FindNearbyMappedNpcsForGroupChat(player, kGamestateNearbyRadiusMeters);
     std::string preferredVoiceTypeKey;
     std::string preferredVoiceTypeName;
-    if (preferredSpeaker && preferredSpeaker->valid)
+    TESObjectREFR* speakerRef = (preferredSpeaker && preferredSpeaker->valid) ? ResolveSpeakerRef(*preferredSpeaker) : nullptr;
+    // FALLBACK: a save load runs ResetRuntimeState, which clears pendingSpeaker --
+    // but an ongoing conversation continues via lastNpcSpeaker (re-captured on
+    // every NPC reply). Without this, every turn after a mid-conversation load
+    // SILENTLY skipped combat detection (no speaker to inspect) even while the
+    // NPC was actively fighting the player.
+    if (!speakerRef && g_state.lastNpcSpeaker.valid)
     {
-        TESObjectREFR* speakerRef = ResolveSpeakerRef(*preferredSpeaker);
+        speakerRef = ResolveSpeakerRef(g_state.lastNpcSpeaker);
         if (speakerRef)
         {
-            const auto preferredVoiceType = ResolveRefVoiceTypeMetadata(speakerRef);
-            preferredVoiceTypeKey = preferredVoiceType.first;
-            preferredVoiceTypeName = preferredVoiceType.second;
+            LogLine("Combat detect: pendingSpeaker unresolved -> using lastNpcSpeaker '%s'.",
+                GetDisplayNameSafe(speakerRef).c_str());
         }
     }
+    if (!speakerRef)
+    {
+        // Make the skip VISIBLE -- a silent skip here cost hours of debugging.
+        LogLine("Combat detect skipped: no speaker ref resolvable for this request.");
+    }
+    if (speakerRef)
+    {
+        const auto preferredVoiceType = ResolveRefVoiceTypeMetadata(speakerRef);
+        preferredVoiceTypeKey = preferredVoiceType.first;
+        preferredVoiceTypeName = preferredVoiceType.second;
+    }
+
+    // Combat awareness for the responding NPC. Built BEFORE the early returns
+    // below so an in-combat NPC with no nearby mapped NPCs still reports it.
+    const SpeakerCombatInfo combatInfo = DetectSpeakerCombat(speakerRef, player, nearbyCandidates);
+    const std::string combatFields = BuildCombatMetadataFields(combatInfo);
+    if (combatInfo.inCombat)
+    {
+        std::string joinedCombatants;
+        for (size_t index = 0; index < combatInfo.combatWith.size(); ++index)
+        {
+            if (index > 0)
+            {
+                joinedCombatants += ", ";
+            }
+            joinedCombatants += combatInfo.combatWith[index];
+        }
+        LogLine("Combat detection: speaker '%s' IS IN COMBAT with [%s] -> sent to prompt.",
+            speakerRef ? GetDisplayNameSafe(speakerRef).c_str() : "<unknown>",
+            joinedCombatants.empty() ? "<unresolved>" : joinedCombatants.c_str());
+    }
+    // (The peaceful case is already logged per-signal inside DetectSpeakerCombat.)
 
     std::sort(nearbyCandidates.begin(), nearbyCandidates.end(), [](const NearbyNpcCandidate& left, const NearbyNpcCandidate& right) {
         if (left.underCrosshair != right.underCrosshair)
@@ -5182,11 +5512,20 @@ std::string BuildTextRequestMetadata(PlayerCharacter* player, const SpeakerSnaps
 
     if (nearbyCandidates.empty())
     {
-        if (macrosJson.empty())
+        std::string inner = combatFields;  // "" unless the speaker is in combat
+        if (!macrosJson.empty())
+        {
+            if (!inner.empty())
+            {
+                inner += ",";
+            }
+            inner += "\"macros\":" + macrosJson;
+        }
+        if (inner.empty())
         {
             return {};
         }
-        return "{\"macros\":" + macrosJson + "}";
+        return "{" + inner + "}";
     }
 
     auto focusIt = std::find_if(nearbyCandidates.begin(), nearbyCandidates.end(), [](const NearbyNpcCandidate& candidate) {
@@ -5195,6 +5534,10 @@ std::string BuildTextRequestMetadata(PlayerCharacter* player, const SpeakerSnaps
 
     std::ostringstream out;
     out << "{";
+    if (!combatFields.empty())
+    {
+        out << combatFields << ",";  // "in_combat":true,"combat_with":[...] then rest follows
+    }
     if (!preferredVoiceTypeKey.empty())
     {
         out << "\"voice_type_key\":" << JsonEscape(preferredVoiceTypeKey);
@@ -5763,6 +6106,24 @@ bool TriggerNpcAttack(const ResponsePayload& response)
     {
         LogLine("Could not resolve actor/player for ATTACK action: npc=%s action=%s", actionNpcName.c_str(), response.gameMasterAction.c_str());
         return false;
+    }
+
+    // Already fighting? Then ATTACK is a no-op. Without this guard the combat
+    // prompt made the model dramatically pick `attack` every in-combat turn, and
+    // the fresh StartCombat call re-kindled/extended the fight each time -- a
+    // feedback loop (combat -> attack action -> more combat) that also re-aggroed
+    // NPCs who were disengaging. Attacking someone you're already attacking means
+    // nothing; the action stays meaningful for STARTING a fight from peace.
+    {
+        auto* actor = static_cast<Actor*>(actorRef);
+        const bool alreadyFighting = (actor && actor->baseProcess
+            && (actor->IsInCombat() || actor->GetCombatTarget() != nullptr))
+            || HasCombatEdge(actorRef->refID, nullptr, nullptr);
+        if (alreadyFighting)
+        {
+            LogLine("ATTACK action skipped for %s: already in combat (no re-StartCombat).", actionNpcName.c_str());
+            return true;  // treated as handled -- the NPC keeps fighting as-is
+        }
     }
 
     if (!g_scriptInterface->CallFunctionAlt(g_startCombatScript, actorRef, 2, actorRef, player))
@@ -7801,6 +8162,23 @@ void EngageConversationHold(const std::string& npcKey, const std::string& npcNam
         return;
     }
 
+    // COMBAT OVERRIDE: if the NPC is already fighting when addressed, do NOT lock
+    // them into the conversation package / restraint. That freeze-and-face is
+    // exactly what clears their combat state and makes them answer calmly. Leave
+    // them fighting -- the reply rides on top, and their IsInCombat stays true so
+    // prompt assembly gets the combat scenario. hold.active stays true so the rest
+    // of the pipeline (trace, release) is symmetric; we just apply nothing here.
+    {
+        auto* speakerActor = static_cast<Actor*>(actorRef);
+        updatedHold.combatMode = speakerActor && speakerActor->baseProcess && speakerActor->IsInCombat();
+        if (updatedHold.combatMode)
+        {
+            LogLine("Conversation hold: '%s' is IN COMBAT -> not locking (stays fighting).",
+                GetDisplayNameSafe(actorRef).c_str());
+            return;
+        }
+    }
+
     updatedHold.preserveFurnitureState = wasActive
         ? (updatedHold.preserveFurnitureState || ShouldPreserveActorConversationAnimation(actorRef))
         : ShouldPreserveActorConversationAnimation(actorRef);
@@ -7893,6 +8271,52 @@ void UpdateConversationHold()
     {
         ReleaseConversationHold("speaker_unresolved");
         return;
+    }
+
+    // COMBAT OVERRIDE: a fighting NPC must not stay locked into the conversation.
+    // If combat broke out after the hold engaged (peaceful talk -> fight), undo the
+    // locks so they can move/fight, and stop refreshing them. When combat ends we
+    // fall through and re-establish the hold normally.
+    {
+        auto* speakerActor = static_cast<Actor*>(actorRef);
+        const bool speakerInCombat = speakerActor && speakerActor->baseProcess && speakerActor->IsInCombat();
+        if (speakerInCombat)
+        {
+            if (!hold.combatMode)
+            {
+                hold.combatMode = true;
+                LogLine("Conversation hold: '%s' entered combat -> releasing lock, letting them fight.",
+                    GetDisplayNameSafe(actorRef).c_str());
+            }
+            // Undo whatever lock was applied before combat started.
+            if (hold.lookApplied)
+            {
+                SetActorLookAtPlayer(actorRef, player, false);
+                hold.lookApplied = false;
+            }
+            if (hold.restrainedApplied)
+            {
+                SetActorRestrainedState(actorRef, false);
+                hold.restrainedApplied = false;
+            }
+            if (hold.noMovePackageApplied)
+            {
+                SetActorNoMovePackageState(actorRef, false);
+                hold.noMovePackageApplied = false;
+            }
+            if (hold.scriptPackageApplied)
+            {
+                SetActorConversationPackageState(actorRef, false);
+                hold.scriptPackageApplied = false;
+                EvaluateActorPackage(actorRef);
+            }
+            hold.conversationModeApplied = false;
+            return;  // hands off while fighting
+        }
+        if (hold.combatMode)
+        {
+            hold.combatMode = false;  // combat ended -> resume the normal hold below
+        }
     }
 
     if (g_debugConfig.conversationModeEnabled && IsConversationModeDistanceExceeded(actorRef, player))
@@ -12128,6 +12552,7 @@ void ResetRuntimeState()
     ResetPersonaStateForSession();
     AbortVoiceCapture("runtime_reset_voice", false);
     ReleaseConversationHold("runtime_reset");
+    ClearCombatTracking("runtime_reset");
     StopSpeechAnimation();
     StopGuitarPerformance("runtime_reset");
     ClearDialogSubtitle();
@@ -17392,6 +17817,7 @@ void HandleNvseMessage(NVSEMessagingInterface::Message* msg)
         MaybeRequestBridgeStackStartup("plugin_init");
         CompanionsOnDeferredInit();
         RegisterGameEventHandlers();
+        RegisterCombatEventHandlers();
         LogLine("FNV bridge native plugin initialized.");
         break;
 
