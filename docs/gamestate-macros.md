@@ -87,3 +87,27 @@ additionally computes `{{participants}}` (the player + the other group NPCs,
 excluding the prompted speaker) for that template; it is backend-derived, not
 part of the plugin's table above. Cards / lore / other system prompts still
 substitute nothing — widening the surface is a separate, later decision.
+
+## npc_state (dynamic scenarios)
+
+Alongside `metadata.macros`, each request carries `metadata.npc_state` — a flat
+**bool** block describing the RESPONDING NPC's situation, built by
+`BuildNpcStateMetadataFields` in `native/nvse-plugin/main.cpp`. chasm uses it
+(never chat content) to pick the scenario wording variant on the Globals →
+Scenario page. The block is omitted when the speaker can't be resolved; chasm
+then treats every flag as false (default variant). Every flag is a real engine
+read:
+
+| Flag | Engine source |
+|------|---------------|
+| `teammate` | membership in `PlayerCharacter::teammates` (tList @ 0x5FC — the list the event-log teammate poll walks; persists in saves) |
+| `following` | best source first: (1) explicit orders issued this session (gamemaster FOLLOW/STOP_FOLLOW, `movement.follow_target` / `movement.stop_follow_target` / `ai.wait_here` / `ai.resume_default` / `ai.sandbox_here` Action-Book actions, companion summon/dismiss); (2) spawned companion-pool slot (teammate flag + registry wait state — the companion esp follow package is conditioned on GetPlayerTeammate); (3) while a conversation hold masks the actor's package: the pre-hold snapshot captured at hold engage; (4) live `GetCurrentPackage == DefaultFollowPlayerFar` probe |
+| `waiting` | same resolution chain, matching the `DefaultSandboxNoMoveCurrentLocation200` package / `ai.wait_here` order / companion registry `waiting` |
+| `sneaking` / `player_sneaking` | compiled helper script calling the vanilla `IsSneaking` condition function on the actor / player |
+| `weapon_drawn` / `player_weapon_drawn` | `Actor::IsWeaponOut()` (`baseProcess->IsWeaponOut`, SDK/lStewieAl) |
+| `sitting` | `BaseProcess::GetSitSleepState()` in the sit range (LoadSitIdle / WantToSit / WaitingForSitAnim / Sitting), sleep states excluded |
+| `player_swimming` | `PlayerCharacter::GetMovementFlags()` bit 11 via the actor mover (guarded null) |
+
+The `traveling` scenario condition is CHASM-side (an en-route journey in the
+movement store) and is deliberately not part of this block. Combat is likewise
+separate (`in_combat` / `combat_with` above the scenario system).

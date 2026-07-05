@@ -160,6 +160,9 @@ constexpr DWORD kSaveStateSyncTimeoutMs = 8000;
 constexpr DWORD kSaveStateAckPollMs = 100;
 constexpr DWORD kSaveStateSyncHudCooldownMs = 1500;
 constexpr char kDefaultFollowPackageEditorId[] = "DefaultFollowPlayerFar";
+// The wait-here package (also used by the ai.wait_here Action-Book action).
+// npc_state probes match against it to report the `waiting` flag.
+constexpr char kSandboxNoMovePackageEditorId[] = "DefaultSandboxNoMoveCurrentLocation200";
 // Movement engine: the Travel package (editor id aaChasmTravel, location = Near
 // Linked Reference) in NVCompanions.esp at local form id 0x000c00. To travel, we set
 // the NPC's linked ref to the destination and add this package; the engine paths
@@ -395,6 +398,14 @@ struct ConversationHoldState
     bool originalRestrained = false;
     bool restrainedApplied = false;
     bool noMovePackageApplied = false;
+    // Pre-hold movement-package snapshot (dynamic scenarios): whether the NPC
+    // was on the bridge follow / wait(sandbox-no-move) package BEFORE the hold
+    // swapped their script package for the conversation package. Captured at
+    // engage and read by BuildNpcStateMetadataFields while the hold is active
+    // (a live GetCurrentPackage probe would only see the conversation package).
+    bool preHoldMovementKnown = false;
+    bool preHoldFollowing = false;
+    bool preHoldWaiting = false;
     std::string npcKey;
     std::string npcName;
     SpeakerSnapshot speaker;
@@ -831,6 +842,13 @@ bool AddActorScriptPackage(TESObjectREFR* actorRef, TESForm* packageForm, const 
 bool RemoveActorScriptPackage(TESObjectREFR* actorRef, const char* traceStage);
 bool SetActorPlayerTeammate(TESObjectREFR* actorRef, bool enabled = true, const char* traceStage = "game_master_follow_teammate");
 TESForm* ResolveDefaultFollowPackage();
+// npc_state (dynamic scenarios) — defined with the package helpers below;
+// declared here for BuildTextRequestMetadata / the action trigger sites.
+std::string BuildNpcStateMetadataFields(TESObjectREFR* speakerRef, PlayerCharacter* player);
+void NoteNpcMovementOrder(TESObjectREFR* actorRef, bool following, bool waiting);
+void ProbeActorMovementPackages(TESObjectREFR* actorRef, bool& outFollowing, bool& outWaiting);
+void ClearNpcMovementOrders();
+TESObjectREFR* ResolveCompanionRef(UInt32 slot);
 double DistanceSquared3D(const TESObjectREFR* left, const TESObjectREFR* right);
 UInt32 MakeWorldCellKey(SInt32 x, SInt32 y);
 bool ShouldPreserveActorConversationAnimation(TESObjectREFR* speakerRef);
@@ -5730,6 +5748,9 @@ std::string BuildTextRequestMetadata(PlayerCharacter* player, const SpeakerSnaps
     // below so an in-combat NPC with no nearby mapped NPCs still reports it.
     const SpeakerCombatInfo combatInfo = DetectSpeakerCombat(speakerRef, player, nearbyCandidates);
     const std::string combatFields = BuildCombatMetadataFields(combatInfo);
+    // Gamestate flags for the responding NPC (dynamic scenarios). Empty when
+    // the speaker is unresolved — chasm then falls back to the default variant.
+    const std::string npcStateFields = BuildNpcStateMetadataFields(speakerRef, player);
     if (combatInfo.inCombat)
     {
         std::string joinedCombatants;
@@ -5764,6 +5785,14 @@ std::string BuildTextRequestMetadata(PlayerCharacter* player, const SpeakerSnaps
     if (nearbyCandidates.empty())
     {
         std::string inner = combatFields;  // "" unless the speaker is in combat
+        if (!npcStateFields.empty())
+        {
+            if (!inner.empty())
+            {
+                inner += ",";
+            }
+            inner += npcStateFields;
+        }
         if (!macrosJson.empty())
         {
             if (!inner.empty())
@@ -5788,6 +5817,10 @@ std::string BuildTextRequestMetadata(PlayerCharacter* player, const SpeakerSnaps
     if (!combatFields.empty())
     {
         out << combatFields << ",";  // "in_combat":true,"combat_with":[...] then rest follows
+    }
+    if (!npcStateFields.empty())
+    {
+        out << npcStateFields << ",";  // "npc_state":{...} then rest follows
     }
     if (!preferredVoiceTypeKey.empty())
     {
@@ -6323,6 +6356,23 @@ bool TriggerTrustedActionBinding(const ResponsePayload& response)
     if (actorRef)
     {
         RememberNpcTarget(actionNpcKey, actionNpcName, CaptureSpeakerSnapshot(actorRef));
+        // Dynamic scenarios: record follow/wait ORDERS as they are issued, so
+        // npc_state reflects them immediately (the conversation hold masks the
+        // actor's real package until it releases).
+        if (response.actionId == "movement.follow_target")
+        {
+            NoteNpcMovementOrder(actorRef, true, false);
+        }
+        else if (response.actionId == "ai.wait_here")
+        {
+            NoteNpcMovementOrder(actorRef, false, true);
+        }
+        else if (response.actionId == "movement.stop_follow_target"
+            || response.actionId == "ai.resume_default"
+            || response.actionId == "ai.sandbox_here")
+        {
+            NoteNpcMovementOrder(actorRef, false, false);
+        }
     }
     if (!response.requestId.empty())
     {
@@ -6413,6 +6463,8 @@ bool TriggerNpcFollow(const ResponsePayload& response)
         return false;
     }
 
+    NoteNpcMovementOrder(actorRef, true, false);
+
     const SpeakerSnapshot snapshot = CaptureSpeakerSnapshot(actorRef);
     RememberNpcTarget(actionNpcKey, actionNpcName, snapshot);
     if (!response.requestId.empty())
@@ -6468,6 +6520,7 @@ bool TriggerNpcStopFollow(const ResponsePayload& response)
         ? RemoveActorScriptPackage(actorRef, "game_master_stop_follow_package")
         : false;
     const bool teammateCleared = SetActorPlayerTeammate(actorRef, false, "game_master_stop_follow_teammate");
+    NoteNpcMovementOrder(actorRef, false, false);
 
     const SpeakerSnapshot snapshot = CaptureSpeakerSnapshot(actorRef);
     RememberNpcTarget(actionNpcKey, actionNpcName, snapshot);
@@ -8315,6 +8368,257 @@ bool IsActorUsingBridgeConversationPackage(TESObjectREFR* actorRef, bool* outKno
     return IsActorUsingPackage(actorRef, packageForm, outKnown);
 }
 
+// ---------------------------------------------------------------------------
+// npc_state (dynamic scenarios): per-request gamestate flags for the
+// responding NPC, sent as metadata.npc_state so chasm can pick the scenario
+// wording variant (companion / following / sneaking / waiting / ...).
+// Every flag is a REAL engine read — never an inference from chat content.
+// ---------------------------------------------------------------------------
+
+// Latest follow/wait order this session issued per actor ref: gamemaster
+// FOLLOW/STOP_FOLLOW, the follow/wait/resume Action-Book actions, and
+// companion summon/dismiss. Explicit orders beat package probes (the
+// conversation hold masks the actor's real package while the player talks to
+// them). Cleared on load — after a reload the live package probe (packages
+// persist in the save) takes over again.
+std::unordered_map<UInt32, std::pair<bool, bool>> g_npcMovementOrders; // refID -> {following, waiting}
+
+void ClearNpcMovementOrders()
+{
+    g_npcMovementOrders.clear();
+}
+
+// Records an explicit follow/wait order for an actor and keeps the active
+// hold's pre-hold snapshot in sync, so a mid-conversation "wait here" is
+// reflected in npc_state on the very next turn.
+void NoteNpcMovementOrder(TESObjectREFR* actorRef, bool following, bool waiting)
+{
+    if (!actorRef)
+    {
+        return;
+    }
+    g_npcMovementOrders[actorRef->refID] = { following, waiting };
+    auto& hold = g_state.conversationHold;
+    if (hold.active && hold.speaker.refId == actorRef->refID)
+    {
+        hold.preHoldMovementKnown = true;
+        hold.preHoldFollowing = following;
+        hold.preHoldWaiting = waiting;
+    }
+}
+
+// Live probe: is the actor's CURRENT package the bridge follow package /
+// the sandbox wait package? Only meaningful while no conversation hold has
+// swapped their script package (callers handle that via the hold snapshot).
+void ProbeActorMovementPackages(TESObjectREFR* actorRef, bool& outFollowing, bool& outWaiting)
+{
+    outFollowing = false;
+    outWaiting = false;
+    if (!actorRef)
+    {
+        return;
+    }
+    if (TESForm* followPackage = GetFormByID(kDefaultFollowPackageEditorId))
+    {
+        outFollowing = IsActorUsingPackage(actorRef, followPackage, nullptr);
+    }
+    if (TESForm* waitPackage = GetFormByID(kSandboxNoMovePackageEditorId))
+    {
+        outWaiting = IsActorUsingPackage(actorRef, waitPackage, nullptr);
+    }
+}
+
+// The follow/wait state of one actor, best source first:
+//   1. an explicit order recorded this session (map above);
+//   2. a spawned companion-pool slot (its esp follow package is keyed off the
+//      teammate flag, so the registry + teammate flag are the truth);
+//   3. while a conversation hold masks the actor's package: the pre-hold
+//      snapshot captured at engage;
+//   4. otherwise: the live package probe.
+void ResolveActorMovementFlags(TESObjectREFR* actorRef, bool isTeammate, bool& outFollowing, bool& outWaiting)
+{
+    outFollowing = false;
+    outWaiting = false;
+    if (!actorRef)
+    {
+        return;
+    }
+
+    const auto order = g_npcMovementOrders.find(actorRef->refID);
+    if (order != g_npcMovementOrders.end())
+    {
+        outFollowing = order->second.first;
+        outWaiting = order->second.second;
+        return;
+    }
+
+    for (UInt32 slot = 0; slot < kCompanionPoolSize; ++slot)
+    {
+        const CompanionSlot& entry = g_companions.slots[slot];
+        if (!entry.claimed || entry.status != "spawned")
+        {
+            continue;
+        }
+        if (ResolveCompanionRef(slot) != actorRef)
+        {
+            continue;
+        }
+        outWaiting = entry.waiting;
+        outFollowing = isTeammate && !entry.waiting;
+        return;
+    }
+
+    const auto& hold = g_state.conversationHold;
+    if (hold.active && hold.speaker.refId == actorRef->refID && hold.preHoldMovementKnown)
+    {
+        outFollowing = hold.preHoldFollowing;
+        outWaiting = hold.preHoldWaiting;
+        return;
+    }
+
+    ProbeActorMovementPackages(actorRef, outFollowing, outWaiting);
+}
+
+// Sneak state via a compiled helper calling the vanilla IsSneaking condition
+// function — works for the player and NPCs alike, with no engine-offset
+// guesswork (same pattern as the other compiled helper scripts).
+Script* g_isSneakingScript = nullptr;
+bool g_isSneakingScriptAttempted = false;
+
+bool IsActorSneakingViaScript(TESObjectREFR* actorRef)
+{
+    if (!actorRef || !g_scriptInterface)
+    {
+        return false;
+    }
+    if (!g_isSneakingScript && !g_isSneakingScriptAttempted)
+    {
+        g_isSneakingScriptAttempted = true;
+        constexpr char kIsSneakingScript[] = R"(
+ref rActor
+float fResult
+
+Begin Function { rActor }
+    let fResult := 0
+    if rActor
+        if rActor.IsSneaking
+            let fResult := 1
+        endif
+    endif
+    SetFunctionValue fResult
+End
+)";
+        g_isSneakingScript = g_scriptInterface->CompileScript(kIsSneakingScript);
+        if (!g_isSneakingScript)
+        {
+            LogLine("Failed to compile IsSneaking helper script.");
+        }
+    }
+    if (!g_isSneakingScript)
+    {
+        return false;
+    }
+    NVSEArrayVarInterface::Element result;
+    const bool callOk = g_scriptInterface->CallFunction(g_isSneakingScript, actorRef, nullptr, &result, 1, actorRef);
+    return callOk
+        && result.GetType() == NVSEArrayVarInterface::Element::kType_Numeric
+        && result.GetNumber() != 0.0;
+}
+
+// Sitting = the sit half of the sit/sleep state machine (the same read
+// ShouldPreserveActorConversationAnimation trusts), excluding the sleep states.
+bool IsActorSittingState(TESObjectREFR* actorRef)
+{
+    auto* actor = static_cast<Actor*>(actorRef);
+    if (!actor || !actor->baseProcess)
+    {
+        return false;
+    }
+    const int sitSleepState = actor->baseProcess->GetSitSleepState();
+    return sitSleepState == HighProcess::kSitSleepState_LoadSitIdle
+        || sitSleepState == HighProcess::kSitSleepState_WantToSit
+        || sitSleepState == HighProcess::kSitSleepState_WaitingForSitAnim
+        || sitSleepState == HighProcess::kSitSleepState_Sitting;
+}
+
+// Teammate = membership in PlayerCharacter::teammates (the same list the
+// event-log teammate poll walks; the flag persists in saves).
+bool IsActorPlayerTeammateFlagged(TESObjectREFR* actorRef, PlayerCharacter* player)
+{
+    if (!actorRef || !player)
+    {
+        return false;
+    }
+    for (auto it = player->teammates.Begin(); !it.End(); ++it)
+    {
+        Actor* teammate = it.Get();
+        if (teammate && teammate->refID == actorRef->refID)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Serializes the responding NPC's gamestate flags for the request metadata.
+// Format (no outer braces, no trailing comma — same contract as
+// BuildCombatMetadataFields):
+//   "npc_state":{"teammate":true,"following":true,...}
+// Empty string when the speaker/player can't be resolved, so such requests
+// stay byte-identical to before this feature (chasm defaults all flags false).
+std::string BuildNpcStateMetadataFields(TESObjectREFR* speakerRef, PlayerCharacter* player)
+{
+    if (!speakerRef || !player)
+    {
+        return {};
+    }
+
+    const bool teammate = IsActorPlayerTeammateFlagged(speakerRef, player);
+    bool following = false;
+    bool waiting = false;
+    ResolveActorMovementFlags(speakerRef, teammate, following, waiting);
+    const bool sneaking = IsActorSneakingViaScript(speakerRef);
+    const bool playerSneaking = IsActorSneakingViaScript(player);
+    auto* speakerActor = static_cast<Actor*>(speakerRef);
+    const bool weaponDrawn = speakerActor && speakerActor->IsWeaponOut();
+    const bool playerWeaponDrawn = player->IsWeaponOut();
+    const bool sitting = IsActorSittingState(speakerRef);
+    const bool playerSwimming = player->actorMover ? player->IsPlayerSwimming() : false;
+
+    std::ostringstream out;
+    bool first = true;
+    const auto flag = [&out, &first](const char* key, bool value) {
+        if (!first)
+        {
+            out << ",";
+        }
+        first = false;
+        out << "\"" << key << "\":" << (value ? "true" : "false");
+    };
+    out << "\"npc_state\":{";
+    flag("teammate", teammate);
+    flag("following", following);
+    flag("waiting", waiting);
+    flag("sneaking", sneaking);
+    flag("player_sneaking", playerSneaking);
+    flag("weapon_drawn", weaponDrawn);
+    flag("player_weapon_drawn", playerWeaponDrawn);
+    flag("sitting", sitting);
+    flag("player_swimming", playerSwimming);
+    out << "}";
+
+    if (teammate || following || waiting || sneaking || playerSneaking || weaponDrawn
+        || playerWeaponDrawn || sitting || playerSwimming)
+    {
+        LogLine("npc_state for '%s': teammate=%d following=%d waiting=%d sneaking=%d player_sneaking=%d weapon=%d player_weapon=%d sitting=%d swimming=%d.",
+            GetDisplayNameSafe(speakerRef).c_str(),
+            teammate ? 1 : 0, following ? 1 : 0, waiting ? 1 : 0, sneaking ? 1 : 0,
+            playerSneaking ? 1 : 0, weaponDrawn ? 1 : 0, playerWeaponDrawn ? 1 : 0,
+            sitting ? 1 : 0, playerSwimming ? 1 : 0);
+    }
+    return out.str();
+}
+
 bool ShouldPreserveActorConversationAnimation(TESObjectREFR* speakerRef)
 {
     auto* actor = static_cast<Actor*>(speakerRef);
@@ -8425,12 +8729,38 @@ void EngageConversationHold(const std::string& npcKey, const std::string& npcNam
     updatedHold.lastAppliedFacingDegrees = wasActive ? updatedHold.lastAppliedFacingDegrees : FLT_MAX;
     updatedHold.lastBodyFaceUpdateTick = wasActive ? updatedHold.lastBodyFaceUpdateTick : 0;
     updatedHold.lastPackageCheckTick = wasActive ? updatedHold.lastPackageCheckTick : 0;
+    updatedHold.preHoldMovementKnown = wasActive ? updatedHold.preHoldMovementKnown : false;
+    updatedHold.preHoldFollowing = wasActive ? updatedHold.preHoldFollowing : false;
+    updatedHold.preHoldWaiting = wasActive ? updatedHold.preHoldWaiting : false;
 
     TESObjectREFR* actorRef = ResolveSpeakerRef(speaker);
     PlayerCharacter* player = GetPlayer();
     if (!actorRef || !player)
     {
         return;
+    }
+
+    // Dynamic scenarios: snapshot the actor's follow/wait package state BEFORE
+    // the hold swaps their script package (a later probe would only see the
+    // conversation package). A refreshed hold keeps its original snapshot;
+    // explicit orders recorded in g_npcMovementOrders take precedence anyway.
+    if (!wasActive)
+    {
+        bool preFollowing = false;
+        bool preWaiting = false;
+        const auto order = g_npcMovementOrders.find(actorRef->refID);
+        if (order != g_npcMovementOrders.end())
+        {
+            preFollowing = order->second.first;
+            preWaiting = order->second.second;
+        }
+        else
+        {
+            ProbeActorMovementPackages(actorRef, preFollowing, preWaiting);
+        }
+        updatedHold.preHoldMovementKnown = true;
+        updatedHold.preHoldFollowing = preFollowing;
+        updatedHold.preHoldWaiting = preWaiting;
     }
 
     // COMBAT OVERRIDE: if the NPC is already fighting when addressed, do NOT lock
@@ -13189,6 +13519,9 @@ void ResetRuntimeState()
     g_state.pendingAudioChunks.clear();
     StopStreamingVoice("reply_state_reset");
     g_state.movementActionRequestIds.clear();
+    // Session-scoped follow/wait orders (dynamic scenarios) are stale after a
+    // load: the save's own package state is the truth again (live probes).
+    ClearNpcMovementOrders();
     g_state.lastNpcKey.clear();
     g_state.lastNpcName.clear();
     g_state.lastNpcSpeaker = {};
@@ -18885,6 +19218,23 @@ void HandleCompanionCommand(const fs::path& path)
     else
     {
         error = "unknown_op";
+    }
+    // Dynamic scenarios: keep the follow/wait order state in step with
+    // companion lifecycle ops (summon = following at the player's side;
+    // dismiss/despawn = no longer following).
+    if (ok)
+    {
+        if (TESObjectREFR* companionRef = ResolveCompanionRef(static_cast<UInt32>(slot)))
+        {
+            if (op == "summon")
+            {
+                NoteNpcMovementOrder(companionRef, true, false);
+            }
+            else if (op == "dismiss" || op == "despawn")
+            {
+                NoteNpcMovementOrder(companionRef, false, false);
+            }
+        }
     }
     SaveCompanionRegistry();
     WriteCompanionAck(requestId, ok, error, op, slot, entry.npcKey);
