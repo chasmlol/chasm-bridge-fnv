@@ -875,6 +875,14 @@ void PrimeHotkeyEdgeStateFromKeyboard();
 void LoadDebugConfigIfNeeded(bool force = false);
 void LoadHotkeysConfigIfNeeded(bool force = false);
 void WriteRuntimeHeartbeatIfNeeded(bool force = false);
+bool IsPlayerRef(const TESObjectREFR* ref);
+// Dead silence (task/dead-silence): dead NPCs never speak. Live-state helpers +
+// a speaker-scoped cut (audio/lip-sync/captions/queued chunks for ONE dying
+// speaker; other speakers in a group reply keep playing).
+bool DeadSilenceIsSpeechlessRef(TESObjectREFR* ref);
+bool DeadSilenceIsSpeechlessSnapshot(const SpeakerSnapshot& speaker);
+void DeadSilenceCutSpeech(UInt32 dyingRefId, const char* reason);
+void DeadSilenceUpdate();
 // Scheduler: read a vanilla TESGlobal float (GameDaysPassed 0x26, GameHour 0x38)
 // so the runtime heartbeat + turn metadata can report the in-game clock to chasm.
 bool ReadGlobalFloat(UInt32 formId, float& out);
@@ -4522,7 +4530,286 @@ bool IsLiveNearbyActorRef(const TESObjectREFR* anchorRef, TESObjectREFR* ref)
         }
     }
 
+    // Dead silence: corpses and knocked-out actors are not conversation candidates —
+    // they can't be the direct-talk target and they leave the group-chat roster (the
+    // nearby set sent to chasm as speaker candidates). Checked live on every scan, so
+    // a knocked-out actor that recovers re-enters the roster by itself.
+    if (DeadSilenceIsSpeechlessRef(ref))
+    {
+        return false;
+    }
+
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// Dead silence (task/dead-silence): dead NPCs never speak
+// ---------------------------------------------------------------------------
+// Actor::lifeState values (offset 0x108; JIP LN NVSE decode for FNV 1.4.0.525).
+// Restrained (5) actors are alive and CAN talk, so it is not in the speechless set.
+constexpr UInt32 kDeadSilenceLifeStateAlive = 0;
+constexpr UInt32 kDeadSilenceLifeStateDying = 1;
+constexpr UInt32 kDeadSilenceLifeStateDead = 2;
+constexpr UInt32 kDeadSilenceLifeStateUnconscious = 3;
+constexpr UInt32 kDeadSilenceLifeStateReanimate = 4;
+
+// True only when we can POSITIVELY determine the actor behind `ref` cannot speak
+// right now (dying/dead/unconscious/reanimating). Unknown or non-actor → false, so
+// callers never silently drop speech for actors we can't verify (e.g. an unloaded
+// walkie-talkie follower). Knocked-out (3) is temporary: every caller re-checks live
+// state, so a recovered actor speaks again — nothing is permanently blacklisted.
+bool DeadSilenceIsSpeechlessRef(TESObjectREFR* ref)
+{
+    if (!ref || !ref->baseForm || IsPlayerRef(ref))
+    {
+        return false;
+    }
+    const UInt8 baseType = ref->baseForm->typeID;
+    if (baseType != kFormType_TESNPC && baseType != kFormType_TESCreature)
+    {
+        return false;
+    }
+    const UInt32 lifeState = static_cast<Actor*>(ref)->lifeState;
+    return lifeState == kDeadSilenceLifeStateDying
+        || lifeState == kDeadSilenceLifeStateDead
+        || lifeState == kDeadSilenceLifeStateUnconscious
+        || lifeState == kDeadSilenceLifeStateReanimate;
+}
+
+// Snapshot flavor: resolve the ref identity-safely (recycled FormIDs refused) and
+// check live state. Unresolvable (unloaded/recycled) → false: can't verify, don't block.
+bool DeadSilenceIsSpeechlessSnapshot(const SpeakerSnapshot& speaker)
+{
+    if (!speaker.valid || !speaker.refId)
+    {
+        return false;
+    }
+    return DeadSilenceIsSpeechlessRef(ResolveSpeakerRef(speaker));
+}
+
+// Same-frame, speaker-scoped speech cut for ONE dying/knocked-out actor: their
+// streaming utterance, queued chunks, legacy static-buffer sounds, lip-sync, caption
+// and guitar performance stop NOW; every other speaker's audio (group replies) is
+// left untouched. Called from the ondeath event handler and the per-frame live-state
+// poll (DeadSilenceUpdate), so it must stay idempotent.
+void DeadSilenceCutSpeech(UInt32 dyingRefId, const char* reason)
+{
+    if (!dyingRefId)
+    {
+        return;
+    }
+    PlayerCharacter* player = GetPlayer();
+    if (player && player->refID == dyingRefId)
+    {
+        return;
+    }
+
+    bool cutAnything = false;
+
+    // 1) Queued-but-unplayed chunks that belong to the dying speaker. Ownership is
+    // resolved the same way playback resolves it (named speaker, else the pending
+    // conversation target), so what would have played is exactly what gets dropped.
+    if (!g_state.pendingAudioChunks.empty())
+    {
+        std::deque<QueuedAudioChunk> kept;
+        for (auto& chunk : g_state.pendingAudioChunks)
+        {
+            bool drop = false;
+            if (!chunk.nonPositional)
+            {
+                SpeakerSnapshot chunkSpeaker = g_state.pendingSpeaker;
+                if (const auto resolved = ResolveSpeakerSnapshotForNpc(chunk.speakerKey, chunk.speakerName); resolved.has_value())
+                {
+                    chunkSpeaker = *resolved;
+                }
+                drop = chunkSpeaker.valid && chunkSpeaker.refId == dyingRefId;
+            }
+            if (!drop)
+            {
+                kept.push_back(std::move(chunk));
+                continue;
+            }
+            cutAnything = true;
+            TraceRequestEvent(chunk.requestId, "dead_silence_chunk_dropped",
+                {
+                    { "speaker_key", chunk.speakerKey },
+                    { "reason", reason ? reason : "" },
+                },
+                { { "chunk_index", static_cast<double>(chunk.chunkIndex) } });
+            std::error_code rmEc;
+            fs::remove(chunk.wavPath, rmEc);
+        }
+        g_state.pendingAudioChunks.swap(kept);
+    }
+
+    // 2) The active streaming utterance (audio + lip-sync queue + caption timeline).
+    if (g_state.streamActive && !g_state.streamNonPositional
+        && g_state.streamSpeaker.valid && g_state.streamSpeaker.refId == dyingRefId)
+    {
+        StopStreamingVoice(reason ? reason : "dead_silence");
+        ClearDialogSubtitle();
+        cutAnything = true;
+    }
+
+    // 3) Legacy static-buffer sounds (non-streaming path + song playback).
+    bool removedActiveSound = false;
+    for (auto& sound : g_state.activeSounds)
+    {
+        if (!sound.speaker.valid || sound.speaker.refId != dyingRefId)
+        {
+            continue;
+        }
+        if (sound.buffer)
+        {
+            sound.buffer->Stop();
+            sound.buffer->Release();
+            sound.buffer = nullptr;
+        }
+        if (sound.buffer3d)
+        {
+            sound.buffer3d->Release();
+            sound.buffer3d = nullptr;
+        }
+        removedActiveSound = true;
+    }
+    if (removedActiveSound)
+    {
+        g_state.activeSounds.erase(
+            std::remove_if(g_state.activeSounds.begin(), g_state.activeSounds.end(),
+                [](const ActiveSound& sound) { return !sound.buffer && !sound.buffer3d; }),
+            g_state.activeSounds.end());
+        // The legacy scheduler's "current chunk still playing" clock belongs to the
+        // sound we just cut; clearing it lets the next (living) speaker start at once.
+        g_state.activeSpeechUntilTick = 0;
+        ClearDialogSubtitle();
+        cutAnything = true;
+    }
+
+    // 4) Face/lip-sync animation bound to the dying speaker.
+    if (g_state.speechAnimation.active && g_state.speechAnimation.speaker.refId == dyingRefId)
+    {
+        StopSpeechAnimation();
+        cutAnything = true;
+    }
+
+    // 5) Guitar/song performance by the dying speaker (live or still deferred).
+    if ((g_state.songActive && g_state.songSpeaker.valid && g_state.songSpeaker.refId == dyingRefId)
+        || (g_state.pendingGuitar && g_state.pendingGuitarSpeaker.valid && g_state.pendingGuitarSpeaker.refId == dyingRefId))
+    {
+        StopGuitarPerformance(reason ? reason : "dead_silence");
+        cutAnything = true;
+    }
+
+    // 6) Mid-generation death of the FOCUSED target with no other speaker's audio in
+    // flight: abandon the whole turn. This reuses the existing interrupt plumbing —
+    // CancelHttpTurn discards the worker's remaining output (the backend stops
+    // generating for a dropped turn, saving GPU) and awaitingReply clears, so the
+    // chat loop and every downstream system (triggers, DM, songs) keep flowing.
+    // In a group reply where another speaker already has audio queued or playing, the
+    // turn is left alive — the dead speaker's remaining chunks are dropped as they
+    // arrive and the terminal reply tears state down normally.
+    if (g_state.awaitingReply
+        && g_state.pendingSpeaker.valid && g_state.pendingSpeaker.refId == dyingRefId)
+    {
+        const bool otherSpeakerAudioActive =
+            (g_state.streamActive
+                && (g_state.streamNonPositional
+                    || (g_state.streamSpeaker.valid && g_state.streamSpeaker.refId != dyingRefId)))
+            || !g_state.pendingAudioChunks.empty() // survivors of the drop above = other speakers
+            || !g_state.activeSounds.empty();
+        if (!otherSpeakerAudioActive)
+        {
+            LogLine("Dead silence: abandoning in-flight reply %s — focused speaker %08X died mid-generation (%s).",
+                g_state.activeRequestId.c_str(), dyingRefId, reason ? reason : "");
+            InterruptBridgeReplyAndPlayback(reason ? reason : "dead_silence");
+            g_state.pendingNpcKey.clear();
+            g_state.pendingNpcName.clear();
+            g_state.pendingSpeaker = {};
+            cutAnything = true;
+        }
+    }
+
+    if (cutAnything)
+    {
+        LogLine("Dead silence: cut speech for actor %08X (%s).", dyingRefId, reason ? reason : "");
+        WriteRuntimeHeartbeatIfNeeded(true);
+    }
+}
+
+// Per-frame live-state watchdog. Collects the distinct speakers currently owning any
+// speech channel and cuts whoever can no longer speak. This is what catches deaths
+// with no ondeath event delivery and knock-outs (unconscious actors never fire
+// ondeath). Zero work while nothing bridge-driven is audible or in flight.
+void DeadSilenceUpdate()
+{
+    const bool anySpeechState = g_state.streamActive
+        || !g_state.activeSounds.empty()
+        || g_state.speechAnimation.active
+        || g_state.songActive
+        || g_state.pendingGuitar
+        || (g_state.awaitingReply && g_state.pendingSpeaker.valid);
+    if (!anySpeechState)
+    {
+        return;
+    }
+
+    SpeakerSnapshot candidates[8];
+    size_t count = 0;
+    const auto consider = [&](const SpeakerSnapshot& speaker) {
+        if (!speaker.valid || !speaker.refId || count >= 8)
+        {
+            return;
+        }
+        for (size_t i = 0; i < count; ++i)
+        {
+            if (candidates[i].refId == speaker.refId)
+            {
+                return;
+            }
+        }
+        candidates[count++] = speaker;
+    };
+
+    if (g_state.streamActive && !g_state.streamNonPositional)
+    {
+        consider(g_state.streamSpeaker);
+    }
+    for (const auto& sound : g_state.activeSounds)
+    {
+        consider(sound.speaker);
+    }
+    if (g_state.speechAnimation.active)
+    {
+        consider(g_state.speechAnimation.speaker);
+    }
+    if (g_state.songActive)
+    {
+        consider(g_state.songSpeaker);
+    }
+    if (g_state.pendingGuitar)
+    {
+        consider(g_state.pendingGuitarSpeaker);
+    }
+    if (g_state.awaitingReply)
+    {
+        consider(g_state.pendingSpeaker);
+    }
+
+    // Evaluate first, cut after: DeadSilenceCutSpeech mutates the containers the
+    // snapshots were collected from.
+    UInt32 speechless[8];
+    size_t speechlessCount = 0;
+    for (size_t i = 0; i < count; ++i)
+    {
+        if (DeadSilenceIsSpeechlessSnapshot(candidates[i]))
+        {
+            speechless[speechlessCount++] = candidates[i].refId;
+        }
+    }
+    for (size_t i = 0; i < speechlessCount; ++i)
+    {
+        DeadSilenceCutSpeech(speechless[i], "dead_silence_livestate");
+    }
 }
 
 void CollectNearbyMappedNpcAround(const TESObjectREFR* anchorRef, TESObjectREFR* ref, double maxDistanceSquared, bool underCrosshair, std::vector<NearbyNpcCandidate>& candidates)
@@ -10344,6 +10631,24 @@ void CancelHttpTurn()
 
 bool WriteRequest(const std::string& npcKey, const std::string& npcName, const std::string& text, const LocationSnapshot& location, const std::string& metadataJson, bool clearSpeechSidecar, const std::vector<BYTE>* httpVoiceWav, bool nonPositionalHint)
 {
+    // Dead silence: never send a turn to an NPC that positively cannot speak (dead,
+    // dying, knocked out). This is the single choke point every request path funnels
+    // through (text, voice, walkie-talkie), so it also protects future callers. The
+    // check runs BEFORE any reply-state teardown below so a skipped request leaves
+    // whatever is currently playing untouched. Admin/non-positional turns are exempt
+    // (they have no positional speaker), and unresolvable actors are allowed —
+    // only a verified corpse/knock-out is silenced.
+    if (!nonPositionalHint)
+    {
+        if (const auto liveCheck = ResolveSpeakerSnapshotForNpc(npcKey, npcName);
+            liveCheck.has_value() && DeadSilenceIsSpeechlessSnapshot(*liveCheck))
+        {
+            LogLine("Dead silence: skipping bridge request for %s (%s) — actor %08X cannot speak (dead/unconscious).",
+                npcName.c_str(), npcKey.c_str(), liveCheck->refId);
+            return false;
+        }
+    }
+
     EnsureBridgeDirectories();
     // Event log: one conversation marker per NPC per window (the transcript
     // itself already lives in chasm — this is just the "we talked" beat).
@@ -12921,6 +13226,26 @@ void DrainChunksToStreamingVoice()
             speaker = *resolved;
         }
 
+        // Dead silence: a chunk whose speaker died (or got knocked out) after the
+        // request was sent must never start playing. Scoped to this chunk's own
+        // speaker — later chunks from living co-speakers keep streaming.
+        if (!front.nonPositional && DeadSilenceIsSpeechlessSnapshot(speaker))
+        {
+            TraceRequestEvent(front.requestId, "dead_silence_chunk_dropped",
+                {
+                    { "speaker_key", front.speakerKey },
+                    { "reason", "speaker_speechless_at_drain" },
+                },
+                { { "chunk_index", static_cast<double>(front.chunkIndex) } });
+            LogLine("Dead silence: dropped stream chunk %d for %s — speaker %08X can no longer speak.",
+                front.chunkIndex, front.speakerKey.c_str(), speaker.refId);
+            const fs::path deadWavPath = front.wavPath;
+            g_state.pendingAudioChunks.pop_front();
+            std::error_code rmEc;
+            fs::remove(deadWavPath, rmEc);
+            continue;
+        }
+
         // Serialize speakers in a group reply: if this chunk belongs to a DIFFERENT
         // positional speaker than the one currently streaming AND that speaker's audio
         // hasn't finished playing, leave the chunk queued and retry next frame — else
@@ -13475,6 +13800,22 @@ void PlayQueuedAudioChunk()
             resolvedSpeaker = *chunkSpeaker;
         }
 
+        // Dead silence: never start playback for a speaker who can no longer speak.
+        if (!chunk.nonPositional && DeadSilenceIsSpeechlessSnapshot(resolvedSpeaker))
+        {
+            TraceRequestEvent(chunk.requestId, "dead_silence_chunk_dropped",
+                {
+                    { "speaker_key", chunk.speakerKey },
+                    { "reason", "speaker_speechless_at_playback" },
+                },
+                { { "chunk_index", static_cast<double>(chunk.chunkIndex) } });
+            LogLine("Dead silence: dropped queued chunk %d for %s — speaker %08X can no longer speak.",
+                chunk.chunkIndex, chunk.speakerKey.c_str(), resolvedSpeaker.refId);
+            std::error_code rmEc;
+            fs::remove(chunk.wavPath, rmEc);
+            continue;
+        }
+
         if (StartQueuedAudioPlayback(chunk, resolvedSpeaker))
         {
             return;
@@ -13696,10 +14037,25 @@ void HandleReplyPayload(const ResponsePayload* responsePtr)
             {
                 finalSpeaker = *resolvedFinalSpeaker;
             }
-            playedAudio = StartQueuedAudioPlayback(finalChunk, finalSpeaker);
-            if (!playedAudio)
+            // Dead silence: the speaker may have died while the reply was generating.
+            if (!response->nonPositionalAudio && DeadSilenceIsSpeechlessSnapshot(finalSpeaker))
             {
-                LogLine("Reply playback failed for %s.", response->audioFile.c_str());
+                TraceRequestEvent(response->requestId, "dead_silence_final_audio_skipped",
+                    {
+                        { "speaker_key", response->npcKey },
+                        { "audio_file", response->audioFile },
+                    },
+                    { { "speaker_ref_id", static_cast<double>(finalSpeaker.refId) } });
+                LogLine("Dead silence: skipped final reply audio for %s — speaker %08X can no longer speak.",
+                    response->npcKey.c_str(), finalSpeaker.refId);
+            }
+            else
+            {
+                playedAudio = StartQueuedAudioPlayback(finalChunk, finalSpeaker);
+                if (!playedAudio)
+                {
+                    LogLine("Reply playback failed for %s.", response->audioFile.c_str());
+                }
             }
         }
         else
@@ -14199,6 +14555,24 @@ void ConsumeSubmittedInput()
         return;
     }
 
+    // Dead silence: the target may have died while the input menu was open (the
+    // canonical repro is shooting the NPC you were mid-conversation with). Drop the
+    // turn cleanly instead of letting WriteRequest fail with a generic bridge error.
+    if (g_state.pendingSpeaker.valid && DeadSilenceIsSpeechlessSnapshot(g_state.pendingSpeaker))
+    {
+        LogLine("Dead silence: dropping text request for %s (%08X) — target can no longer speak.",
+            g_state.pendingNpcName.c_str(), g_state.pendingSpeaker.refId);
+        const std::string deadName = g_state.pendingNpcName;
+        g_state.pendingNpcKey.clear();
+        g_state.pendingNpcName.clear();
+        g_state.pendingSpeaker = {};
+        SuppressBridgeHotkeysAfterTextInputClose();
+        ReleaseConversationHold("dead_silence_target");
+        ShowHudMessage(deadName.empty() ? "They can't answer you now." : (ToUiAscii(deadName) + " can't answer you now."));
+        WriteDiagnostics("dead_silence_request_skipped=1\n");
+        return;
+    }
+
     ClearIdleOutboxArtifacts("text_submit_idle_stale_response");
     if (HasQueuedOrPlayingReply())
     {
@@ -14611,6 +14985,19 @@ void FinishVoiceCaptureAndSubmit()
     const std::vector<BYTE> wavBytes = BuildWaveBytesFromPcm(capture.capturedPcm);
     const LocationSnapshot location = CapturePlayerLocation();
     const bool adminMode = capture.adminMode;
+
+    // Dead silence: the target may have died while the player was recording (admin
+    // chat has no positional target and is exempt). Same live-state rule as the text
+    // path: only a POSITIVELY dead/knocked-out actor drops the turn.
+    if (!adminMode && capture.speaker.valid && DeadSilenceIsSpeechlessSnapshot(capture.speaker))
+    {
+        LogLine("Dead silence: dropping voice request for %s (%08X) — target can no longer speak.",
+            capture.npcName.c_str(), capture.speaker.refId);
+        ShowHudMessage(capture.npcName.empty() ? "They can't answer you now." : (ToUiAscii(capture.npcName) + " can't answer you now."));
+        AbortVoiceCapture("dead_silence_target");
+        return;
+    }
+
     g_state.pendingNpcKey = capture.npcKey;
     g_state.pendingNpcName = capture.npcName;
     g_state.pendingSpeaker = capture.speaker;
@@ -15468,6 +15855,16 @@ bool PlaySongDelivery(const std::vector<std::string>& lines)
         return false;
     }
 
+    // Dead silence: a performer who died (or got knocked out) while their song was
+    // queued never sings it. Consumed, not retried — the song belongs to a moment
+    // that has passed even if the actor later recovers.
+    if (DeadSilenceIsSpeechlessRef(actorRef))
+    {
+        LogLine("Dead silence: dropping queued song for %s (%08X) — performer can no longer sing.",
+            npcName.c_str(), actorRef->refID);
+        return true;
+    }
+
     // Load the WAV once so we can both play it and drive the mouth from its envelope.
     const auto wavData = LoadWavFile(wav);
     if (!wavData.has_value())
@@ -16226,6 +16623,12 @@ void OnDeathEventHandler(TESObjectREFR* /*thisObj*/, void* parameters)
     {
         return;
     }
+
+    // Dead silence: cut any in-flight speech for the dying actor THIS frame, before
+    // the event-log noise filters below (a currently-speaking actor is always
+    // relevant no matter where or how they died).
+    DeadSilenceCutSpeech(dying->refID, "ondeath_event");
+
     auto* killerRef = reinterpret_cast<TESObjectREFR*>(killerForm);
     const bool killerIsPlayer = killerForm && killerRef == static_cast<TESObjectREFR*>(GetPlayer());
     const bool victimIsPlayer = IsPlayerRef(dying);
@@ -17240,6 +17643,10 @@ void OnMainGameLoop()
     {
         return;
     }
+
+    // Dead silence: live-state watchdog runs BEFORE the chunk pump so a death this
+    // frame cuts playback and drops that speaker's chunks before new audio starts.
+    DeadSilenceUpdate();
 
     const bool httpTransport = g_debugConfig.transport == BridgeTransport::Http;
     LARGE_INTEGER _pc0;
