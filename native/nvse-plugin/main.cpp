@@ -160,6 +160,13 @@ constexpr DWORD kSaveStateSyncTimeoutMs = 8000;
 constexpr DWORD kSaveStateAckPollMs = 100;
 constexpr DWORD kSaveStateSyncHudCooldownMs = 1500;
 constexpr char kDefaultFollowPackageEditorId[] = "DefaultFollowPlayerFar";
+// Movement engine: the Travel package (editor id aaChasmTravel, location = Near
+// Linked Reference) in NVCompanions.esp at local form id 0x000c00. To travel, we set
+// the NPC's linked ref to the destination and add this package; the engine paths
+// them there — through load doors, overriding their routine. Resolved by mod-local
+// form id (robust — no editor-id-at-runtime dependency), like the dialogue forms.
+constexpr char kCompanionsPluginName[] = "NVCompanions.esp";
+constexpr UInt32 kChasmTravelPackageLocalFormId = 0x00000c00;
 constexpr char kNativeActionCommandVersion2[] = "NVBRIDGE_ACTION_V2";
 constexpr char kTrustedFNVActionEngine[] = "fallout-new-vegas:xnvse";
 constexpr size_t kMaxTrustedExecutionScriptBytes = 256ull * 1024ull;
@@ -227,6 +234,10 @@ struct LocationSnapshot
     std::string cell;
     std::string worldspace;
     std::string region;
+    // True when inside a building (interior cell) — the game's own IsInterior()
+    // flag. Surfaced to the scenario as `inside_or_outside`/`interior` macros so
+    // the prompt reads differently in vs out (they were previously identical).
+    bool interior = false;
 };
 
 struct ActiveSound
@@ -636,6 +647,12 @@ Script* g_applyNoMovePackageScript = nullptr;
 bool g_applyNoMovePackageScriptAttempted = false;
 Script* g_runBatchScript = nullptr;
 Script* g_consoleCommandScript = nullptr;
+// Scheduler clock: GameDaysPassed via a compiled GECK helper. GameHour (0x38) is a
+// correct direct read, but the day counter is NOT at 0x26 in FalloutNV, so we let
+// the script compiler resolve the `GameDaysPassed` global BY NAME instead of
+// guessing its runtime form id. Compiled once, cached.
+Script* g_gameDaysPassedScript = nullptr;
+bool g_gameDaysPassedScriptAttempted = false;
 // Music (task/music): performance idle re-assert + stop, lazily compiled. Guitar =
 // SpecialIdleNVGuitar (play-a-song); Sing = SpecialIdleSinging (rap/vocal).
 Script* g_playGuitarIdleScript = nullptr;
@@ -840,6 +857,60 @@ void PrimeHotkeyEdgeStateFromKeyboard();
 void LoadDebugConfigIfNeeded(bool force = false);
 void LoadHotkeysConfigIfNeeded(bool force = false);
 void WriteRuntimeHeartbeatIfNeeded(bool force = false);
+// Scheduler: read a vanilla TESGlobal float (GameDaysPassed 0x26, GameHour 0x38)
+// so the runtime heartbeat + turn metadata can report the in-game clock to chasm.
+bool ReadGlobalFloat(UInt32 formId, float& out);
+bool ReadGameDaysPassed(float& out);
+std::string FormatClockFloat(float value);
+// Scheduler travel: the named map locations within `radiusMeters` of the player,
+// closest first (comma-separated), so chasm can offer them as travel destinations.
+std::string BuildNearbyLocationsMacro(PlayerCharacter* player, size_t maxCount);
+// Movement engine: dump all map markers (name + world pos + form id) for chasm.
+void WriteLocationsManifestIfNeeded(PlayerCharacter* player, bool force = false);
+
+// Movement engine Phase 2: per-NPC travel status the plugin reports back to chasm
+// via the heartbeat, so chasm knows whether a traveller is currently loaded (being
+// walked by a real package) or unloaded (needs the off-screen sim), and can
+// re-anchor its simulation on the NPC's ACTUAL position — no backward-teleport
+// when the player walks away mid-journey.
+struct TravelerStatus
+{
+    bool loaded = false;
+    // Reached the target — used for journeys to a MOVING target (player / another
+    // NPC) whose position chasm can't measure itself, so the plugin signals arrival.
+    bool arrived = false;
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+    ULONGLONG updatedMs = 0;
+    // Last time we (re)issued the walk package; throttled so we don't reset the
+    // actor's path every tick (which would stutter the animation).
+    ULONGLONG lastWalkIssueMs = 0;
+};
+std::map<std::string, TravelerStatus> g_travelers;
+
+// Movement engine: building entrances discovered from teleport doors. Buildings
+// (the saloon, a shop) aren't map markers — they're interior CELLS reached through
+// a load door. We map each interior cell NAME ("Prospector Saloon") to its EXTERIOR
+// door's world position + form id, so a named building resolves to a walkable spot.
+// Accumulated over the session (keyed by lowercased name) since a door is only
+// enumerable while its exterior cell is loaded; once seen it stays known.
+struct BuildingEntrance
+{
+    std::string name;
+    // The EXTERIOR front door (outside the building — the walk-to target).
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+    UInt32 formId = 0;
+    // The linked INTERIOR door (just inside — where an NPC steps through to when
+    // travelling to the INSIDE of a building).
+    float ix = 0.0f;
+    float iy = 0.0f;
+    float iz = 0.0f;
+    UInt32 interiorFormId = 0;
+};
+std::map<std::string, BuildingEntrance> g_buildingEntrances;
 void UpdatePersonaCapture();
 void ResetPersonaStateForSession();
 void TraceRequestEvent(const std::string& requestId, const std::string& stage,
@@ -3372,6 +3443,9 @@ void WriteRuntimeHeartbeatIfNeeded(bool force)
         : 0;
 
     const PlayerCharacter* player = GetPlayer();
+    // Movement engine: refresh the map-marker manifest chasm uses to plan journeys
+    // (self-throttled to every few seconds; rides the heartbeat's cadence).
+    WriteLocationsManifestIfNeeded(GetPlayer());
     SpeakerSnapshot lastNpcSnapshot = g_state.lastNpcSpeaker;
     bool lastNpcResolved = false;
     if (TESObjectREFR* resolvedLastNpc = ResolveSpeakerRef(g_state.lastNpcSpeaker))
@@ -3423,6 +3497,37 @@ void WriteRuntimeHeartbeatIfNeeded(bool force)
     payload << "    \"pos_z\": " << lastNpcSnapshot.posZ << ",\n";
     payload << "    \"distance_to_player_m\": " << playerToLastNpcDistanceMeters << "\n";
     payload << "  },\n";
+    // Movement engine Phase 2: live status of every NPC chasm is currently walking
+    // somewhere — is it loaded (a real walk package is moving it) and where is it
+    // right now. chasm re-anchors its off-screen sim on this actual position and
+    // detects arrival from it. Entries older than 60s are pruned (journey ended).
+    {
+        const ULONGLONG travelersNowMs = GetTickCount64();
+        for (auto it = g_travelers.begin(); it != g_travelers.end();)
+        {
+            if (travelersNowMs - it->second.updatedMs > 60000)
+            {
+                it = g_travelers.erase(it);
+            }
+            else
+            {
+                ++it;
+            }
+        }
+        payload << "  \"travelers\": {\n";
+        size_t travelerIdx = 0;
+        for (const auto& kv : g_travelers)
+        {
+            payload << "    " << JsonEscape(kv.first) << ": {"
+                << "\"loaded\": " << (kv.second.loaded ? "true" : "false")
+                << ", \"arrived\": " << (kv.second.arrived ? "true" : "false")
+                << ", \"pos_x\": " << std::fixed << std::setprecision(2) << kv.second.x
+                << ", \"pos_y\": " << kv.second.y
+                << ", \"pos_z\": " << kv.second.z << "}"
+                << (++travelerIdx < g_travelers.size() ? "," : "") << "\n";
+        }
+        payload << "  },\n";
+    }
     payload << "  \"speech_animation\": {\n";
     payload << "    \"active\": " << (g_state.speechAnimation.active ? "true" : "false") << ",\n";
     payload << "    \"request_id\": " << JsonEscape(g_state.speechAnimation.requestId) << ",\n";
@@ -3471,6 +3576,21 @@ void WriteRuntimeHeartbeatIfNeeded(bool force)
     payload << "    \"caption_ms_per_char\": " << g_debugConfig.captionMsPerChar << ",\n";
     payload << "    \"bridge_root_path\": " << JsonEscape(g_debugConfig.bridgeRootPath) << "\n";
     payload << "  },\n";
+    // Scheduler in-game clock: chasm's scheduler tick reads this block every few
+    // seconds to advance its notion of the current in-game day+hour and fire
+    // time-triggered tasks even while the player is idle (not in a dialogue turn).
+    // clock_valid is false at the main menu / before a save loads.
+    {
+        float gdp = 0.0f;
+        float ghr = 0.0f;
+        const bool clockValid = player && ReadGlobalFloat(0x38, ghr) && ReadGameDaysPassed(gdp);
+        payload << "  \"game\": {\n";
+        payload << "    \"loaded\": " << ((player && g_state.loadedIntoGame) ? "true" : "false") << ",\n";
+        payload << "    \"clock_valid\": " << (clockValid ? "true" : "false") << ",\n";
+        payload << "    \"days_passed\": " << JsonEscape(clockValid ? FormatClockFloat(gdp) : std::string("0")) << ",\n";
+        payload << "    \"hour\": " << JsonEscape(clockValid ? FormatClockFloat(ghr) : std::string("0")) << "\n";
+        payload << "  },\n";
+    }
     payload << "  \"last_playback_diagnostics\": " << JsonEscape(g_state.lastPlaybackDiagnostics) << "\n";
     payload << "}\n";
 
@@ -4627,6 +4747,92 @@ std::string JoinWithOverflow(const std::vector<std::string>& items, size_t maxIt
     return out.str();
 }
 
+// Scheduler clock source. Reads a vanilla TESGlobal float by its (hard-coded,
+// FalloutNV.esm) form id. GameHour (0x38) is the 0..24 float wall clock. Returns
+// false (and leaves `out` untouched) at the main menu / before a save loads, when
+// the global is absent. (GameDaysPassed does NOT read cleanly by form id here —
+// see ReadGameDaysPassed, which resolves it by name via the script compiler.)
+bool ReadGlobalFloat(UInt32 formId, float& out)
+{
+    TESForm* form = LookupFormByID(formId);
+    if (!form || form->typeID != kFormType_TESGlobal)
+    {
+        return false;
+    }
+    out = static_cast<TESGlobal*>(form)->data;
+    return true;
+}
+
+// GameDaysPassed — the monotonic in-game day counter (increases ~1.0/day). Its
+// runtime form id is not the commonly-cited 0x26 in FalloutNV, so rather than
+// guess we compile a trivial GECK function once (the compiler resolves the global
+// BY NAME) and call it. Cheap: a cached script call. Returns false before the
+// script interface / player exist, or if the call fails.
+bool ReadGameDaysPassed(float& out)
+{
+    // Cache for ~1s: the heartbeat asks 10x/second but the day counter barely
+    // moves, so cap the actual script call to once per second.
+    static float s_cachedDays = 0.0f;
+    static DWORD s_cachedTick = 0;
+    const DWORD nowTick = GetTickCount();
+    if (s_cachedTick != 0 && (nowTick - s_cachedTick) < 1000)
+    {
+        out = s_cachedDays;
+        return true;
+    }
+
+    if (!g_scriptInterface)
+    {
+        return false;
+    }
+    if (!g_gameDaysPassedScript && !g_gameDaysPassedScriptAttempted)
+    {
+        g_gameDaysPassedScriptAttempted = true;
+        constexpr char kScript[] = R"(
+float fDays
+
+Begin Function { }
+    let fDays := GameDaysPassed
+    SetFunctionValue fDays
+End
+)";
+        g_gameDaysPassedScript = g_scriptInterface->CompileScript(kScript);
+        if (!g_gameDaysPassedScript)
+        {
+            LogLine("scheduler: failed to compile GameDaysPassed helper.");
+        }
+    }
+    if (!g_gameDaysPassedScript)
+    {
+        return false;
+    }
+    PlayerCharacter* player = GetPlayer();
+    if (!player)
+    {
+        return false;
+    }
+    NVSEArrayVarInterface::Element result;
+    const bool callOk = g_scriptInterface->CallFunction(g_gameDaysPassedScript, player, nullptr, &result, 0);
+    if (!callOk || result.GetType() != NVSEArrayVarInterface::Element::kType_Numeric)
+    {
+        return false;
+    }
+    out = static_cast<float>(result.GetNumber());
+    s_cachedDays = out;
+    s_cachedTick = nowTick;
+    return true;
+}
+
+// "13.5217"-style plain decimal for a clock global, for the turn macro table and
+// heartbeat (chasm parses these back to a day+hour). Fixed 4dp keeps ~0.4s hour
+// resolution while staying stable regardless of the caller's ostream flags.
+std::string FormatClockFloat(float value)
+{
+    char buffer[32]{};
+    std::snprintf(buffer, sizeof(buffer), "%.4f", static_cast<double>(value));
+    return buffer;
+}
+
 std::string BuildTimeOfDayMacro()
 {
     TESForm* gameHourForm = LookupFormByID(0x38); // vanilla GameHour global (FalloutNV.esm)
@@ -5094,7 +5300,36 @@ std::string BuildPlayerMacros(PlayerCharacter* player, const LocationSnapshot* l
     // self-contained even though `location` is also sent at the top level.
     AppendJsonMacro(out, first, "major_location", location->major);
     AppendJsonMacro(out, first, "minor_location", location->minor);
+    // Inside vs outside a building, so the scenario reads differently in/out
+    // (previously identical). `inside_or_outside` is prose for the template;
+    // `interior` is the raw 1/0 for anyone who wants a boolean.
+    AppendJsonMacro(out, first, "inside_or_outside", location->interior ? "inside" : "outside");
+    AppendJsonMacro(out, first, "interior", location->interior ? "1" : "0");
     AppendJsonMacro(out, first, "time_of_day", BuildTimeOfDayMacro());
+
+    // Scheduler clock (numeric): the raw GameDaysPassed / GameHour globals, so
+    // chasm can total-order in-game time and fire time-triggered scheduled tasks.
+    // The runtime heartbeat carries the same pair for firing while the player is
+    // idle (not talking); these macros make it visible on the Gamestate page too.
+    float gameDaysPassed = 0.0f;
+    if (ReadGameDaysPassed(gameDaysPassed))
+    {
+        AppendJsonMacro(out, first, "game_days_passed", FormatClockFloat(gameDaysPassed));
+    }
+    float gameHour = 0.0f;
+    if (ReadGlobalFloat(0x38, gameHour))
+    {
+        AppendJsonMacro(out, first, "game_hour", FormatClockFloat(gameHour));
+    }
+
+    // Scheduler travel: named map locations within ~1.2km, closest first. chasm
+    // offers these as the travel action's destination candidates so the model
+    // names a REAL place ("Prospector Saloon") the plugin can resolve to a marker.
+    const std::string nearbyLocations = BuildNearbyLocationsMacro(player, 10);
+    if (!nearbyLocations.empty())
+    {
+        AppendJsonMacro(out, first, "nearby_locations", nearbyLocations);
+    }
 
     const int currentHealth = ReadPlayerActorValueInt(player, eActorVal_Health);
     // ActorValueOwner::Fn_08 is GetPermanentActorValue: the Pip-Boy's max HP.
@@ -7241,6 +7476,26 @@ std::string GetStringValueSafe(String& value)
     return text ? SanitizeLine(text) : "";
 }
 
+// The display name of a building (interior cell) — the game's own cell name, the
+// same "Prospector Saloon" it shows the player. Prefer the cell's fullName; fall
+// back to humanizing the editor id (e.g. "GSProspectorSaloonInterior" ->
+// "Prospector Saloon"). No hardcoded name tables. Used for BOTH the scenario's
+// `minor_location` AND the travel manifest's building entrances, so the name the
+// model is told and the name travel resolves are identical by construction.
+std::string InteriorBuildingName(TESObjectCELL* cell)
+{
+    if (!cell)
+    {
+        return "";
+    }
+    const std::string display = GetStringValueSafe(cell->fullName.name);
+    if (!display.empty())
+    {
+        return display;
+    }
+    return HumanizeIdentifier(GetFormNameSafe(cell));
+}
+
 double DistanceSquared3D(const TESObjectREFR* left, const TESObjectREFR* right)
 {
     if (!left || !right)
@@ -8558,6 +8813,332 @@ std::string FindNearestWorldMapLocation(PlayerCharacter* player)
     return bestName;
 }
 
+// Scheduler travel: lowercase + trim a marker name/query and drop a leading "the "
+// so "the Prospector Saloon" and "prospector saloon" compare equal.
+std::string NormalizeMarkerQuery(std::string value)
+{
+    value = ToLowerAscii(Trim(value));
+    if (value.rfind("the ", 0) == 0)
+    {
+        value = value.substr(4);
+    }
+    return value;
+}
+
+// Resolve a natural-language destination ("prospector saloon") to a map-marker
+// reference in the player's CURRENT worldspace. Every map marker is a persistent
+// ref living in the worldspace's permanent cell, so that is searched first (no
+// distance limit); a wide cell sweep is a fallback. Matches by display name:
+// exact first, then substring either way. Returns nullptr when nothing matches
+// (the caller then falls back to the player). Runs only on a fired travel task
+// (rare), so the sweep's cost is a non-issue.
+TESObjectREFR* FindMapMarkerByName(const std::string& query)
+{
+    const std::string q = NormalizeMarkerQuery(query);
+    if (q.empty())
+    {
+        return nullptr;
+    }
+    PlayerCharacter* player = GetPlayer();
+    if (!player || !player->parentCell || !player->parentCell->worldSpace)
+    {
+        return nullptr;
+    }
+    TESWorldSpace* world = player->parentCell->worldSpace;
+
+    TESObjectREFR* exact = nullptr;
+    TESObjectREFR* partial = nullptr;
+    auto consider = [&](TESObjectREFR* ref) {
+        if (exact || !ref || !IsMapMarkerRef(ref))
+        {
+            return;
+        }
+        const std::string name = NormalizeMarkerQuery(GetMapMarkerDisplayName(ref));
+        if (name.empty())
+        {
+            return;
+        }
+        if (name == q)
+        {
+            exact = ref;
+        }
+        else if (!partial && (name.find(q) != std::string::npos || q.find(name) != std::string::npos))
+        {
+            partial = ref;
+        }
+    };
+
+    // 1) The worldspace permanent cell holds every map marker, regardless of distance.
+    if (world->cell)
+    {
+        for (auto iter = world->cell->objectList.Begin(); !iter.End() && !exact; ++iter)
+        {
+            consider(*iter);
+        }
+    }
+    // 2) Fallback: a wide cell sweep around the player.
+    if (!exact && !partial && world->cellMap)
+    {
+        const auto coords = GetWorldCellCoordinates(player->parentCell);
+        if (coords.has_value())
+        {
+            constexpr SInt32 kDepth = 40;
+            for (SInt32 y = coords->second - kDepth; y <= coords->second + kDepth && !exact; ++y)
+            {
+                for (SInt32 x = coords->first - kDepth; x <= coords->first + kDepth && !exact; ++x)
+                {
+                    TESObjectCELL* cell = world->cellMap->Lookup(MakeWorldCellKey(x, y));
+                    if (!cell)
+                    {
+                        continue;
+                    }
+                    for (auto iter = cell->objectList.Begin(); !iter.End() && !exact; ++iter)
+                    {
+                        consider(*iter);
+                    }
+                }
+            }
+        }
+    }
+
+    TESObjectREFR* result = exact ? exact : partial;
+    if (result)
+    {
+        LogLine("scheduler: resolved destination '%s' -> marker %08X (%s).",
+            query.c_str(), result->refID, GetMapMarkerDisplayName(result).c_str());
+    }
+    else
+    {
+        LogLine("scheduler: destination '%s' matched no map marker.", query.c_str());
+    }
+    return result;
+}
+
+// Scheduler travel: gather the map locations within `radiusMeters` of the player,
+// closest first, as a comma-separated list of display names (up to `maxCount`).
+// Reuses the worldspace permanent cell (holds every marker). chasm injects this as
+// the travel action's destination candidates so the model picks a REAL place name.
+std::string BuildNearbyLocationsMacro(PlayerCharacter* player, size_t maxCount)
+{
+    // Only meaningful outdoors: distances are measured from the player's exterior
+    // position (interior cells use unrelated local coordinates).
+    if (!player || !player->parentCell || !player->parentCell->worldSpace)
+    {
+        return "";
+    }
+    const double px = player->posX;
+    const double py = player->posY;
+    const double pz = player->posZ;
+
+    std::vector<std::pair<double, std::string>> found; // (distanceSquared, name)
+    const auto addUnique = [&](double distSq, const std::string& name) {
+        if (name.empty())
+        {
+            return;
+        }
+        const std::string key = ToLowerAscii(name);
+        for (auto& fp : found)
+        {
+            if (ToLowerAscii(fp.second) == key)
+            {
+                if (distSq < fp.first)
+                {
+                    fp.first = distSq; // keep the nearest instance of a shared name
+                }
+                return;
+            }
+        }
+        found.emplace_back(distSq, name);
+    };
+
+    // Map markers (the worldspace permanent cell holds every one).
+    if (TESWorldSpace* world = player->parentCell->worldSpace; world && world->cell)
+    {
+        for (auto iter = world->cell->objectList.Begin(); !iter.End(); ++iter)
+        {
+            TESObjectREFR* ref = *iter;
+            if (!ref || !IsMapMarkerRef(ref))
+            {
+                continue;
+            }
+            addUnique(DistanceSquared3D(player, ref), SanitizeLine(GetMapMarkerDisplayName(ref)));
+        }
+    }
+    // Building entrances discovered so far (front doors — the same set travel resolves).
+    for (const auto& kv : g_buildingEntrances)
+    {
+        const BuildingEntrance& be = kv.second;
+        const double dx = px - be.x;
+        const double dy = py - be.y;
+        const double dz = pz - be.z;
+        addUnique(dx * dx + dy * dy + dz * dz, be.name);
+    }
+
+    std::sort(found.begin(), found.end(),
+        [](const std::pair<double, std::string>& a, const std::pair<double, std::string>& b) {
+            return a.first < b.first;
+        });
+
+    // The nearest `maxCount`, each with its distance in metres so the model can pick
+    // sensibly: "Prospector Saloon (45m), Goodsprings (120m), ...".
+    std::ostringstream out;
+    size_t shown = 0;
+    for (const auto& fp : found)
+    {
+        if (shown >= maxCount)
+        {
+            break;
+        }
+        if (shown++)
+        {
+            out << ", ";
+        }
+        const long meters = std::lround(std::sqrt(fp.first) / static_cast<double>(kGameUnitsPerMeter));
+        out << fp.second << " (" << meters << "m)";
+    }
+    return out.str();
+}
+
+// Movement engine: write EVERY map marker in the current worldspace (display name
+// + world position + runtime form id) to `<bridge>/locations.json`, so chasm can
+// measure the distance to any destination and drive an on-time journey without a
+// round-trip. Throttled to at most once every few seconds (markers don't move); a
+// no-op when there's no worldspace (main menu / an interior with no markers), which
+// simply keeps the last-written manifest.
+void WriteLocationsManifestIfNeeded(PlayerCharacter* player, bool force)
+{
+    static ULONGLONG lastWriteMs = 0;
+    const ULONGLONG nowMs = GetTickCount64();
+    if (!force && lastWriteMs != 0 && (nowMs - lastWriteMs) < 5000)
+    {
+        return;
+    }
+    if (!player || !player->parentCell || !player->parentCell->worldSpace)
+    {
+        return;
+    }
+    TESWorldSpace* world = player->parentCell->worldSpace;
+    if (!world->cell)
+    {
+        return;
+    }
+
+    // Discover building entrances from teleport doors: for a door whose linked door
+    // is in an INTERIOR, map the interior cell's name ("Prospector Saloon") to the
+    // exterior front door (walk target) + the interior door (inside). Persistent load
+    // doors live in the worldspace's PERMANENT cell — in memory regardless of what is
+    // loaded — so all buildings are known WITHOUT having visited them.
+    const auto tryAddDoor = [](TESObjectREFR* door) {
+        if (!door)
+        {
+            return;
+        }
+        BSExtraData* extra = door->extraDataList.GetByType(kExtraData_Teleport);
+        ExtraTeleport* tele = extra ? reinterpret_cast<ExtraTeleport*>(extra) : nullptr;
+        if (!tele || !tele->data || !tele->data->linkedDoor)
+        {
+            return;
+        }
+        TESObjectREFR* linked = tele->data->linkedDoor;
+        if (!linked->parentCell || !linked->parentCell->IsInterior())
+        {
+            return; // only doors that lead INTO a building
+        }
+        // Name the building from its cell display name — the SAME source the
+        // scenario's minor_location uses — so model, scenario and travel agree.
+        const std::string name = InteriorBuildingName(linked->parentCell);
+        if (name.empty())
+        {
+            return; // no natural name (wilderness / unnamed)
+        }
+        BuildingEntrance& be = g_buildingEntrances[ToLowerAscii(name)];
+        be.name = name;
+        be.x = door->posX;        // exterior front door (outside — the walk target)
+        be.y = door->posY;
+        be.z = door->posZ;
+        be.formId = door->refID;
+        be.ix = linked->posX;     // interior door (inside)
+        be.iy = linked->posY;
+        be.iz = linked->posZ;
+        be.interiorFormId = linked->refID;
+    };
+    // The worldspace permanent cell holds every persistent ref (map markers AND load
+    // doors) in memory regardless of what is loaded — the single source, no visiting.
+    for (auto it = world->cell->objectList.Begin(); !it.End(); ++it)
+    {
+        tryAddDoor(*it);
+    }
+
+    std::ostringstream out;
+    out << "{\"version\":1,\"markers\":[";
+    size_t count = 0;
+    const auto emitEntry = [&](const std::string& name, float x, float y, float z, UInt32 formId) {
+        if (count++)
+        {
+            out << ",";
+        }
+        out << "{\"name\":" << JsonEscape(name)
+            << ",\"x\":" << std::fixed << std::setprecision(2) << x
+            << ",\"y\":" << y
+            << ",\"z\":" << z
+            << ",\"form_id\":" << std::dec << formId << "}";
+    };
+    for (auto iter = world->cell->objectList.Begin(); !iter.End(); ++iter)
+    {
+        TESObjectREFR* ref = *iter;
+        if (!ref || !IsMapMarkerRef(ref))
+        {
+            continue;
+        }
+        const std::string name = GetMapMarkerDisplayName(ref);
+        if (name.empty())
+        {
+            continue;
+        }
+        emitEntry(name, ref->posX, ref->posY, ref->posZ, ref->refID);
+    }
+    // Building entrances ride the same list — the exterior front door (walk target)
+    // plus the interior door (`inside_*`) for travelling to the INSIDE of a building.
+    for (const auto& kv : g_buildingEntrances)
+    {
+        const BuildingEntrance& be = kv.second;
+        if (count++)
+        {
+            out << ",";
+        }
+        out << "{\"name\":" << JsonEscape(be.name)
+            << ",\"x\":" << std::fixed << std::setprecision(2) << be.x
+            << ",\"y\":" << be.y
+            << ",\"z\":" << be.z
+            << ",\"form_id\":" << std::dec << be.formId
+            << ",\"inside_x\":" << std::fixed << std::setprecision(2) << be.ix
+            << ",\"inside_y\":" << be.iy
+            << ",\"inside_z\":" << be.iz
+            << ",\"inside_form_id\":" << std::dec << be.interiorFormId << "}";
+    }
+    out << "]}";
+
+    lastWriteMs = nowMs;
+    const fs::path path = BridgeDir() / "locations.json";
+    const fs::path tmp = BridgeDir() / "locations.json.tmp";
+    {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        if (!f)
+        {
+            return;
+        }
+        const std::string body = out.str();
+        f.write(body.data(), static_cast<std::streamsize>(body.size()));
+    }
+    std::error_code ec;
+    fs::rename(tmp, path, ec);
+    if (ec)
+    {
+        fs::copy_file(tmp, path, fs::copy_options::overwrite_existing, ec);
+    }
+    LogLine("movement: wrote locations manifest (%zu markers).", count);
+}
+
 std::string FindNearestLocalMapLocation(PlayerCharacter* player)
 {
     if (!player || !player->parentCell)
@@ -8629,16 +9210,27 @@ LocationSnapshot CapturePlayerLocation()
 
     TESObjectCELL* cell = player->parentCell;
     snapshot.cell = GetFormNameSafe(cell);
+    snapshot.interior = cell->IsInterior();
     if (cell->worldSpace)
     {
         snapshot.worldspace = GetFormNameSafe(cell->worldSpace);
     }
     snapshot.major = FindNearestWorldMapLocation(player);
-    if (snapshot.major.empty() && cell->worldSpace == nullptr)
+    if (snapshot.major.empty() && snapshot.interior)
     {
         snapshot.major = InferMajorLocationFromCellIdentifier(snapshot.cell);
     }
-    snapshot.minor = FindNearestLocalMapLocation(player);
+    // Inside a building, the specific place IS the building — name it from the
+    // game's cell display name (robust, non-hardcoded). Outside, keep the nearest
+    // landmark. `inside_or_outside` (below) then disambiguates the two.
+    if (snapshot.interior)
+    {
+        snapshot.minor = InteriorBuildingName(cell);
+    }
+    else
+    {
+        snapshot.minor = FindNearestLocalMapLocation(player);
+    }
     if (snapshot.minor.empty())
     {
         snapshot.minor = InferMinorLocationFromCellIdentifier(snapshot.cell);
@@ -16706,6 +17298,290 @@ bool CompanionMoveToRef(TESObjectREFR* actorRef, TESObjectREFR* targetRef)
     return issued;
 }
 
+// ---------------------------------------------------------------------------
+// Movement engine: MoveTo a target ref with an explicit X/Y/Z offset (game units).
+// The travel engine (chasm) drives an NPC along its route by anchoring on the
+// destination MARKER ref (resolved by form id, so this works regardless of where
+// the player is — even inside an interior) and offsetting BACK toward the start by
+// the remaining fraction. MoveTo is the cross-cell-safe primitive: the engine
+// reassigns the exterior cell for the resulting coordinates, so a large offset
+// spanning many cells is fine.
+Script* g_moveToPosScript = nullptr;
+
+bool EnsureMoveToPosScript()
+{
+    if (g_moveToPosScript)
+    {
+        return true;
+    }
+    if (!g_scriptInterface)
+    {
+        LogLine("movement: script interface unavailable.");
+        return false;
+    }
+    constexpr char kScript[] = R"(
+ref rActor
+ref rTarget
+float fX
+float fY
+float fZ
+float fIssued
+
+Begin Function { rActor, rTarget, fX, fY, fZ }
+    let fIssued := 0
+    if rActor && rTarget
+        rActor.Enable
+        rActor.MoveTo rTarget fX fY fZ
+        let fIssued := 1
+    endif
+    SetFunctionValue fIssued
+End
+)";
+    g_moveToPosScript = g_scriptInterface->CompileScript(kScript);
+    if (!g_moveToPosScript)
+    {
+        LogLine("movement: failed to compile MoveTo-offset helper.");
+    }
+    return g_moveToPosScript != nullptr;
+}
+
+// CallFunction reads each vararg as a 4-byte void* and reinterprets the slot as a
+// float for a Float param (`*((float*)&arg)`). A float passed directly would be
+// promoted to an 8-byte double and misread, so we pack each float's raw 32 bits
+// into the pointer-sized slot.
+static void* FloatArg(float value)
+{
+    UInt32 bits;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return reinterpret_cast<void*>(bits);
+}
+
+bool MoveRefToOffset(TESObjectREFR* actorRef, TESObjectREFR* targetRef, float dx, float dy, float dz)
+{
+    if (!actorRef || !targetRef || !EnsureMoveToPosScript())
+    {
+        return false;
+    }
+    NVSEArrayVarInterface::Element result;
+    const bool callOk = g_scriptInterface->CallFunction(
+        g_moveToPosScript, actorRef, nullptr, &result, 5,
+        actorRef, targetRef, FloatArg(dx), FloatArg(dy), FloatArg(dz));
+    const bool issued = callOk
+        && result.GetType() == NVSEArrayVarInterface::Element::kType_Numeric
+        && result.GetNumber() != 0.0;
+    if (!issued)
+    {
+        LogLine("movement: MoveTo-offset helper failed for %08X (call_ok=%d).", actorRef->refID, callOk ? 1 : 0);
+    }
+    return issued;
+}
+
+// Resolve a map-marker ref by its runtime form id (worldspace-independent — works
+// while the player is in an interior), falling back to a name search. Then place
+// `actorRef` at the absolute world position (`x`,`y`,`z`) by offsetting from the
+// marker. Returns false if neither the marker nor the actor could be resolved.
+bool MoveRefToWorldPos(TESObjectREFR* actorRef, UInt32 markerFormId, const std::string& markerName,
+    float x, float y, float z, std::string& outError)
+{
+    if (!actorRef)
+    {
+        outError = "actor_unresolved";
+        return false;
+    }
+    TESObjectREFR* marker = nullptr;
+    if (markerFormId != 0)
+    {
+        if (TESForm* form = LookupFormByID(markerFormId))
+        {
+            // Accept any reference the manifest handed us — a map marker OR a
+            // building's front door (both are valid, resolvable destinations).
+            marker = DYNAMIC_CAST(form, TESForm, TESObjectREFR);
+        }
+    }
+    if (!marker && !markerName.empty())
+    {
+        marker = FindMapMarkerByName(markerName);
+    }
+    if (!marker)
+    {
+        outError = "marker_unresolved";
+        return false;
+    }
+    const float dx = x - marker->posX;
+    const float dy = y - marker->posY;
+    const float dz = z - marker->posZ;
+    if (!MoveRefToOffset(actorRef, marker, dx, dy, dz))
+    {
+        outError = "move_failed";
+        return false;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Movement engine Phase 2: REAL walking when the NPC is loaded. JIP LN NVSE's
+// TravelToRef drops a temporary travel package on the actor (AddBackUpPackage),
+// so it physically walks/paths the navmesh to the target ref with animation — a
+// pure-runtime primitive, no esp/package edit. `run`=1 makes them run instead of
+// walk. Only meaningful for a loaded (rendered/high-process) actor; the engine
+// won't path an unloaded one (that's what the off-screen sim is for).
+Script* g_travelToRefScript = nullptr;
+
+bool EnsureTravelToRefScript()
+{
+    if (g_travelToRefScript)
+    {
+        return true;
+    }
+    if (!g_scriptInterface)
+    {
+        return false;
+    }
+    constexpr char kScript[] = R"(
+ref rActor
+ref rTarget
+int iRun
+float fIssued
+
+Begin Function { rActor, rTarget, iRun }
+    let fIssued := 0
+    if rActor && rTarget
+        rActor.TravelToRef rTarget iRun
+        let fIssued := 1
+    endif
+    SetFunctionValue fIssued
+End
+)";
+    g_travelToRefScript = g_scriptInterface->CompileScript(kScript);
+    if (!g_travelToRefScript)
+    {
+        LogLine("movement: failed to compile TravelToRef helper (is JIP LN NVSE installed?).");
+    }
+    return g_travelToRefScript != nullptr;
+}
+
+bool TravelActorToRef(TESObjectREFR* actorRef, TESObjectREFR* targetRef, bool run)
+{
+    if (!actorRef || !targetRef || !EnsureTravelToRefScript())
+    {
+        return false;
+    }
+    NVSEArrayVarInterface::Element result;
+    // Integer param: CallFunction casts the pointer-sized arg slot straight to
+    // SInt32 (unlike float params, which are bit-reinterpreted), so pass the value.
+    void* runArg = reinterpret_cast<void*>(static_cast<UInt32>(run ? 1 : 0));
+    const bool callOk = g_scriptInterface->CallFunction(
+        g_travelToRefScript, actorRef, nullptr, &result, 3, actorRef, targetRef, runArg);
+    const bool issued = callOk
+        && result.GetType() == NVSEArrayVarInterface::Element::kType_Numeric
+        && result.GetNumber() != 0.0;
+    if (!issued)
+    {
+        LogLine("movement: TravelToRef helper failed for %08X (call_ok=%d).", actorRef->refID, callOk ? 1 : 0);
+    }
+    return issued;
+}
+
+// An NPC is "loaded" (rendered / high-process, so the engine will actually walk
+// it) when it has a 3D render node. Unloaded actors have none — those get the
+// off-screen position sim instead.
+bool IsActorRenderLoaded(TESObjectREFR* ref)
+{
+    return ref && ref->GetNiNode() != nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// Movement engine: travel via a real AI Travel package. Set the NPC's linked ref to
+// the destination, then add the "aaChasmTravel" package (location = Near Linked
+// Reference, authored in NVCompanions.esp). The engine paths them there — through
+// load doors, in and out of buildings — and the added package outranks their editor
+// routine so they don't wander home. THIS is the travel primitive: no TravelToRef,
+// no MoveTo, no door hacks.
+TESForm* ResolveChasmTravelPackage()
+{
+    TESForm* form = ResolveModLocalForm(kCompanionsPluginName, kChasmTravelPackageLocalFormId);
+    if (!form)
+    {
+        LogLine("movement: aaChasmTravel package not found in %s.", kCompanionsPluginName);
+        return nullptr;
+    }
+    if (!DYNAMIC_CAST(form, TESForm, TESPackage))
+    {
+        LogLine("movement: aaChasmTravel resolved to %08X but is not a package.", form->refID);
+        return nullptr;
+    }
+    return form;
+}
+
+Script* g_setLinkedRefScript = nullptr;
+bool EnsureSetLinkedRefScript()
+{
+    if (g_setLinkedRefScript)
+    {
+        return true;
+    }
+    if (!g_scriptInterface)
+    {
+        return false;
+    }
+    // JIP LN NVSE's SetLinkedReference — the target the Near-Linked-Reference travel
+    // package heads for.
+    constexpr char kScript[] = R"(
+ref rActor
+ref rTarget
+float fIssued
+
+Begin Function { rActor, rTarget }
+    let fIssued := 0
+    if rActor && rTarget
+        rActor.SetLinkedReference rTarget
+        let fIssued := 1
+    endif
+    SetFunctionValue fIssued
+End
+)";
+    g_setLinkedRefScript = g_scriptInterface->CompileScript(kScript);
+    if (!g_setLinkedRefScript)
+    {
+        LogLine("movement: failed to compile SetLinkedReference helper (is JIP LN NVSE installed?).");
+    }
+    return g_setLinkedRefScript != nullptr;
+}
+
+bool SetActorLinkedRef(TESObjectREFR* actor, TESObjectREFR* target)
+{
+    if (!actor || !target || !EnsureSetLinkedRefScript())
+    {
+        return false;
+    }
+    NVSEArrayVarInterface::Element result;
+    const bool callOk = g_scriptInterface->CallFunction(g_setLinkedRefScript, actor, nullptr, &result, 2, actor, target);
+    return callOk
+        && result.GetType() == NVSEArrayVarInterface::Element::kType_Numeric
+        && result.GetNumber() != 0.0;
+}
+
+// Send `npc` to `target` via the travel package: set the linked ref, add the
+// package, evaluate. The engine handles the rest (pathing, doors, routine override).
+bool TravelViaPackage(TESObjectREFR* npc, TESObjectREFR* target)
+{
+    if (!npc || !target)
+    {
+        return false;
+    }
+    TESForm* pkg = ResolveChasmTravelPackage();
+    if (!pkg)
+    {
+        return false;
+    }
+    if (!SetActorLinkedRef(npc, target))
+    {
+        LogLine("movement: SetLinkedReference failed for %08X.", npc->refID);
+        return false;
+    }
+    return AddActorScriptPackage(npc, pkg, "aaChasmTravel", "movement_travel_package");
+}
+
 bool CompanionMoveToHold(TESObjectREFR* actorRef)
 {
     if (!actorRef || !EnsureCompanionDespawnScript())
@@ -17132,6 +18008,67 @@ bool CompanionSummon(UInt32 slot, std::string& outError)
     return true;
 }
 
+// Scheduler: move a specific actor ref to a travel destination.
+//   * a named place ("prospector saloon") -> the matching map-marker ref, so the
+//     actor actually travels THERE (MoveTo teleports across cells).
+//   * "player"/"me"/"you"/"here"/empty, or an unresolved name -> the player, the
+//     reliable rendezvous fallback that works from anywhere.
+// Reuses the proven Enable + MoveTo primitive WITHOUT forcing teammate/follow.
+// Shared by both the companion path and the conversing-NPC path below.
+bool TravelRefTo(TESObjectREFR* ref, const std::string& destName, std::string& outError)
+{
+    PlayerCharacter* player = GetPlayer();
+    if (!ref || !player)
+    {
+        outError = ref ? "no_player" : "actor_unresolved";
+        return false;
+    }
+    const std::string destLower = ToLowerAscii(Trim(destName));
+    const bool toPlayer = destLower.empty() || destLower == "player" || destLower == "me"
+        || destLower == "you" || destLower == "the player" || destLower == "here";
+    TESObjectREFR* target = toPlayer ? static_cast<TESObjectREFR*>(player) : FindMapMarkerByName(destName);
+    if (!target)
+    {
+        // A NAMED place that didn't resolve to a map marker. Do NOT yank the actor
+        // onto the player — that "teleport to me" is worse than nothing. Fail so the
+        // journey is marked failed rather than silently rendezvousing.
+        outError = "destination_unresolved";
+        LogLine("scheduler: destination '%s' unresolved — not moving (no player fallback).",
+            destName.c_str());
+        return false;
+    }
+    if (!CompanionMoveToRef(ref, target))
+    {
+        outError = "move_failed";
+        return false;
+    }
+    EvaluateActorPackage(ref);
+    LogLine("scheduler: %08X travelled to %s (dest='%s').", ref->refID,
+        toPlayer ? "the player" : GetMapMarkerDisplayName(target).c_str(),
+        destName.c_str());
+    return true;
+}
+
+// Companion travel: resolve the slot's ref, then move it.
+bool CompanionTravelTo(UInt32 slot, const std::string& destName, std::string& outError)
+{
+    TESObjectREFR* ref = ResolveCompanionRef(slot);
+    if (!ref)
+    {
+        outError = "companion_ref_unresolved";
+        LogLine("scheduler: travel_to slot %u ref unresolved.", slot);
+        return false;
+    }
+    if (!TravelRefTo(ref, destName, outError))
+    {
+        LogLine("scheduler: travel_to slot %u failed (%s).", slot, outError.c_str());
+        return false;
+    }
+    g_companions.slots[slot].status = "spawned";
+    RememberNpcTarget(g_companions.slots[slot].npcKey, g_companions.slots[slot].name, CaptureSpeakerSnapshot(ref));
+    return true;
+}
+
 bool CompanionStopFollowing(UInt32 slot, std::string& outError)
 {
     TESObjectREFR* ref = ResolveCompanionRef(slot);
@@ -17509,6 +18446,255 @@ void HandleCompanionCommand(const fs::path& path)
         if (ok)
         {
             ShowHudMessage(ToUiAscii(entry.name) + " joined you.");
+        }
+        return;
+    }
+
+    // Scheduler: rendezvous a companion with the player (fired scheduled task).
+    // Resolves the slot from `slot=` or, failing that, `npc_key=` (chasm knows the
+    // owner's npc_key; the slot is looked up from the registry but npc_key is the
+    // durable id). Handled before the generic slot check so npc_key alone works.
+    if (op == "travel_to")
+    {
+        int tslot = -1;
+        const std::string slotField = Trim(GetField(fields, "slot"));
+        if (!slotField.empty())
+        {
+            tslot = atoi(slotField.c_str());
+        }
+        const std::string npcKey = Trim(GetField(fields, "npc_key"));
+        const bool slotOk = tslot >= 0 && tslot < static_cast<int>(kCompanionPoolSize)
+            && g_companions.slots[tslot].claimed;
+        if (!slotOk && !npcKey.empty())
+        {
+            for (UInt32 i = 0; i < kCompanionPoolSize; ++i)
+            {
+                if (g_companions.slots[i].claimed && g_companions.slots[i].npcKey == npcKey)
+                {
+                    tslot = static_cast<int>(i);
+                    break;
+                }
+            }
+        }
+        const std::string destName = decodeText("dest_name_base64");
+        std::string npcName = decodeText("npc_name_base64");
+        if (npcName.empty())
+        {
+            npcName = Trim(GetField(fields, "npc_name"));
+        }
+        const bool haveCompanion = tslot >= 0 && tslot < static_cast<int>(kCompanionPoolSize)
+            && g_companions.slots[tslot].claimed;
+
+        std::string travelError;
+        bool travelled = false;
+        int ackSlot = tslot;
+        std::string ackKey = npcKey;
+        std::string displayName = npcName.empty() ? npcKey : npcName;
+
+        if (haveCompanion)
+        {
+            travelled = CompanionTravelTo(static_cast<UInt32>(tslot), destName, travelError);
+            SaveCompanionRegistry();
+            ackKey = g_companions.slots[tslot].npcKey;
+            displayName = g_companions.slots[tslot].name;
+        }
+        else
+        {
+            // Not a companion -> the conversing NPC (e.g. Chet). Resolve their ref
+            // by npc_key/name (they just spoke, so it's remembered) and move it.
+            ackSlot = -1;
+            if (const auto snap = ResolveSpeakerSnapshotForNpc(npcKey, npcName); snap.has_value())
+            {
+                if (TESObjectREFR* ref = ResolveSpeakerRef(*snap))
+                {
+                    travelled = TravelRefTo(ref, destName, travelError);
+                }
+                else
+                {
+                    travelError = "npc_ref_unresolved";
+                }
+            }
+            else
+            {
+                travelError = "npc_not_found";
+            }
+        }
+
+        WriteCompanionAck(requestId, travelled, travelError, op, ackSlot, ackKey);
+        if (travelled)
+        {
+            ShowHudMessage(ToUiAscii(displayName) + (destName.empty()
+                ? std::string(" set off to meet you.")
+                : (" travelled to " + ToUiAscii(destName) + ".")));
+        }
+        else
+        {
+            LogLine("scheduler: travel_to failed for npc_key='%s' (%s).", npcKey.c_str(), travelError.c_str());
+        }
+        return;
+    }
+
+    // Movement engine: place a travelling NPC at an absolute world position — a
+    // waypoint along its route, or the exact arrival point. Anchors on the
+    // destination marker (by runtime form id, so it resolves regardless of where
+    // the player is) and offsets to the coordinates chasm computed. Resolves the
+    // actor exactly like `travel_to` (a claimed companion slot, else the conversing
+    // NPC by key/name).
+    if (op == "move_to_pos")
+    {
+        const std::string npcKey = Trim(GetField(fields, "npc_key"));
+        std::string npcName = decodeText("npc_name_base64");
+        if (npcName.empty())
+        {
+            npcName = Trim(GetField(fields, "npc_name"));
+        }
+        const std::string markerName = decodeText("dest_name_base64");
+        const UInt32 markerFormId =
+            static_cast<UInt32>(strtoul(GetField(fields, "dest_form_id").c_str(), nullptr, 10));
+        const float x = static_cast<float>(atof(GetField(fields, "x").c_str()));
+        const float y = static_cast<float>(atof(GetField(fields, "y").c_str()));
+        const float z = static_cast<float>(atof(GetField(fields, "z").c_str()));
+
+        TESObjectREFR* ref = nullptr;
+        for (UInt32 i = 0; i < kCompanionPoolSize; ++i)
+        {
+            if (g_companions.slots[i].claimed && g_companions.slots[i].npcKey == npcKey)
+            {
+                ref = ResolveCompanionRef(i);
+                break;
+            }
+        }
+        if (!ref)
+        {
+            if (const auto snap = ResolveSpeakerSnapshotForNpc(npcKey, npcName); snap.has_value())
+            {
+                ref = ResolveSpeakerRef(*snap);
+            }
+        }
+
+        std::string moveError;
+        const bool moved = MoveRefToWorldPos(ref, markerFormId, markerName, x, y, z, moveError);
+        WriteCompanionAck(requestId, moved, moveError, op, -1, npcKey);
+        if (!moved)
+        {
+            LogLine("movement: move_to_pos failed for npc_key='%s' (%s).", npcKey.c_str(), moveError.c_str());
+        }
+        return;
+    }
+
+    // Movement engine: one journey step — (re)apply the travel package that walks the
+    // NPC to its target (a place/building/door, the player, or another NPC), and
+    // report position + arrival back to chasm. The engine handles pathing and doors.
+    if (op == "travel_step")
+    {
+        const std::string npcKey = Trim(GetField(fields, "npc_key"));
+        std::string npcName = decodeText("npc_name_base64");
+        if (npcName.empty())
+        {
+            npcName = Trim(GetField(fields, "npc_name"));
+        }
+        const std::string markerName = decodeText("dest_name_base64");
+        const UInt32 markerFormId =
+            static_cast<UInt32>(strtoul(GetField(fields, "dest_form_id").c_str(), nullptr, 10));
+        const bool toPlayer = atoi(GetField(fields, "to_player").c_str()) != 0;
+
+        TESObjectREFR* ref = nullptr;
+        for (UInt32 i = 0; i < kCompanionPoolSize; ++i)
+        {
+            if (g_companions.slots[i].claimed && g_companions.slots[i].npcKey == npcKey)
+            {
+                ref = ResolveCompanionRef(i);
+                break;
+            }
+        }
+        if (!ref)
+        {
+            if (const auto snap = ResolveSpeakerSnapshotForNpc(npcKey, npcName); snap.has_value())
+            {
+                ref = ResolveSpeakerRef(*snap);
+            }
+        }
+        if (!ref)
+        {
+            WriteCompanionAck(requestId, false, "actor_unresolved", op, -1, npcKey);
+            return;
+        }
+
+        // Resolve the TARGET to travel to: the player, a map marker / building door
+        // (by form id), or ANOTHER NPC named by dest_name.
+        TESObjectREFR* target = nullptr;
+        if (toPlayer)
+        {
+            target = GetPlayer();
+        }
+        if (!target && markerFormId != 0)
+        {
+            if (TESForm* form = LookupFormByID(markerFormId))
+            {
+                target = DYNAMIC_CAST(form, TESForm, TESObjectREFR);
+            }
+        }
+        if (!target && !markerName.empty())
+        {
+            target = FindMapMarkerByName(markerName); // a place
+            if (!target)
+            {
+                // … else another NPC by that name (travel TO someone).
+                if (const auto snap = ResolveSpeakerSnapshotForNpc(markerName, markerName); snap.has_value())
+                {
+                    target = ResolveSpeakerRef(*snap);
+                }
+            }
+        }
+
+        const ULONGLONG nowMs = GetTickCount64();
+        TravelerStatus& status = g_travelers[npcKey];
+        std::string stepError;
+        bool ok = false;
+        if (!target)
+        {
+            stepError = "destination_unresolved";
+        }
+        else if (status.lastWalkIssueMs == 0 || nowMs - status.lastWalkIssueMs > 10000)
+        {
+            // (Re)apply the travel package — throttled so the engine keeps a stable
+            // path rather than re-planning every tick. The engine handles the rest:
+            // pathing, load doors in/out of buildings, overriding their routine.
+            ok = TravelViaPackage(ref, target);
+            if (ok)
+            {
+                status.lastWalkIssueMs = nowMs;
+            }
+            else
+            {
+                stepError = "travel_failed";
+            }
+        }
+        else
+        {
+            ok = true; // package already applied, still travelling
+        }
+
+        // Report live status back to chasm (heartbeat `travelers`): position + whether
+        // they've reached the target (the plugin measures arrival — chasm can't, for a
+        // moving target).
+        bool arrived = false;
+        if (target)
+        {
+            const double arriveUnits = static_cast<double>(6.0f * kGameUnitsPerMeter);
+            arrived = DistanceSquared3D(ref, target) < (arriveUnits * arriveUnits);
+        }
+        status.loaded = IsActorRenderLoaded(ref);
+        status.arrived = arrived;
+        status.x = ref->posX;
+        status.y = ref->posY;
+        status.z = ref->posZ;
+        status.updatedMs = nowMs;
+
+        WriteCompanionAck(requestId, ok, stepError, op, -1, npcKey);
+        if (!ok)
+        {
+            LogLine("movement: travel_step failed for npc_key='%s' (%s).", npcKey.c_str(), stepError.c_str());
         }
         return;
     }

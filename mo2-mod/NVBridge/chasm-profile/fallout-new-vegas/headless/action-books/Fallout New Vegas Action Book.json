@@ -5955,6 +5955,137 @@
                 "play wave gesture",
                 "perform wave gesture"
             ]
+        },
+        "630": {
+            "keysecondary": [
+                "at",
+                "location",
+                "place",
+                "saloon",
+                "bar",
+                "town",
+                "there",
+                "outside",
+                "inside",
+                "here"
+            ],
+            "constant": false,
+            "vectorized": true,
+            "selective": false,
+            "selectiveLogic": 0,
+            "addMemo": false,
+            "position": 0,
+            "disable": false,
+            "ignoreBudget": false,
+            "excludeRecursion": false,
+            "preventRecursion": false,
+            "matchPersonaDescription": false,
+            "matchCharacterDescription": false,
+            "matchCharacterPersonality": false,
+            "matchCharacterDepthPrompt": false,
+            "matchScenario": false,
+            "matchCreatorNotes": false,
+            "delayUntilRecursion": 0,
+            "probability": 100,
+            "useProbability": true,
+            "depth": 4,
+            "group": "",
+            "groupOverride": false,
+            "groupWeight": 100,
+            "scanDepth": null,
+            "caseSensitive": null,
+            "matchWholeWords": null,
+            "useGroupScoring": null,
+            "automationId": "",
+            "role": 0,
+            "sticky": null,
+            "cooldown": null,
+            "delay": null,
+            "triggers": [],
+            "riskTier": "low",
+            "targetGame": "fallout-new-vegas",
+            "pluginSource": "chasm scheduler",
+            "preconditions": [
+                "the player named a place to go"
+            ],
+            "effects": [
+                "you travel to that place (at the given time, if one was named)"
+            ],
+            "commandTemplate": "",
+            "examplesWhenToUse": [
+                "'Go to the Prospector Saloon.'",
+                "'Travel to Novac at dawn.'",
+                "'Head to Doc Mitchell's house and wait for me there.'"
+            ],
+            "examplesWhenNotToUse": [
+                "The player wants you to follow them around (use follow).",
+                "No place was named."
+            ],
+            "scopes": [
+                "global",
+                "game:fallout-new-vegas"
+            ],
+            "tags": [
+                "scheduler",
+                "movement",
+                "native-supported"
+            ],
+            "include": [],
+            "exclude": [],
+            "sourceLinks": [],
+            "extensions": {},
+            "execution": {},
+            "scopedCatalogs": [],
+            "binding": {},
+            "vectorSearchTexts": [
+                "go to the prospector saloon",
+                "travel to novac",
+                "head to doc mitchells house",
+                "walk over to the gas station",
+                "make your way to goodsprings",
+                "go wait at the saloon"
+            ],
+            "uid": 630,
+            "key": [
+                "travel to",
+                "go to",
+                "head to",
+                "walk to",
+                "make your way to",
+                "head over to",
+                "go over to",
+                "travel",
+                "walk over to",
+                "meet me",
+                "meet me at",
+                "meet you at",
+                "meet up at",
+                "meet",
+                "come to",
+                "come by",
+                "come over to",
+                "come find me",
+                "see you at",
+                "be at",
+                "wait at",
+                "wait for me at",
+                "waiting for you at",
+                "swing by",
+                "get to",
+                "move to",
+                "rendezvous",
+                "rendezvous at"
+            ],
+            "comment": "Travel to a place",
+            "content": "Travel to a named place, or to the player. In the call, put the destination in to=\"<place>\" - prefer an exact name from the \"Nearby places you can travel to\" list. Add at=\"<clock time>\" to go there later instead of now. Use to=\"me\" to come to the player.",
+            "order": 233,
+            "actionId": "movement.travel_to_location",
+            "alias": "travel",
+            "parametersSchema": {
+                "destination": "string: the place to travel to (a named location on the map)",
+                "when": "string (optional): a natural in-game time like '1am', 'tonight', 'in an hour'"
+            },
+            "vectorizableText": "travel go to a named place location town saloon and move there"
         }
     },
     "settings": {
