@@ -886,6 +886,19 @@ struct TravelerStatus
     // Last time we (re)issued the walk package; throttled so we don't reset the
     // actor's path every tick (which would stutter the animation).
     ULONGLONG lastWalkIssueMs = 0;
+    // Whether the NPC is currently inside a building (interior cell). The chasm
+    // movement engine reads this: while inside, it has the plugin step them out the
+    // front door; once outside, it simulates the walk (offscreen) or hands off to
+    // the live package (loaded).
+    bool interior = false;
+    // The id of the journey this status is FOR. Chasm scopes `arrived` to it so a
+    // brand-new journey never reads a leftover `arrived=true` from the last trip
+    // (which would mark it done instantly). Reset clears `arrived` on a new id.
+    std::string journeyId;
+    // The display name of the building the NPC is currently INSIDE ("" when outside).
+    // Chasm compares it to the destination to tell "inside the saloon" = arrived from
+    // "inside his own shop" = still needs to leave.
+    std::string building;
 };
 std::map<std::string, TravelerStatus> g_travelers;
 
@@ -3521,6 +3534,9 @@ void WriteRuntimeHeartbeatIfNeeded(bool force)
             payload << "    " << JsonEscape(kv.first) << ": {"
                 << "\"loaded\": " << (kv.second.loaded ? "true" : "false")
                 << ", \"arrived\": " << (kv.second.arrived ? "true" : "false")
+                << ", \"interior\": " << (kv.second.interior ? "true" : "false")
+                << ", \"journey_id\": " << JsonEscape(kv.second.journeyId)
+                << ", \"building\": " << JsonEscape(kv.second.building)
                 << ", \"pos_x\": " << std::fixed << std::setprecision(2) << kv.second.x
                 << ", \"pos_y\": " << kv.second.y
                 << ", \"pos_z\": " << kv.second.z << "}"
@@ -17582,6 +17598,36 @@ bool TravelViaPackage(TESObjectREFR* npc, TESObjectREFR* target)
     return AddActorScriptPackage(npc, pkg, "aaChasmTravel", "movement_travel_package");
 }
 
+// Send an NPC out the front door of the building they're in: find the exterior door
+// of their current interior cell (from the door-link manifest g_buildingEntrances,
+// keyed by the building's display name) and MoveTo it. This is the ONLY thing we do
+// for an indoor start — no interior pathing, no AI inside; they "appear at the door"
+// and the chasm engine walks/simulates them from there. Returns false when there's
+// no mapped door for the cell (then the caller leaves them put).
+bool StepOutFrontDoor(TESObjectREFR* actorRef)
+{
+    if (!actorRef || !actorRef->parentCell || !actorRef->parentCell->IsInterior())
+    {
+        return false;
+    }
+    const std::string cellName = ToLowerAscii(InteriorBuildingName(actorRef->parentCell));
+    const auto it = g_buildingEntrances.find(cellName);
+    if (it == g_buildingEntrances.end() || it->second.formId == 0)
+    {
+        LogLine("movement: no mapped front door for '%s'; cannot step %08X out.", cellName.c_str(), actorRef->refID);
+        return false;
+    }
+    TESForm* doorForm = LookupFormByID(it->second.formId);
+    TESObjectREFR* frontDoor = doorForm ? DYNAMIC_CAST(doorForm, TESForm, TESObjectREFR) : nullptr;
+    if (!frontDoor || !MoveRefToOffset(actorRef, frontDoor, 0.0f, 0.0f, 0.0f))
+    {
+        LogLine("movement: front door for '%s' unresolved; %08X stays put.", cellName.c_str(), actorRef->refID);
+        return false;
+    }
+    LogLine("movement: stepped %08X out the front door of '%s'.", actorRef->refID, cellName.c_str());
+    return true;
+}
+
 bool CompanionMoveToHold(TESObjectREFR* actorRef)
 {
     if (!actorRef || !EnsureCompanionDespawnScript())
@@ -18551,6 +18597,7 @@ void HandleCompanionCommand(const fs::path& path)
         const std::string markerName = decodeText("dest_name_base64");
         const UInt32 markerFormId =
             static_cast<UInt32>(strtoul(GetField(fields, "dest_form_id").c_str(), nullptr, 10));
+        const bool toPlayer = atoi(GetField(fields, "to_player").c_str()) != 0;
         const float x = static_cast<float>(atof(GetField(fields, "x").c_str()));
         const float y = static_cast<float>(atof(GetField(fields, "y").c_str()));
         const float z = static_cast<float>(atof(GetField(fields, "z").c_str()));
@@ -18573,7 +18620,24 @@ void HandleCompanionCommand(const fs::path& path)
         }
 
         std::string moveError;
-        const bool moved = MoveRefToWorldPos(ref, markerFormId, markerName, x, y, z, moveError);
+        bool moved = false;
+        if (toPlayer)
+        {
+            // Off-screen sim toward a MOVING target (the player): anchor the MoveTo on
+            // the player ref (worldspace-safe) and place at absolute (x,y,z).
+            TESObjectREFR* player = GetPlayer();
+            if (!ref) { moveError = "actor_unresolved"; }
+            else if (!player) { moveError = "player_unresolved"; }
+            else
+            {
+                moved = MoveRefToOffset(ref, player, x - player->posX, y - player->posY, z - player->posZ);
+                if (!moved) { moveError = "move_failed"; }
+            }
+        }
+        else
+        {
+            moved = MoveRefToWorldPos(ref, markerFormId, markerName, x, y, z, moveError);
+        }
         WriteCompanionAck(requestId, moved, moveError, op, -1, npcKey);
         if (!moved)
         {
@@ -18649,43 +18713,102 @@ void HandleCompanionCommand(const fs::path& path)
 
         const ULONGLONG nowMs = GetTickCount64();
         TravelerStatus& status = g_travelers[npcKey];
+
+        // `hold`=1 means "keep them where they are" (chasm's linger-at-destination):
+        // re-apply the travel package but DON'T step them out the front door.
+        const bool hold = atoi(GetField(fields, "hold").c_str()) != 0;
+
+        // Scope arrival to THIS journey: a new journey_id clears the previous trip's
+        // `arrived` (and throttle) so chasm never reads a stale "arrived=true".
+        const std::string journeyId = Trim(GetField(fields, "journey_id"));
+        if (!journeyId.empty() && journeyId != status.journeyId)
+        {
+            status.journeyId = journeyId;
+            status.arrived = false;
+            status.lastWalkIssueMs = 0;
+        }
+
         std::string stepError;
         bool ok = false;
         if (!target)
         {
             stepError = "destination_unresolved";
         }
-        else if (status.lastWalkIssueMs == 0 || nowMs - status.lastWalkIssueMs > 10000)
+        else
         {
-            // (Re)apply the travel package — throttled so the engine keeps a stable
-            // path rather than re-planning every tick. The engine handles the rest:
-            // pathing, load doors in/out of buildings, overriding their routine.
-            ok = TravelViaPackage(ref, target);
-            if (ok)
+            TESObjectREFR* player = GetPlayer();
+            const bool npcInterior = ref->parentCell && ref->parentCell->IsInterior();
+            const bool playerSameCell = player && ref->parentCell == player->parentCell;
+            if (!hold && npcInterior && !playerSameCell)
             {
-                status.lastWalkIssueMs = nowMs;
+                // Indoors and unwatched: don't path them around inside — just step them
+                // out the front door. THROTTLE the physical step-out (~6s): a vendor's
+                // sandbox that keeps pulling them back in would otherwise cause visible
+                // in/out spam every tick. Between step-outs we still re-assert the travel
+                // package so it can win and carry them off to the destination.
+                const bool stepDue = status.lastWalkIssueMs == 0 || nowMs - status.lastWalkIssueMs > 6000;
+                if (stepDue)
+                {
+                    StepOutFrontDoor(ref); // logs its own success/failure
+                    // The moment they're outside, apply the AlwaysRun travel package so
+                    // their AI becomes "go to the destination", not "go back to my store".
+                    ok = TravelViaPackage(ref, target);
+                    status.lastWalkIssueMs = nowMs;
+                    stepError = ok ? "" : "travel_failed";
+                }
+                else
+                {
+                    ok = true; // recently stepped out — give the package time to take hold
+                }
+            }
+            else if (status.lastWalkIssueMs == 0 || nowMs - status.lastWalkIssueMs > 10000)
+            {
+                // Loaded, or indoors WITH the player watching: the engine walks them for
+                // real (to the door, through it, over to the target). Throttled so the
+                // path stays stable rather than re-planning every tick.
+                ok = TravelViaPackage(ref, target);
+                if (ok) { status.lastWalkIssueMs = nowMs; }
+                else { stepError = "travel_failed"; }
             }
             else
             {
-                stepError = "travel_failed";
+                ok = true; // package already applied, still travelling
             }
         }
-        else
-        {
-            ok = true; // package already applied, still travelling
-        }
 
-        // Report live status back to chasm (heartbeat `travelers`): position + whether
-        // they've reached the target (the plugin measures arrival — chasm can't, for a
-        // moving target).
-        bool arrived = false;
+        // Arrival, LATCHED for this journey: once they reach the destination it STAYS
+        // arrived even if their AI bolts them back out a frame later (a brief in-and-out
+        // still counts) — and the slower-sampling backend can't miss it. We use a
+        // generous approach radius (not a tight 6 m) so a travel_step lands while they're
+        // still walking up, plus a building-name match for "walked inside the saloon".
+        // (journey_id reset above clears the latch for a fresh trip.)
+        const bool npcInteriorNow = ref->parentCell && ref->parentCell->IsInterior();
+        bool reachedNow = false;
         if (target)
         {
-            const double arriveUnits = static_cast<double>(6.0f * kGameUnitsPerMeter);
-            arrived = DistanceSquared3D(ref, target) < (arriveUnits * arriveUnits);
+            const double r = static_cast<double>(12.0f * kGameUnitsPerMeter);
+            reachedNow = DistanceSquared3D(ref, target) < (r * r);
+        }
+        if (!reachedNow && npcInteriorNow && !toPlayer)
+        {
+            std::string b = ToLowerAscii(InteriorBuildingName(ref->parentCell));
+            std::string d = ToLowerAscii(markerName);
+            for (const std::string& pfx : { std::string("the "), std::string("inside "), std::string("outside ") })
+            {
+                if (d.rfind(pfx, 0) == 0) { d = d.substr(pfx.size()); break; }
+            }
+            if (!b.empty() && !d.empty() && (b.find(d) != std::string::npos || d.find(b) != std::string::npos))
+            {
+                reachedNow = true;
+            }
+        }
+        if (reachedNow)
+        {
+            status.arrived = true; // latch
         }
         status.loaded = IsActorRenderLoaded(ref);
-        status.arrived = arrived;
+        status.interior = npcInteriorNow;
+        status.building = npcInteriorNow ? InteriorBuildingName(ref->parentCell) : std::string();
         status.x = ref->posX;
         status.y = ref->posY;
         status.z = ref->posZ;
