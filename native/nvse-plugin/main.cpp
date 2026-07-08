@@ -895,11 +895,10 @@ void ResetLootStateOnLoad();
 void QueueWorldEvent(const std::string& npcKey, const std::string& npcName, const std::string& text);
 TESObjectREFR* ResolveAnyNpcRefByIdentity(const std::string& npcKey, const std::string& npcName);
 bool TriggerNpcLoot(const ResponsePayload& response);
-// The loot item-transfer helper (RemoveItem+AddItem UDF), defined with the loot
-// session code late in the file; the give_item world-query reuses it in reverse
-// (NPC -> player), so it needs to be visible earlier in HandleWorldQuery.
-extern Script* g_lootTransferScript;
-bool EnsureLootTransferScript();
+// GIVE errand: NPC walks to the player and hands over a carried item. Defined
+// with the loot session code (reuses its walk + transfer); forward-declared here
+// so the native-action dispatch can reach it.
+bool TriggerNpcGive(const ResponsePayload& response);
 void ShutdownDirectSound();
 void UpdateConversationHold();
 bool LootSessionSuppressesHold(UInt32 refId); // defined with the loot sessions
@@ -8291,6 +8290,16 @@ bool TriggerGameMasterAction(const ResponsePayload& response, std::string* outTr
     if (action == "LOOT")
     {
         const bool triggered = TriggerNpcLoot(response);
+        if (triggered && outTriggeredAction)
+        {
+            *outTriggeredAction = action;
+        }
+        return triggered;
+    }
+
+    if (action == "GIVE")
+    {
+        const bool triggered = TriggerNpcGive(response);
         if (triggered && outTriggeredAction)
         {
             *outTriggeredAction = action;
@@ -23729,47 +23738,6 @@ void HandleWorldQuery(const fs::path& path)
         return;
     }
 
-    if (op == "give_item")
-    {
-        // give_item step 2: hand the NPC's chosen carried item to the player.
-        // `target` is the exact item name he picked from his own inventory scan.
-        // No walking needed (it is already in his pack), so this rides the query
-        // channel and transfers immediately, mirroring the container take in
-        // reverse (RemoveItem from the NPC, AddItem to the player).
-        PlayerCharacter* player = GetPlayer();
-        const std::vector<LootInvItem> items = EnumerateContainerItems(npcRef);
-        const LootInvItem* match = nullptr;
-        for (const LootInvItem& item : items)
-        {
-            if (LootNamesEqual(item.name, target))
-            {
-                match = &item;
-                break;
-            }
-        }
-        if (!player || !match || !match->form)
-        {
-            WriteWorldQueryResult(requestId, true, op,
-                "You go to hand it over, but you are not carrying that.", "");
-            return;
-        }
-        // Hand over ONE (the player asked for "a" thing; he keeps the rest).
-        if (EnsureLootTransferScript()
-            && g_scriptInterface->CallFunctionAlt(g_lootTransferScript, npcRef, 4,
-                npcRef, player, match->form, 1))
-        {
-            LogLine("worldq: %s gave '%s' to the player.", npcName.c_str(), match->name.c_str());
-            WriteWorldQueryResult(requestId, true, op,
-                "You hand the " + match->name + " to the player.", "");
-        }
-        else
-        {
-            WriteWorldQueryResult(requestId, true, op,
-                "You couldn't hand over the " + match->name + ".", "");
-        }
-        return;
-    }
-
     WriteWorldQueryResult(requestId, false, op, "(unknown query)", "");
 }
 
@@ -23931,7 +23899,7 @@ int iCount
 
 Begin Function { rSrc, rDst, rItem, iCount }
     rSrc.RemoveItem rItem iCount 1
-    rDst.AddItem rItem iCount 1
+    rDst.AddItem rItem iCount 0
 End
 )";
     g_lootTransferScript = g_scriptInterface->CompileScript(kScript);
@@ -23940,6 +23908,37 @@ End
         LogLine("loot: failed to compile transfer helper.");
     }
     return g_lootTransferScript != nullptr;
+}
+
+// The vanilla give hand-over idle (LooseNPCGiving), played on the NPC when he
+// reaches the player - the engine's own "handing something over" motion. Fire-
+// and-forget; the transfer + "added" popup happen alongside it.
+Script* g_giveIdleScript = nullptr;
+bool EnsureGiveIdleScript()
+{
+    if (g_giveIdleScript)
+    {
+        return true;
+    }
+    if (!g_scriptInterface)
+    {
+        return false;
+    }
+    constexpr char kScript[] = R"(
+ref rActor
+
+Begin Function { rActor }
+    if rActor
+        rActor.PlayIdle LooseNPCGiving
+    endif
+End
+)";
+    g_giveIdleScript = g_scriptInterface->CompileScript(kScript);
+    if (!g_giveIdleScript)
+    {
+        LogLine("give: failed to compile hand-over idle helper.");
+    }
+    return g_giveIdleScript != nullptr;
 }
 
 // --- world-event turns --------------------------------------------------------
@@ -24279,6 +24278,78 @@ bool TriggerNpcLoot(const ResponsePayload& response)
     return true;
 }
 
+// Native action GIVE: hand a carried item to the player. Symmetric with LOOT -
+// no engine "give" package exists, so the proper mechanic is to APPROACH the
+// player with the same Travel package the loot walk uses, then transfer the
+// item (RemoveItem/AddItem, the vanilla GECK transfer) and report a world event.
+// One session at a time per NPC, exactly like loot.
+bool TriggerNpcGive(const ResponsePayload& response)
+{
+    const std::string npcKey = !response.actionNpcKey.empty() ? response.actionNpcKey : response.npcKey;
+    const std::string npcName = !response.actionNpcName.empty() ? response.actionNpcName : response.npcName;
+    TESObjectREFR* npcRef = ResolveAnyNpcRefByIdentity(npcKey, npcName);
+    PlayerCharacter* player = GetPlayer();
+    if (!npcRef || !player)
+    {
+        LogLine("give: unresolved npc/player for key='%s' name='%s'.", npcKey.c_str(), npcName.c_str());
+        return false;
+    }
+    const std::string displayName = npcName.empty() ? GetDisplayNameSafe(npcRef) : npcName;
+    const std::string itemName = Trim(response.lootItems);
+
+    // Verify he actually carries it (the grammar pins the pick to his inventory
+    // scan, but a stale pick / non-enum path could name something he lacks).
+    const std::vector<LootInvItem> inv = EnumerateContainerItems(npcRef);
+    const LootInvItem* match = nullptr;
+    for (const LootInvItem& it : inv)
+    {
+        if (LootNamesEqual(it.name, itemName))
+        {
+            match = &it;
+            break;
+        }
+    }
+    if (!match)
+    {
+        QueueWorldEvent(npcKey, displayName,
+            "[You went to hand it over, but you weren't carrying that.]");
+        return true;
+    }
+
+    LootSession session;
+    session.requestId = response.requestId;
+    session.npcKey = npcKey;
+    session.npcName = displayName;
+    session.npcRefId = npcRef->refID;
+    // target = the PLAYER (a persistent ref); the exact carried item rides `name`.
+    session.target = { player->refID, match->name, "give" };
+    session.targetStartTick = GetTickCount();
+    session.progressTick = GetTickCount();
+
+    // One interaction at a time: a new order replaces whatever walk is running.
+    for (auto it = g_lootSessions.begin(); it != g_lootSessions.end();)
+    {
+        if (it->npcRefId == session.npcRefId)
+        {
+            it = g_lootSessions.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+    // Release a pre-engaged conversation hold so the walk isn't frozen (the exact
+    // fix the loot walk needed - suppression alone doesn't free an active hold).
+    if (g_state.conversationHold.active
+        && g_state.conversationHold.speaker.refId == session.npcRefId)
+    {
+        ReleaseConversationHold("give_walk");
+    }
+    LogLine("give: '%s' -> hand '%s' to the player.", session.npcName.c_str(), match->name.c_str());
+    g_lootSessions.push_back(std::move(session));
+    return true;
+}
+
 void FinishLootSession(LootSession& session, TESObjectREFR* npcRef)
 {
     if (npcRef)
@@ -24392,6 +24463,73 @@ void UpdateLootSessions()
                 continue;
             }
             ++index;
+            continue;
+        }
+
+        // GIVE: hand a carried item to the player. Walk to the player with the same
+        // Travel package the loot walk uses (there is no engine "give" package), then
+        // transfer the named item NPC -> player and report it. The player is usually
+        // right there (conversation) so LootWalkTo returns in-reach immediately and
+        // the hand-over is instant; only a distant NPC actually walks.
+        if (session.target.kind == "give")
+        {
+            PlayerCharacter* player = GetPlayer();
+            if (!player)
+            {
+                FinishLootSession(session, npcRef);
+                g_lootSessions.erase(g_lootSessions.begin() + index);
+                continue;
+            }
+            bool gaveUp = false;
+            if (!LootWalkTo(session, npcRef, player, "the player", now, gaveUp))
+            {
+                if (gaveUp)
+                {
+                    WriteWorldRecord(session.npcKey, session.npcName,
+                        "[You couldn't reach the player to hand over the " + session.target.name + ".]");
+                    FinishLootSession(session, npcRef);
+                    g_lootSessions.erase(g_lootSessions.begin() + index);
+                    continue;
+                }
+                ++index;
+                continue;
+            }
+            // In reach: face the player, play the vanilla hand-over idle, and hand
+            // it over - re-resolving the item now (he may have used/dropped it while
+            // walking). The transfer's AddItem (bHideMessage=0) shows the vanilla
+            // "<item> added" popup, so the give reads like a natural hand-off.
+            if (g_faceObjectScript)
+            {
+                g_scriptInterface->CallFunctionAlt(g_faceObjectScript, npcRef, 2, npcRef, player);
+            }
+            if (EnsureGiveIdleScript())
+            {
+                g_scriptInterface->CallFunctionAlt(g_giveIdleScript, npcRef, 1, npcRef);
+            }
+            const std::vector<LootInvItem> inv = EnumerateContainerItems(npcRef);
+            const LootInvItem* match = nullptr;
+            for (const LootInvItem& it : inv)
+            {
+                if (LootNamesEqual(it.name, session.target.name))
+                {
+                    match = &it;
+                    break;
+                }
+            }
+            if (match && match->form && EnsureLootTransferScript()
+                && g_scriptInterface->CallFunctionAlt(g_lootTransferScript, npcRef, 4,
+                    npcRef, player, match->form, 1))
+            {
+                QueueWorldEvent(session.npcKey, session.npcName,
+                    "[You handed the " + session.target.name + " to the player.]");
+            }
+            else
+            {
+                QueueWorldEvent(session.npcKey, session.npcName,
+                    "[You went to hand over the " + session.target.name + ", but you no longer had it.]");
+            }
+            FinishLootSession(session, npcRef);
+            g_lootSessions.erase(g_lootSessions.begin() + index);
             continue;
         }
 
