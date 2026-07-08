@@ -200,6 +200,14 @@ struct ResponsePayload
     std::vector<std::string> executionArguments;
     double gameMasterConfidence = 0.0;
     bool gameMasterShouldTrigger = false;
+    // LOOT native action: the WHOLE errand as (mode, value) stops - mode
+    // "container" with an exact container/body name, or mode "items" with
+    // exact item names. One command = one trip. The legacy single-target
+    // fields remain parsed for command bodies persisted by older builds.
+    std::vector<std::pair<std::string, std::string>> lootPlan;
+    std::string lootMode;
+    std::string lootTarget;
+    std::string lootItems;
 };
 
 enum class TrustedExecutionArgumentType
@@ -641,6 +649,15 @@ Script* g_openTextInputScript = nullptr;
 Script* g_closeTextInputScript = nullptr;
 Script* g_startCombatScript = nullptr;
 Script* g_setPlayerTeammateScript = nullptr;
+Script* g_setAggressionScript = nullptr;
+Script* g_getTeammateScript = nullptr;
+Script* g_getDispositionScript = nullptr;
+Script* g_setConfidenceScript = nullptr;
+Script* g_argProbeScript = nullptr;
+Script* g_pinCombatScript = nullptr;
+Script* g_unpinCombatScript = nullptr;
+Script* g_addFactionScript = nullptr;   // {rActor, rFaction} -> AddToFaction
+Script* g_remFactionScript = nullptr;   // {rActor, rFaction} -> RemoveFromFaction
 Script* g_startConversationScript = nullptr;
 Script* g_startLookScript = nullptr;
 Script* g_stopLookScript = nullptr;
@@ -859,8 +876,22 @@ void UpdateSpeechAnimation();
 void StopStreamingVoice(const char* reason);
 void UpdateStreamingVoice();
 void DrainChunksToStreamingVoice();
+// World loot engine (defined near the loot session code late in the file).
+void PollWorldQueries();
+void UpdateLootSessions();
+void ResetLootStateOnLoad();
+void QueueWorldEvent(const std::string& npcKey, const std::string& npcName, const std::string& text);
+TESObjectREFR* ResolveAnyNpcRefByIdentity(const std::string& npcKey, const std::string& npcName);
+bool TriggerNpcLoot(const ResponsePayload& response);
+// The loot item-transfer helper (RemoveItem+AddItem UDF), defined with the loot
+// session code late in the file; the give_item world-query reuses it in reverse
+// (NPC -> player), so it needs to be visible earlier in HandleWorldQuery.
+extern Script* g_lootTransferScript;
+bool EnsureLootTransferScript();
 void ShutdownDirectSound();
 void UpdateConversationHold();
+bool LootSessionSuppressesHold(UInt32 refId); // defined with the loot sessions
+void UpdateCombatDrive();
 void ReleaseConversationHold(const char* reason);
 void UpdateVoiceBootstrapStatus();
 void UpdateVoiceCaptureHotkey();
@@ -1722,6 +1753,7 @@ void EnsureBridgeDirectories()
     fs::create_directories(UserFunctionDir());
     fs::create_directories(ScriptRunnerDir());
     fs::create_directories(BridgeDir() / "control" / "companions" / "acks");
+    fs::create_directories(BridgeDir() / "control" / "queries" / "results");
     fs::create_directories(BridgeDir() / "companions");
 }
 
@@ -1995,6 +2027,236 @@ End
     }
 
     return true;
+}
+
+bool EnsureSetAggressionScript()
+{
+    if (g_setAggressionScript)
+    {
+        return true;
+    }
+
+    if (!g_scriptInterface)
+    {
+        LogLine("Script interface unavailable; cannot adjust NPC aggression.");
+        return false;
+    }
+
+    constexpr char kSetAggressionScript[] = R"(
+ref rActor
+int iLevel
+float fIssued
+
+Begin Function { rActor, iLevel }
+    let fIssued := 0
+    if rActor
+        rActor.SetAV Aggression iLevel
+        let fIssued := 1
+    endif
+    SetFunctionValue fIssued
+End
+)";
+
+    g_setAggressionScript = g_scriptInterface->CompileScript(kSetAggressionScript);
+    if (!g_setAggressionScript)
+    {
+        LogLine("Failed to compile SetAggression helper script.");
+        return false;
+    }
+
+    return true;
+}
+
+bool EnsureGetTeammateScript()
+{
+    if (g_getTeammateScript)
+    {
+        return true;
+    }
+
+    if (!g_scriptInterface)
+    {
+        LogLine("Script interface unavailable; cannot read NPC teammate state.");
+        return false;
+    }
+
+    constexpr char kGetTeammateScript[] = R"(
+ref rActor
+float fVal
+
+Begin Function { rActor }
+    let fVal := 0
+    if rActor
+        let fVal := rActor.GetPlayerTeammate
+    endif
+    SetFunctionValue fVal
+End
+)";
+
+    g_getTeammateScript = g_scriptInterface->CompileScript(kGetTeammateScript);
+    if (!g_getTeammateScript)
+    {
+        LogLine("Failed to compile GetPlayerTeammate helper script.");
+        return false;
+    }
+
+    return true;
+}
+
+// JIP LN's SetCombatDisabled hook (written for JIP CCC's Attack Target order):
+// with flag 1 + a target, the engine's combat-target-selection path ALWAYS
+// returns that target while the actor is in combat with it — the retarget
+// re-evaluation that kept dissolving our ordered fights is overridden at
+// engine level. Compiles only when JIP LN is present; failure falls back to
+// the re-assert loop.
+bool EnsurePinCombatScripts()
+{
+    if (g_pinCombatScript && g_unpinCombatScript)
+    {
+        return true;
+    }
+    if (!g_scriptInterface)
+    {
+        return false;
+    }
+    constexpr char kPinScript[] = R"(
+ref rActor
+ref rTarget
+float fIssued
+
+Begin Function { rActor, rTarget }
+    let fIssued := 0
+    if rActor && rTarget
+        rActor.SetCombatDisabled 1 rTarget
+        let fIssued := 1
+    endif
+    SetFunctionValue fIssued
+End
+)";
+    constexpr char kUnpinScript[] = R"(
+ref rActor
+float fIssued
+
+Begin Function { rActor }
+    let fIssued := 0
+    if rActor
+        rActor.SetCombatDisabled 0
+        let fIssued := 1
+    endif
+    SetFunctionValue fIssued
+End
+)";
+    if (!g_pinCombatScript)
+    {
+        g_pinCombatScript = g_scriptInterface->CompileScript(kPinScript);
+    }
+    if (!g_unpinCombatScript)
+    {
+        g_unpinCombatScript = g_scriptInterface->CompileScript(kUnpinScript);
+    }
+    if (!g_pinCombatScript || !g_unpinCombatScript)
+    {
+        LogLine("Combat drive: SetCombatDisabled helper failed to compile (JIP LN missing/old?) - using re-assert fallback.");
+        return false;
+    }
+    return true;
+}
+
+bool EnsureArgProbeScript()
+{
+    if (g_argProbeScript)
+    {
+        return true;
+    }
+    if (!g_scriptInterface)
+    {
+        return false;
+    }
+    // Diagnostic: reports the distance between the two REF args AS THE SCRIPT
+    // RECEIVES them. 0 => both bound to the same actor (StartCombat on self =
+    // instant self-cancel, immune to every AI lever); -1 => a null binding.
+    constexpr char kArgProbeScript[] = R"(
+ref rActor
+ref rTarget
+float fVal
+
+Begin Function { rActor, rTarget }
+    let fVal := -1
+    if rActor && rTarget
+        let fVal := rActor.GetDistance rTarget
+    endif
+    SetFunctionValue fVal
+End
+)";
+    g_argProbeScript = g_scriptInterface->CompileScript(kArgProbeScript);
+    if (!g_argProbeScript)
+    {
+        LogLine("Failed to compile arg-probe helper script.");
+    }
+    return g_argProbeScript != nullptr;
+}
+
+bool EnsureSetConfidenceScript()
+{
+    if (g_setConfidenceScript)
+    {
+        return true;
+    }
+    if (!g_scriptInterface)
+    {
+        return false;
+    }
+    constexpr char kSetConfidenceScript[] = R"(
+ref rActor
+int iLevel
+float fIssued
+
+Begin Function { rActor, iLevel }
+    let fIssued := 0
+    if rActor
+        rActor.SetAV Confidence iLevel
+        let fIssued := 1
+    endif
+    SetFunctionValue fIssued
+End
+)";
+    g_setConfidenceScript = g_scriptInterface->CompileScript(kSetConfidenceScript);
+    if (!g_setConfidenceScript)
+    {
+        LogLine("Failed to compile SetConfidence helper script.");
+    }
+    return g_setConfidenceScript != nullptr;
+}
+
+bool EnsureGetDispositionScript()
+{
+    if (g_getDispositionScript)
+    {
+        return true;
+    }
+    if (!g_scriptInterface)
+    {
+        return false;
+    }
+    constexpr char kGetDispositionScript[] = R"(
+ref rActor
+ref rTarget
+float fVal
+
+Begin Function { rActor, rTarget }
+    let fVal := -1
+    if rActor && rTarget
+        let fVal := rActor.GetDisposition rTarget
+    endif
+    SetFunctionValue fVal
+End
+)";
+    g_getDispositionScript = g_scriptInterface->CompileScript(kGetDispositionScript);
+    if (!g_getDispositionScript)
+    {
+        LogLine("Failed to compile GetDisposition helper script.");
+    }
+    return g_getDispositionScript != nullptr;
 }
 
 bool EnsurePlayerTeammateScript()
@@ -5731,6 +5993,20 @@ std::unordered_map<UInt32, CombatEdge> g_combatEdges;  // actor refID -> current
 // onstartcombat re-firing throughout a real fight -- so when the engine says the
 // fight is over, we read peaceful immediately.
 
+// Combat drive (defined below, used by the handlers): restores a chasm-bumped
+// Aggression when the engine reports the fight over.
+void RestoreCombatDriveAggression(UInt32 refId, const char* reason);
+void RestoreCombatDriveAggressionOnly(UInt32 refId, const char* reason);
+bool DriveCombatFactions(TESObjectREFR* attackerRef, TESObjectREFR* targetRef);
+void RestoreCombatFactions(UInt32 refId, const char* reason);
+void CleanCombatFactionLedger(const char* reason);
+void DriveCombatAggression(TESObjectREFR* actorRef, const std::string& npcName, int level);
+void RecordCombatDriveIntent(TESObjectREFR* actorRef, TESObjectREFR* targetRef);
+void ClearCombatDriveIntent(UInt32 refId);
+bool AddActorScriptPackage(TESObjectREFR* actorRef, TESForm* packageForm, const char* packageEditorId, const char* traceStage);
+void RestoreAllCombatDriveAggression(const char* reason);
+TESForm* ResolveDefaultFollowPackage();
+
 // NVSE native event handler signature is void(TESObjectREFR* thisObj, void* params).
 // For game events thisObj is null and params = { source, object } (verified against
 // EventManager.cpp): source[0] is the actor entering combat, object[1] its target.
@@ -5751,6 +6027,15 @@ void CombatAlertOnStartCombat(TESObjectREFR*, void* parameters)
     edge.targetRefId = target ? target->refID : 0;
     edge.targetName = target ? GetDisplayNameSafe(target) : std::string();
     edge.startTick = GetTickCount();
+    // A DRIVEN actor's fight just got engine-committed: DO NOT de-escalate.
+    // Aggression 2 will not sustain a fight against a FRIEND (Chet/Pete rate as
+    // friends by disposition) - confirmed live, every de-escalate-to-2 was
+    // followed by oncombatend the same second, producing the in/out flicker.
+    // Frenzy (3) is held for the whole fight; the JIP target pin
+    // (SetCombatDisabled) keeps the frenzied actor locked on the ordered victim
+    // so it no longer wanders. Original aggression restores at genuine combat
+    // end. Just retire the retry intent now that combat is committed.
+    ClearCombatDriveIntent(actor->refID);
     LogLine("Combat event: onstartcombat '%s' -> '%s'.",
         GetDisplayNameSafe(actor).c_str(),
         edge.targetName.empty() ? "?" : edge.targetName.c_str());
@@ -5772,6 +6057,8 @@ void CombatAlertOnCombatEnd(TESObjectREFR*, void* parameters)
     {
         LogLine("Combat event: oncombatend '%s'.", GetDisplayNameSafe(actor).c_str());
     }
+    // The engine says this actor's fight is over — hand back its real Aggression.
+    RestoreCombatDriveAggression(actor->refID, "oncombatend");
 }
 
 // Registers the combat event handlers once the event manager is available.
@@ -5808,6 +6095,816 @@ bool HasCombatEdge(UInt32 refId, UInt32* outTargetRefId, std::string* outTargetN
     return true;
 }
 
+// --- Combat drive: make chasm-ordered combat STICK ---------------------------
+// StartCombat on a player teammate against a FRIENDLY NPC is dropped by the
+// combat controller on its next evaluate (observed live: "chamzy executed
+// combat.start" then oncombatend within the same second, and no combat edge
+// was ever recorded): the actor's Aggression forbids attacking a non-enemy.
+// For a chasm-ordered combat.start we temporarily raise Aggression to 2
+// (very aggressive: attacks neutrals — deliberately NOT 3/frenzied, which
+// would include the player), remember the original, and restore it when the
+// engine reports the fight over (oncombatend) or combat tracking resets
+// (load / new game). Caveat: a save written mid-fight persists the elevated
+// value if the session dies before restore — restored again the next time a
+// chasm-ordered fight involving that actor ends.
+std::unordered_map<UInt32, int> g_combatDriveAggro; // actor refID -> original Aggression
+// Tick at which each actor was (re)driven. oncombatend is delivered ASYNC and a
+// STALE end from the initial one-sided attempt lands AFTER the reciprocal fight
+// engages — observed live: full restore (aggression 1, teammate+Defensive
+// Combat back ON) fired between the reciprocal call and the real onstartcombat,
+// so the fight collapsed ~1s in. Restores are ignored inside this grace window;
+// a watchdog re-checks after it expires so nothing sticks.
+constexpr DWORD kCombatDriveGraceMs = 6000;
+std::unordered_map<UInt32, DWORD> g_combatDriveTick;
+// Conversation-hold suppression for a freshly ordered fight: the reply audio is
+// usually still playing when combat.start executes, and the playback tick would
+// re-engage the hold (script package + look lock) on the very next frame -
+// stomping the combat state before IsInCombat ever reads true.
+UInt32 g_combatDriveHoldSuppressRefId = 0;
+DWORD g_combatDriveHoldSuppressUntil = 0;
+// The ordered opponent per driven actor. Until the engine COMMITS (that
+// actor's onstartcombat), the watchdog re-asserts StartCombat at this target
+// every ~600ms - which both retries a cancelled initiation and yanks a
+// frenzy-wandering actor back onto the intended victim (observed: attacker
+// briefly chased an unrelated actor out the door pre-commitment).
+struct CombatDriveIntent
+{
+    UInt32 targetRefId = 0;
+    DWORD lastAssertTick = 0;
+};
+std::unordered_map<UInt32, CombatDriveIntent> g_combatDriveIntent;
+// Attackers whose FOLLOW script package we removed for the fight: the scripted
+// stay-near-the-player objective competes with combat every AI tick even with
+// Defensive Combat cleared (observed: repeated engage/cancel flicker that only
+// sometimes ended in a committed fight). Re-added on restore.
+std::unordered_set<UInt32> g_combatDriveFollowRemoved;
+// Actors whose combat target is pinned via JIP SetCombatDisabled (unpinned on
+// restore; SetCombatDisabled 0 also issues StopCombat, which is what a genuine
+// combat-end/stand-down wants anyway).
+std::unordered_set<UInt32> g_combatDrivePinned;
+
+// The conversation hold must stay OFF an ordered fighter for the WHOLE drive
+// lifetime, not a fixed 5s: the kill order's spoken reply often outlasts the
+// old window, and the playback loop then re-engaged the hold every frame —
+// its package stomped each freshly committed fight (observed: fights died ~1s
+// after every onstartcombat once the reply ran long; short-reply fights
+// worked). Active = initial suppress window OR still in the grace/tick map OR
+// combat-target still pinned (covers the sustained fight until restore).
+bool CombatDriveSuppressesHold(UInt32 refId)
+{
+    if (refId == 0)
+    {
+        return false;
+    }
+    if (g_combatDriveHoldSuppressRefId == refId
+        && GetTickCount() < g_combatDriveHoldSuppressUntil)
+    {
+        return true;
+    }
+    return g_combatDriveTick.count(refId) > 0 || g_combatDrivePinned.count(refId) > 0;
+}
+
+void PinCombatDriveTarget(TESObjectREFR* actorRef, TESObjectREFR* targetRef)
+{
+    if (!actorRef || !targetRef || !EnsurePinCombatScripts())
+    {
+        return;
+    }
+    NVSEArrayVarInterface::Element result;
+    const bool ok = g_scriptInterface->CallFunction(
+        g_pinCombatScript, actorRef, nullptr, &result, 2, actorRef, targetRef);
+    if (ok && result.GetType() == NVSEArrayVarInterface::Element::kType_Numeric
+        && result.GetNumber() != 0.0)
+    {
+        g_combatDrivePinned.insert(actorRef->refID);
+        LogLine("Combat drive: pinned combat target '%s' -> '%s' (JIP SetCombatDisabled).",
+            GetDisplayNameSafe(actorRef).c_str(), GetDisplayNameSafe(targetRef).c_str());
+    }
+}
+
+void UnpinCombatDriveTarget(UInt32 refId, const char* reason)
+{
+    if (g_combatDrivePinned.erase(refId) == 0 || !EnsurePinCombatScripts())
+    {
+        return;
+    }
+    TESForm* form = LookupFormByID(refId);
+    TESObjectREFR* ref = form ? DYNAMIC_CAST(form, TESForm, TESObjectREFR) : nullptr;
+    if (!ref)
+    {
+        return;
+    }
+    NVSEArrayVarInterface::Element result;
+    if (g_scriptInterface->CallFunction(g_unpinCombatScript, ref, nullptr, &result, 1, ref))
+    {
+        LogLine("Combat drive: unpinned combat target for '%s' (%s).",
+            GetDisplayNameSafe(ref).c_str(), reason ? reason : "?");
+    }
+}
+
+void ClearCombatDriveIntent(UInt32 refId)
+{
+    g_combatDriveIntent.erase(refId);
+}
+
+void RecordCombatDriveIntent(TESObjectREFR* actorRef, TESObjectREFR* targetRef)
+{
+    if (!actorRef || !targetRef)
+    {
+        return;
+    }
+    CombatDriveIntent& intent = g_combatDriveIntent[actorRef->refID];
+    intent.targetRefId = targetRef->refID;
+    intent.lastAssertTick = GetTickCount();
+}
+std::unordered_set<UInt32> g_combatDriveTeammate;   // actors whose teammate flag we dropped
+// Package forms whose Defensive Combat flag we cleared for an ordered fight.
+// "Defensive Combat: the actor will not attack an NPC or creature unless he is
+// attacked first" — vanilla follow/companion packages carry it, and it vetoes
+// StartCombat vs a friendly no matter the aggression/teammate state (observed
+// live: hold released, aggression 2, teammate off, oncombatend still instant).
+// packageFlags is a form-level field: cleared for the fight, re-set on restore.
+std::unordered_set<UInt32> g_combatDriveDefensivePackages;
+
+void ClearDefensiveCombatFlag(TESPackage* package, const char* label)
+{
+    if (!package || !(package->packageFlags & TESPackage::kPackageFlag_DefensiveCombat))
+    {
+        return;
+    }
+    package->packageFlags &= ~TESPackage::kPackageFlag_DefensiveCombat;
+    g_combatDriveDefensivePackages.insert(package->refID);
+    LogLine("Combat drive: cleared Defensive Combat on package %08X (%s).", package->refID, label);
+}
+
+void RestoreDefensiveCombatFlags(const char* reason)
+{
+    for (UInt32 formId : g_combatDriveDefensivePackages)
+    {
+        TESForm* form = LookupFormByID(formId);
+        auto* package = form ? DYNAMIC_CAST(form, TESForm, TESPackage) : nullptr;
+        if (package)
+        {
+            package->packageFlags |= TESPackage::kPackageFlag_DefensiveCombat;
+            LogLine("Combat drive: restored Defensive Combat on package %08X (%s).",
+                formId, reason ? reason : "?");
+        }
+    }
+    g_combatDriveDefensivePackages.clear();
+}
+
+// Clears Defensive Combat on every package that could govern this actor during
+// the ordered fight: the CURRENT package, the stable package, and the default
+// follow package the FOLLOW handler may re-assert a moment later.
+void DriveCombatPackages(TESObjectREFR* actorRef, const std::string& npcName)
+{
+    auto* actor = actorRef ? static_cast<Actor*>(actorRef) : nullptr;
+    if (!actor || !actor->baseProcess)
+    {
+        return;
+    }
+    ClearDefensiveCombatFlag(actor->baseProcess->GetCurrentPackage(), (npcName + " current").c_str());
+    ClearDefensiveCombatFlag(actor->baseProcess->GetStablePackage(), (npcName + " stable").c_str());
+    if (TESForm* follow = ResolveDefaultFollowPackage())
+    {
+        ClearDefensiveCombatFlag(DYNAMIC_CAST(follow, TESForm, TESPackage), "default follow");
+    }
+}
+
+bool CombatDriveSuppressesHold(UInt32 refId); // defined after the drive state
+
+// Reads the engine's own teammate state (vanilla GetPlayerTeammate) via a
+// cached UDF, so the drive never wrongly PROMOTES a non-teammate on restore.
+bool ActorIsPlayerTeammate(TESObjectREFR* actorRef)
+{
+    if (!actorRef || !EnsureGetTeammateScript())
+    {
+        return false;
+    }
+    NVSEArrayVarInterface::Element result;
+    if (!g_scriptInterface->CallFunction(g_getTeammateScript, actorRef, nullptr, &result, 1, actorRef))
+    {
+        return false;
+    }
+    return result.GetType() == NVSEArrayVarInterface::Element::kType_Numeric
+        && result.GetNumber() != 0.0;
+}
+
+// --- Faction hostility: the RESEARCH clean mechanism -------------------------
+// Our NVCompanions.esp ships two mutually-hostile factions (ChasmCombatAtk/
+// TgtFaction, combat reaction = Enemy). Putting the attacker in Atk and the
+// victim in Tgt makes them GENUINE ENEMIES - so the engine WANTS the fight and
+// sustains it at normal aggression, no frenzy, no collateral. This replaces the
+// frenzy/reciprocal-StartCombat brute force (kept only as a fallback if the
+// faction forms fail to resolve, e.g. an old esp). Referenced by editor id in
+// the compiled UDFs (the game retains editor ids - GetFormByID resolves them).
+// A POOL of mutually-hostile faction PAIRS (ChasmCombatAtkNN/TgtNN in
+// NVCompanions.esp, formids 0x000e00 + 2i / +1). Each ordered fight claims a
+// FREE pair so it is fully ISOLATED: attacker joins Atk_i, victim joins Tgt_i,
+// and Atk_i is hostile to ONLY Tgt_i - so a second fight (or a leaked
+// membership) on a different pair can never make an unrelated NPC attack the
+// victim. This is the fix for shared-faction cross-contamination (observed: a
+// Goodsprings Settler attacking the ordered victim). Mirrors the companion
+// slot pool. Both factions are passed to the UDFs as forms (like AddScriptPackage),
+// so two scripts cover the whole pool.
+constexpr UInt32 kCombatFactionPoolSize = 12;
+constexpr UInt32 kCombatFactionPoolBase = 0x000e00; // Atk_i = base+2i, Tgt_i = base+2i+1
+
+struct CombatFactionClaim
+{
+    int pair = -1;          // which pool pair this actor is bound to
+    bool isAttacker = false; // true = Atk_i member, false = Tgt_i member
+};
+std::unordered_map<UInt32, CombatFactionClaim> g_combatDriveFactionOf; // refId -> claim
+bool g_combatFactionPairInUse[kCombatFactionPoolSize] = { false };
+
+// CRASH-PROOF LEDGER: AddToFaction persists into the SAVE, so a hard quit /
+// load mid-fight leaks pool memberships into the world forever (observed with
+// the old shared factions: chamzy and Easy Pete spawned mutually hostile at
+// session start, no order given, and Pete's self-defense against a teammate
+// flagged him criminal -> the whole town piled onto him). Every membership is
+// journaled to disk the moment it's granted and struck when removed; on every
+// combat-tracking reset (load / new game / menu) the ledger is replayed and
+// any surviving membership is stripped. Entries whose actor can't be resolved
+// yet stay in the ledger for the next reset.
+fs::path CombatFactionLedgerPath();
+bool EnsureCombatFactionScripts();
+TESForm* ResolveCombatPoolFaction(int pair, bool attacker);
+
+fs::path CombatFactionLedgerPath()
+{
+    return BridgeDir() / "combat_factions.txt";
+}
+
+void SaveCombatFactionLedger()
+{
+    std::string body;
+    for (const auto& entry : g_combatDriveFactionOf)
+    {
+        char line[64];
+        snprintf(line, sizeof(line), "%08X,%d,%d\n",
+            entry.first, entry.second.pair, entry.second.isAttacker ? 1 : 0);
+        body += line;
+    }
+    std::error_code ec;
+    if (body.empty())
+    {
+        fs::remove(CombatFactionLedgerPath(), ec);
+        return;
+    }
+    std::ofstream out(CombatFactionLedgerPath(), std::ios::trunc);
+    if (out)
+    {
+        out << body;
+    }
+}
+
+void CleanCombatFactionLedger(const char* reason)
+{
+    std::ifstream in(CombatFactionLedgerPath());
+    if (!in)
+    {
+        return;
+    }
+    std::vector<std::string> kept;
+    std::string line;
+    int cleaned = 0;
+    while (std::getline(in, line))
+    {
+        UInt32 refId = 0; int pair = -1; int atk = 0;
+        if (sscanf_s(line.c_str(), "%x,%d,%d", &refId, &pair, &atk) != 3)
+        {
+            continue;
+        }
+        TESForm* form = LookupFormByID(refId);
+        TESObjectREFR* ref = form ? DYNAMIC_CAST(form, TESForm, TESObjectREFR) : nullptr;
+        TESForm* faction = ResolveCombatPoolFaction(pair, atk != 0);
+        bool removed = false;
+        if (ref && faction && EnsureCombatFactionScripts())
+        {
+            NVSEArrayVarInterface::Element r;
+            removed = g_scriptInterface->CallFunction(g_remFactionScript, ref, nullptr, &r, 2, ref, faction);
+        }
+        if (removed)
+        {
+            ++cleaned;
+        }
+        else
+        {
+            kept.push_back(line);
+        }
+    }
+    in.close();
+    if (cleaned > 0 || !kept.empty())
+    {
+        LogLine("Combat drive: faction ledger sweep (%s) - %d membership(s) stripped, %zu kept for next sweep.",
+            reason ? reason : "?", cleaned, kept.size());
+    }
+    std::error_code ec;
+    if (kept.empty())
+    {
+        fs::remove(CombatFactionLedgerPath(), ec);
+    }
+    else
+    {
+        std::ofstream out(CombatFactionLedgerPath(), std::ios::trunc);
+        for (const auto& keep : kept)
+        {
+            out << keep << "\n";
+        }
+    }
+}
+
+bool EnsureCombatFactionScripts()
+{
+    if (g_addFactionScript && g_remFactionScript)
+    {
+        return true;
+    }
+    if (!g_scriptInterface)
+    {
+        return false;
+    }
+    if (!g_addFactionScript)
+    {
+        g_addFactionScript = g_scriptInterface->CompileScript(R"(
+ref rActor
+ref rFaction
+float fIssued
+Begin Function { rActor, rFaction }
+    let fIssued := 0
+    if rActor && rFaction
+        rActor.AddToFaction rFaction 0
+        let fIssued := 1
+    endif
+    SetFunctionValue fIssued
+End
+)");
+    }
+    if (!g_remFactionScript)
+    {
+        g_remFactionScript = g_scriptInterface->CompileScript(R"(
+ref rActor
+ref rFaction
+Begin Function { rActor, rFaction }
+    if rActor && rFaction
+        rActor.RemoveFromFaction rFaction
+    endif
+End
+)");
+    }
+    if (!g_addFactionScript || !g_remFactionScript)
+    {
+        LogLine("Combat drive: combat-faction helpers failed to compile - using frenzy fallback.");
+        return false;
+    }
+    return true;
+}
+
+TESForm* ResolveCombatPoolFaction(int pair, bool attacker)
+{
+    if (pair < 0 || static_cast<UInt32>(pair) >= kCombatFactionPoolSize)
+    {
+        return nullptr;
+    }
+    const UInt32 local = kCombatFactionPoolBase + 2 * static_cast<UInt32>(pair) + (attacker ? 0 : 1);
+    return ResolveModLocalForm(kCompanionsEspName, local);
+}
+
+bool AddActorToPoolFaction(TESObjectREFR* actorRef, int pair, bool attacker)
+{
+    TESForm* faction = ResolveCombatPoolFaction(pair, attacker);
+    if (!actorRef || !faction || !EnsureCombatFactionScripts())
+    {
+        return false;
+    }
+    NVSEArrayVarInterface::Element r;
+    const bool ok = g_scriptInterface->CallFunction(g_addFactionScript, actorRef, nullptr, &r, 2, actorRef, faction)
+        && r.GetType() == NVSEArrayVarInterface::Element::kType_Numeric && r.GetNumber() != 0.0;
+    if (ok)
+    {
+        g_combatDriveFactionOf[actorRef->refID] = { pair, attacker };
+        SaveCombatFactionLedger();
+    }
+    return ok;
+}
+
+// Claims a free pool pair and enrolls attacker->Atk_i, victim->Tgt_i (mutual
+// enemies). Returns whether the isolated hostility was established.
+bool DriveCombatFactions(TESObjectREFR* attackerRef, TESObjectREFR* targetRef)
+{
+    if (!attackerRef || !targetRef || !EnsureCombatFactionScripts())
+    {
+        return false;
+    }
+    int pair = -1;
+    for (UInt32 i = 0; i < kCombatFactionPoolSize; ++i)
+    {
+        if (!g_combatFactionPairInUse[i])
+        {
+            pair = static_cast<int>(i);
+            break;
+        }
+    }
+    if (pair < 0)
+    {
+        LogLine("Combat drive: no free faction pair (all %u in use) - frenzy fallback.", kCombatFactionPoolSize);
+        return false;
+    }
+    const bool aOk = AddActorToPoolFaction(attackerRef, pair, true);
+    const bool bOk = AddActorToPoolFaction(targetRef, pair, false);
+    if (aOk && bOk)
+    {
+        g_combatFactionPairInUse[pair] = true;
+        LogLine("Combat drive: faction hostility applied on pair %d ('%s' Atk, '%s' Tgt).",
+            pair, GetDisplayNameSafe(attackerRef).c_str(), GetDisplayNameSafe(targetRef).c_str());
+        return true;
+    }
+    // Partial failure: back out cleanly so the pair stays free.
+    if (aOk)
+    {
+        RestoreCombatFactions(attackerRef->refID, "faction_partial_fail");
+    }
+    if (bOk)
+    {
+        RestoreCombatFactions(targetRef->refID, "faction_partial_fail");
+    }
+    LogLine("Combat drive: faction hostility FAILED on pair %d - frenzy fallback.", pair);
+    return false;
+}
+
+void RestoreCombatFactions(UInt32 refId, const char* reason)
+{
+    auto it = g_combatDriveFactionOf.find(refId);
+    if (it == g_combatDriveFactionOf.end())
+    {
+        return;
+    }
+    const CombatFactionClaim claim = it->second;
+    g_combatDriveFactionOf.erase(it);
+    TESForm* form = LookupFormByID(refId);
+    TESObjectREFR* ref = form ? DYNAMIC_CAST(form, TESForm, TESObjectREFR) : nullptr;
+    TESForm* faction = ResolveCombatPoolFaction(claim.pair, claim.isAttacker);
+    if (ref && faction && EnsureCombatFactionScripts())
+    {
+        NVSEArrayVarInterface::Element r;
+        g_scriptInterface->CallFunction(g_remFactionScript, ref, nullptr, &r, 2, ref, faction);
+        LogLine("Combat drive: removed '%s' from pool %s%d (%s).",
+            GetDisplayNameSafe(ref).c_str(), claim.isAttacker ? "Atk" : "Tgt", claim.pair, reason ? reason : "?");
+    }
+    SaveCombatFactionLedger();
+    // Free the pair once BOTH sides have left it.
+    if (claim.pair >= 0 && static_cast<UInt32>(claim.pair) < kCombatFactionPoolSize)
+    {
+        bool stillUsed = false;
+        for (const auto& e : g_combatDriveFactionOf)
+        {
+            if (e.second.pair == claim.pair) { stillUsed = true; break; }
+        }
+        if (!stillUsed)
+        {
+            g_combatFactionPairInUse[claim.pair] = false;
+        }
+    }
+}
+
+void DriveCombatAggression(TESObjectREFR* actorRef, const std::string& npcName, int level)
+{
+    if (!actorRef)
+    {
+        return;
+    }
+    auto* actor = static_cast<Actor*>(actorRef);
+    if (!actor || !actor->baseProcess)
+    {
+        return;
+    }
+    const int current = static_cast<int>(actor->avOwner.Fn_02(eActorVal_Aggression));
+    if (current >= level)
+    {
+        LogLine("Combat drive: %s aggression already %d (>= %d) - no bump needed.", npcName.c_str(), current, level);
+        g_combatDriveTick[actorRef->refID] = GetTickCount();
+        return;
+    }
+    if (!EnsureSetAggressionScript())
+    {
+        return;
+    }
+    // With faction hostility applied the victim is a genuine ENEMY, so VERY
+    // AGGRESSIVE (2) suffices and adds no friend-collateral. Only when factions
+    // fail do we fall back to FRENZIED (3) to attack a friend by disposition.
+    NVSEArrayVarInterface::Element result;
+    if (!g_scriptInterface->CallFunction(g_setAggressionScript, actorRef, nullptr, &result, 2, actorRef, level))
+    {
+        LogLine("Combat drive: SetAV Aggression call failed for %s.", npcName.c_str());
+        return;
+    }
+    // First bump wins: a repeated kill order must not record OUR bump as the original.
+    g_combatDriveAggro.emplace(actorRef->refID, current);
+    g_combatDriveTick[actorRef->refID] = GetTickCount();
+    LogLine("Combat drive: raised %s aggression %d -> %d for chasm combat.start (restores on combat end).",
+        npcName.c_str(), current, level);
+}
+
+// Restores ONLY the aggression bump (teammate/package restores stay on combat
+// end): called from onstartcombat the instant the engine commits to the fight.
+void RestoreCombatDriveAggressionOnly(UInt32 refId, const char* reason)
+{
+    auto it = g_combatDriveAggro.find(refId);
+    if (it == g_combatDriveAggro.end())
+    {
+        return;
+    }
+    const int original = it->second;
+    g_combatDriveAggro.erase(it);
+    TESForm* form = LookupFormByID(refId);
+    TESObjectREFR* ref = form ? DYNAMIC_CAST(form, TESForm, TESObjectREFR) : nullptr;
+    if (ref && EnsureSetAggressionScript())
+    {
+        NVSEArrayVarInterface::Element result;
+        if (g_scriptInterface->CallFunction(g_setAggressionScript, ref, nullptr, &result, 2, ref, original))
+        {
+            LogLine("Combat drive: restored '%s' aggression to %d (%s).",
+                GetDisplayNameSafe(ref).c_str(), original, reason ? reason : "?");
+        }
+    }
+}
+
+// A COWARDLY actor (low Confidence) refuses/abandons combat regardless of
+// aggression — the one motivation AV the drive had not touched while frenzied
+// aggression + neutral disposition (35) still insta-vetoed. Bumped to 4
+// (foolhardy) for the fight; restored at combat END (confidence gates flee
+// decisions continuously, unlike aggression which only gates initiation).
+std::unordered_map<UInt32, int> g_combatDriveConfidence;
+
+void DriveCombatConfidence(TESObjectREFR* actorRef, const std::string& npcName)
+{
+    auto* actor = actorRef ? static_cast<Actor*>(actorRef) : nullptr;
+    if (!actor || !actor->baseProcess)
+    {
+        return;
+    }
+    const int current = static_cast<int>(actor->avOwner.Fn_02(eActorVal_Confidence));
+    LogLine("Combat drive: %s confidence = %d.", npcName.c_str(), current);
+    if (current >= 4 || !EnsureSetConfidenceScript())
+    {
+        return;
+    }
+    NVSEArrayVarInterface::Element result;
+    if (!g_scriptInterface->CallFunction(g_setConfidenceScript, actorRef, nullptr, &result, 2, actorRef, 4))
+    {
+        LogLine("Combat drive: SetAV Confidence call failed for %s.", npcName.c_str());
+        return;
+    }
+    g_combatDriveConfidence.emplace(actorRef->refID, current);
+    LogLine("Combat drive: raised %s confidence %d -> 4 for chasm combat.start (restores on combat end).",
+        npcName.c_str(), current);
+}
+
+// Diagnostic: the actor's disposition toward the ordered target, so the log
+// shows WHICH engine tier (enemy/neutral/friend) the pair sits in.
+void LogCombatDriveDisposition(TESObjectREFR* actorRef, TESObjectREFR* targetRef, const std::string& npcName)
+{
+    if (!actorRef || !targetRef || !EnsureGetDispositionScript())
+    {
+        return;
+    }
+    NVSEArrayVarInterface::Element result;
+    if (g_scriptInterface->CallFunction(g_getDispositionScript, actorRef, nullptr, &result, 2, actorRef, targetRef)
+        && result.GetType() == NVSEArrayVarInterface::Element::kType_Numeric)
+    {
+        LogLine("Combat drive: %s disposition toward '%s' = %g.",
+            npcName.c_str(), GetDisplayNameSafe(targetRef).c_str(), result.GetNumber());
+    }
+}
+
+// A player TEAMMATE's combat AI only initiates on actors hostile to the
+// PLAYER — the aggression bump alone did not unlock a chasm-ordered fight
+// (observed live: aggression 1->2, StartCombat issued, oncombatend within the
+// same second, three attempts in a row; the FOLLOW handler even re-asserts
+// teammate=1 right before a multi-step plan's attack). Drop the flag for the
+// duration of the fight; the restore path puts it back.
+void DriveCombatTeammate(TESObjectREFR* actorRef, const std::string& npcName)
+{
+    if (!actorRef || !ActorIsPlayerTeammate(actorRef))
+    {
+        return;
+    }
+    if (!SetActorPlayerTeammate(actorRef, false, "combat_drive_teammate_off"))
+    {
+        LogLine("Combat drive: could not drop teammate flag for %s.", npcName.c_str());
+        return;
+    }
+    g_combatDriveTeammate.insert(actorRef->refID);
+    LogLine("Combat drive: dropped teammate flag for %s (restores on combat end).", npcName.c_str());
+}
+
+void RestoreCombatDriveAggression(UInt32 refId, const char* reason)
+{
+    // Inside the grace window the fight is still being ESTABLISHED — a stale
+    // oncombatend from the initial one-sided attempt must not revert the levers
+    // under the real fight. The watchdog (UpdateCombatDrive) re-checks later;
+    // hard resets (load/menu) bypass via reason "runtime_reset"/... which clear
+    // the tick first in ClearCombatTracking.
+    {
+        auto tick = g_combatDriveTick.find(refId);
+        if (tick != g_combatDriveTick.end() && GetTickCount() - tick->second < kCombatDriveGraceMs)
+        {
+            LogLine("Combat drive: ignoring restore for %08X within grace window (%s).",
+                refId, reason ? reason : "?");
+            return;
+        }
+        if (tick != g_combatDriveTick.end())
+        {
+            g_combatDriveTick.erase(tick);
+        }
+    }
+    // Package flags: shared forms, restored wholesale when a DRIVEN actor's
+    // fight ends (oncombatend fires for every actor — a random fight ending
+    // across town must not re-arm Defensive Combat mid-ordered-fight).
+    if (g_combatDriveAggro.count(refId) > 0 || g_combatDriveTeammate.count(refId) > 0
+        || g_combatDriveConfidence.count(refId) > 0)
+    {
+        RestoreDefensiveCombatFlags(reason);
+    }
+    // Unpin first: SetCombatDisabled 0 clears the JIP hook flags and issues
+    // StopCombat — the right end-state for a finished/stood-down fight.
+    UnpinCombatDriveTarget(refId, reason);
+    // Drop the temporary faction membership (mutual enmity ends with the fight).
+    RestoreCombatFactions(refId, reason);
+    // Follow package back: re-add + teammate/EvaluatePackage below resume the
+    // companion behavior.
+    if (g_combatDriveFollowRemoved.erase(refId) > 0)
+    {
+        TESForm* followForm = LookupFormByID(refId);
+        TESObjectREFR* followRef =
+            followForm ? DYNAMIC_CAST(followForm, TESForm, TESObjectREFR) : nullptr;
+        TESForm* followPackage = ResolveDefaultFollowPackage();
+        if (followRef && followPackage
+            && AddActorScriptPackage(followRef, followPackage, kDefaultFollowPackageEditorId, "combat_drive_follow_restore"))
+        {
+            LogLine("Combat drive: re-added follow script package for '%s' (%s).",
+                GetDisplayNameSafe(followRef).c_str(), reason ? reason : "?");
+        }
+        else
+        {
+            LogLine("Combat drive: could not re-add follow package for %08X (%s).",
+                refId, reason ? reason : "?");
+        }
+    }
+    // Confidence back first (independent bookkeeping).
+    if (auto conf = g_combatDriveConfidence.find(refId); conf != g_combatDriveConfidence.end())
+    {
+        const int original = conf->second;
+        g_combatDriveConfidence.erase(conf);
+        TESForm* confForm = LookupFormByID(refId);
+        TESObjectREFR* confRef = confForm ? DYNAMIC_CAST(confForm, TESForm, TESObjectREFR) : nullptr;
+        if (confRef && EnsureSetConfidenceScript())
+        {
+            NVSEArrayVarInterface::Element result;
+            if (g_scriptInterface->CallFunction(g_setConfidenceScript, confRef, nullptr, &result, 2, confRef, original))
+            {
+                LogLine("Combat drive: restored '%s' confidence to %d (%s).",
+                    GetDisplayNameSafe(confRef).c_str(), original, reason ? reason : "?");
+            }
+        }
+    }
+    // Teammate flag first: independent of the aggression bookkeeping.
+    if (g_combatDriveTeammate.erase(refId) > 0)
+    {
+        TESForm* teammateForm = LookupFormByID(refId);
+        TESObjectREFR* teammateRef =
+            teammateForm ? DYNAMIC_CAST(teammateForm, TESForm, TESObjectREFR) : nullptr;
+        if (teammateRef && SetActorPlayerTeammate(teammateRef, true, "combat_drive_teammate_restore"))
+        {
+            LogLine("Combat drive: restored teammate flag for '%s' (%s).",
+                GetDisplayNameSafe(teammateRef).c_str(), reason ? reason : "?");
+        }
+        else
+        {
+            LogLine("Combat drive: could not restore teammate flag for %08X (%s).",
+                refId, reason ? reason : "?");
+        }
+    }
+    auto it = g_combatDriveAggro.find(refId);
+    if (it == g_combatDriveAggro.end())
+    {
+        return;
+    }
+    const int original = it->second;
+    g_combatDriveAggro.erase(it);
+    TESForm* form = LookupFormByID(refId);
+    TESObjectREFR* ref = form ? DYNAMIC_CAST(form, TESForm, TESObjectREFR) : nullptr;
+    if (!ref || !EnsureSetAggressionScript())
+    {
+        LogLine("Combat drive: could not restore aggression %d for %08X (%s) - ref or script unavailable.",
+            original, refId, reason ? reason : "?");
+        return;
+    }
+    NVSEArrayVarInterface::Element result;
+    if (g_scriptInterface->CallFunction(g_setAggressionScript, ref, nullptr, &result, 2, ref, original))
+    {
+        LogLine("Combat drive: restored '%s' aggression to %d (%s).",
+            GetDisplayNameSafe(ref).c_str(), original, reason ? reason : "?");
+    }
+    else
+    {
+        LogLine("Combat drive: aggression restore call failed for %08X (%s).", refId, reason ? reason : "?");
+    }
+}
+
+void RestoreAllCombatDriveAggression(const char* reason)
+{
+    std::vector<UInt32> ids;
+    ids.reserve(g_combatDriveAggro.size() + g_combatDriveTeammate.size() + g_combatDriveConfidence.size());
+    for (const auto& entry : g_combatDriveAggro)
+    {
+        ids.push_back(entry.first);
+    }
+    for (const auto& entry : g_combatDriveConfidence)
+    {
+        ids.push_back(entry.first);
+    }
+    for (UInt32 refId : g_combatDriveTeammate)
+    {
+        ids.push_back(refId);
+    }
+    std::sort(ids.begin(), ids.end());
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+    for (UInt32 refId : ids)
+    {
+        RestoreCombatDriveAggression(refId, reason);
+    }
+}
+
+// Per-frame: once an actor's grace window expires, restore it if the engine is
+// NOT fighting with it (the drive failed / the fight already ended while the
+// stale-end was swallowed). Actors in a live fight restore on their genuine
+// oncombatend after the grace.
+void UpdateCombatDrive()
+{
+    if (g_combatDriveTick.empty())
+    {
+        return;
+    }
+    const DWORD now = GetTickCount();
+    std::vector<UInt32> expired;
+    for (const auto& entry : g_combatDriveTick)
+    {
+        if (now - entry.second >= kCombatDriveGraceMs)
+        {
+            expired.push_back(entry.first);
+        }
+    }
+    for (UInt32 refId : expired)
+    {
+        TESForm* form = LookupFormByID(refId);
+        TESObjectREFR* ref = form ? DYNAMIC_CAST(form, TESForm, TESObjectREFR) : nullptr;
+        auto* actor = ref ? static_cast<Actor*>(ref) : nullptr;
+        const bool fighting = actor && actor->baseProcess
+            && (actor->IsInCombat() || actor->GetCombatTarget() != nullptr
+                || HasCombatEdge(refId, nullptr, nullptr));
+        g_combatDriveTick.erase(refId);
+        g_combatDriveIntent.erase(refId);
+        if (!fighting)
+        {
+            LogLine("Combat drive: grace expired with no live fight for %08X - restoring.", refId);
+            RestoreCombatDriveAggression(refId, "grace_expired");
+        }
+        // else: leave levers in place; the genuine oncombatend restores them.
+    }
+
+    // Re-assert uncommitted ordered fights: within the grace, an actor whose
+    // onstartcombat hasn't fired yet gets StartCombat re-issued at the intended
+    // victim every ~600ms (retries a cancelled initiation; re-locks a wanderer).
+    for (auto& entry : g_combatDriveIntent)
+    {
+        const UInt32 refId = entry.first;
+        CombatDriveIntent& intent = entry.second;
+        auto tick = g_combatDriveTick.find(refId);
+        if (tick == g_combatDriveTick.end() || now - intent.lastAssertTick < 600)
+        {
+            continue;
+        }
+        TESForm* actorForm = LookupFormByID(refId);
+        TESObjectREFR* driveRef = actorForm ? DYNAMIC_CAST(actorForm, TESForm, TESObjectREFR) : nullptr;
+        TESForm* targetForm = LookupFormByID(intent.targetRefId);
+        TESObjectREFR* targetRef = targetForm ? DYNAMIC_CAST(targetForm, TESForm, TESObjectREFR) : nullptr;
+        if (!driveRef || !targetRef || !EnsureStartCombatScript() || !EnsureSetAggressionScript())
+        {
+            continue;
+        }
+        intent.lastAssertTick = now;
+        NVSEArrayVarInterface::Element result;
+        g_scriptInterface->CallFunction(g_setAggressionScript, driveRef, nullptr, &result, 2, driveRef, 3);
+        const bool ok =
+            g_scriptInterface->CallFunctionAlt(g_startCombatScript, driveRef, 2, driveRef, targetRef);
+        LogLine("Combat drive: re-asserting ordered combat '%s' -> '%s' (%s).",
+            GetDisplayNameSafe(driveRef).c_str(), GetDisplayNameSafe(targetRef).c_str(),
+            ok ? "ok" : "FAILED");
+    }
+}
+
 // Wipes ALL combat tracking. Called from ResetRuntimeState on every load / new
 // game / exit-to-menu: a save load resets the engine's combat WITHOUT firing
 // `oncombatend`, so without this an actor that was fighting when you saved would
@@ -5815,6 +6912,18 @@ bool HasCombatEdge(UInt32 refId, UInt32* outTargetRefId, std::string* outTargetN
 // re-populates from the live IsInCombat() signal and the next `onstartcombat`.
 void ClearCombatTracking(const char* reason)
 {
+    g_combatDriveTick.clear(); // hard reset bypasses the restore grace window
+    g_combatDriveIntent.clear();
+    // Strip any save-persisted pool memberships (in-memory map is about to be
+    // wiped, so sweep from the on-disk ledger - it includes everything the map
+    // held plus anything a crashed session left behind).
+    CleanCombatFactionLedger(reason);
+    g_combatDriveFactionOf.clear();
+    for (UInt32 i = 0; i < kCombatFactionPoolSize; ++i) { g_combatFactionPairInUse[i] = false; }
+    // Pins are engine-side per-actor flags; a load wipes actor state anyway,
+    // but try per-ref unpins via the restore-all below before clearing.
+
+    RestoreAllCombatDriveAggression(reason);
     if (!g_combatEdges.empty())
     {
         LogLine("Combat tracking cleared (%s): %zu edge(s).",
@@ -5878,7 +6987,15 @@ SpeakerCombatInfo DetectSpeakerCombat(TESObjectREFR* speakerRef, PlayerCharacter
     // authoritative: the speaker fighting ANYONE, or the player fighting the
     // speaker, is combat regardless of either "in combat" flag.
     const bool speakerHasTarget = speakerTarget != nullptr;       // speaker is fighting someone
-    const bool playerTargetsSpeaker = playerTarget == speaker;    // player is fighting the speaker
+    // ...but the PLAYER's target pointer DANGLES: the engine never nulls it when
+    // combat ends, so with flag=0 AND byte=0 it still points at the last opponent
+    // (observed: 35/38 IN COMBAT detections in one session were exactly this
+    // pattern, marking six different peaceful NPCs "in combat" and feeding the
+    // do-not-attack prompt directive). Only trust it while the player's own
+    // combat state corroborates -- the sticky 0xDF0 byte holds through a fight's
+    // lulls and conversations, so genuine mid-fight turns stay detected.
+    const bool playerTargetsSpeakerRaw = playerTarget == speaker;
+    const bool playerTargetsSpeaker = playerInCombat && playerTargetsSpeakerRaw;
 
     // LIVE mutual check (flag-gated, kept as one more corroborating signal).
     const bool fightingThePlayerNow =
@@ -5908,10 +7025,11 @@ SpeakerCombatInfo DetectSpeakerCombat(TESObjectREFR* speakerRef, PlayerCharacter
     // Diagnostic: every candidate signal, so a single reproduction shows exactly
     // which one(s) fire (or none) for a given NPC. `player[...]` = the player's own
     // combat state; `target[...]` = the combat-controller target read.
-    LogLine("Combat detect '%s': player[flag=%d byte=%d vsSelf=%d] target[self=%s playerVsSelf=%d] now[self=%d] edge[self=%d(%s) playerVsSelf=%d] -> %s",
+    LogLine("Combat detect '%s': player[flag=%d byte=%d vsSelf=%d] target[self=%s playerVsSelf=%d raw=%d] now[self=%d] edge[self=%d(%s) playerVsSelf=%d] -> %s",
         GetDisplayNameSafe(speakerRef).c_str(),
         playerFlagInCombat, playerCombatByte, playerFightingSpeaker,
         speakerHasTarget ? GetDisplayNameSafe(speakerTarget).c_str() : "-", playerTargetsSpeaker,
+        playerTargetsSpeakerRaw,
         speakerInCombat,
         speakerHasEdge, speakerEdgeTarget.empty() ? "-" : speakerEdgeTarget.c_str(), playerEdgeVsSpeaker,
         inCombat ? "IN COMBAT" : "peaceful");
@@ -6600,8 +7718,147 @@ bool TriggerTrustedActionBinding(const ResponsePayload& response)
         trustedArgs.push_back(*resolvedArg);
     }
 
+    // A chasm-ordered fight must survive the combat controller's next evaluate:
+    // bump the actor's Aggression BEFORE StartCombat runs (see DriveCombatAggression);
+    // an ordered stand-down hands the original back immediately.
+    if (actorRef && response.actionId == "combat.start")
+    {
+        // The conversation hold's script package vetoes StartCombat the same
+        // tick (observed live: aggression bumped AND teammate dropped, yet
+        // oncombatend still landed within the second while the NPC just stared
+        // mid-reply-lock). Release the hold and keep it off this actor for a
+        // few seconds so the playback tick can't re-lock before combat sticks.
+        if (g_state.conversationHold.active
+            && g_state.conversationHold.speaker.refId == actorRef->refID)
+        {
+            ReleaseConversationHold("chasm_combat_order");
+        }
+        g_combatDriveHoldSuppressRefId = actorRef->refID;
+        g_combatDriveHoldSuppressUntil = GetTickCount() + 5000;
+        LogLine("Combat drive: conversation hold released/suppressed for %s (5s).",
+            ActionNpcName(response).c_str());
+        for (const TrustedExecutionArgument& arg : trustedArgs)
+        {
+            if (arg.type == TrustedExecutionArgumentType::Ref && arg.ref && arg.ref != actorRef)
+            {
+                LogCombatDriveDisposition(actorRef, arg.ref, ActionNpcName(response));
+                break;
+            }
+        }
+        DriveCombatConfidence(actorRef, ActionNpcName(response));
+        DriveCombatTeammate(actorRef, ActionNpcName(response));
+        DriveCombatPackages(actorRef, ActionNpcName(response));
+        // Belt + braces: a lingering restraint (conversation/music rooting) is
+        // exactly "stands still and stares" — clear it before the fight.
+        if (SetActorRestrainedState(actorRef, false))
+        {
+            LogLine("Combat drive: cleared restraint for %s.", ActionNpcName(response).c_str());
+        }
+    }
+    else if (actorRef && response.actionId == "combat.stop")
+    {
+        RestoreCombatDriveAggression(actorRef->refID, "combat.stop ordered");
+    }
+
     TESObjectREFR* callingRef = actorRef ? actorRef : static_cast<TESObjectREFR*>(player);
     NVSEArrayVarInterface::Element result;
+
+    // combat.start: diagnose the two-ref binding through the generic CallFunction
+    // path, then EXECUTE through the legacy CallFunctionAlt plumbing (the path
+    // the working player-targeted ATTACK has always used) with the resolved
+    // named target. Every AI motivation lever checked out live and the veto
+    // persisted — a same-actor/null arg binding in the generic variadic path is
+    // the remaining suspect, and CallFunctionAlt sidesteps it either way.
+    if (response.actionId == "combat.start" && actorRef && trustedArgs.size() >= 2)
+    {
+        TESObjectREFR* targetRef = nullptr;
+        for (const TrustedExecutionArgument& arg : trustedArgs)
+        {
+            if (arg.type == TrustedExecutionArgumentType::Ref && arg.ref && arg.ref != actorRef)
+            {
+                targetRef = arg.ref;
+                break;
+            }
+        }
+        if (EnsureArgProbeScript())
+        {
+            NVSEArrayVarInterface::Element probe;
+            if (CallTrustedExecutionScript(g_argProbeScript, callingRef, trustedArgs, probe)
+                && probe.GetType() == NVSEArrayVarInterface::Element::kType_Numeric)
+            {
+                LogLine("Combat drive: bound-arg probe distance = %g (0 = args collapsed to same actor, -1 = null).",
+                    probe.GetNumber());
+            }
+        }
+        if (targetRef && EnsureStartCombatScript())
+        {
+            const std::string targetName = GetDisplayNameSafe(targetRef);
+            // 1) FACTION HOSTILITY (research core): make attacker+victim genuine
+            //    mutual enemies. Level 2 (very aggressive) is enough vs a real
+            //    enemy - no frenzy, no collateral. If the factions fail to apply
+            //    (old esp), fall back to frenzy (3) + reciprocal StartCombat.
+            const bool factionsOk = DriveCombatFactions(actorRef, targetRef);
+            // Factions make the victim a real ENEMY, so aggression 1 (attacks
+            // enemies on sight, IGNORES neutrals) is enough AND stops the
+            // attacker shooting the now-neutral player/bystanders (observed:
+            // chamzy -> Courier under aggression 2). Fallback (no factions)
+            // still needs frenzy 3 to attack a friend by disposition.
+            const int level = factionsOk ? 1 : 3;
+            DriveCombatAggression(actorRef, ActionNpcName(response), level);
+            DriveCombatAggression(targetRef, targetName, level);
+            DriveCombatConfidence(targetRef, targetName);
+            DriveCombatPackages(targetRef, targetName);
+
+            // 2) Kick the fight off. With factions the victim already counts the
+            //    attacker as an enemy and joins on its own; the fallback path
+            //    also issues the reciprocal StartCombat so both sides engage.
+            const bool altOk =
+                g_scriptInterface->CallFunctionAlt(g_startCombatScript, actorRef, 2, actorRef, targetRef);
+            LogLine("Combat drive: StartCombat '%s' -> '%s' (%s) [factions=%s].",
+                GetDisplayNameSafe(actorRef).c_str(), targetName.c_str(),
+                altOk ? "ok" : "FAILED", factionsOk ? "on" : "fallback");
+            if (!factionsOk)
+            {
+                const bool backOk =
+                    g_scriptInterface->CallFunctionAlt(g_startCombatScript, targetRef, 2, targetRef, actorRef);
+                LogLine("Combat drive: reciprocal StartCombat '%s' -> '%s' (%s).",
+                    targetName.c_str(), GetDisplayNameSafe(actorRef).c_str(), backOk ? "ok" : "FAILED");
+            }
+            RecordCombatDriveIntent(actorRef, targetRef);
+            RecordCombatDriveIntent(targetRef, actorRef);
+            // Engine-level target pin (JIP): the retarget path now always
+            // returns the ordered victim while in combat with them.
+            PinCombatDriveTarget(actorRef, targetRef);
+            PinCombatDriveTarget(targetRef, actorRef);
+            // Take the attacker OFF the follow script package for the fight:
+            // the stay-near-the-player objective keeps competing with combat
+            // at every AI tick (the engage/cancel back-and-forth), and whichever
+            // wins the last race decides the fight. Removed here, re-added on
+            // the combat-end restore.
+            if (RemoveActorScriptPackage(actorRef, "combat_drive_follow_off"))
+            {
+                g_combatDriveFollowRemoved.insert(actorRef->refID);
+                EvaluateActorPackage(actorRef);
+                LogLine("Combat drive: removed follow script package for %s (re-added on combat end).",
+                    ActionNpcName(response).c_str());
+            }
+            if (altOk)
+            {
+                if (!response.requestId.empty())
+                {
+                    g_state.movementActionRequestIds.insert(response.requestId);
+                }
+                const std::string label = !response.actionId.empty() ? response.actionId : response.executionTemplateId;
+                ShowHudMessage((actionNpcName.empty() ? std::string("NPC") : actionNpcName) + " executed " + label + ".");
+                LogLine("Triggered trusted Action Book execution for %s: action_id=%s template_id=%s (legacy-alt path).",
+                    actionNpcName.c_str(),
+                    response.actionId.c_str(),
+                    response.executionTemplateId.c_str());
+                return true;
+            }
+        }
+    }
+
     const bool callOk = CallTrustedExecutionScript(script, callingRef, trustedArgs, result);
     const bool issued = callOk
         && (result.GetType() != NVSEArrayVarInterface::Element::kType_Numeric || result.GetNumber() != 0.0);
@@ -6892,6 +8149,16 @@ bool TriggerGameMasterAction(const ResponsePayload& response, std::string* outTr
         LogLine("Trusted Action Book execution failed for %s; trying legacy native action %s.",
             response.actionId.c_str(),
             action.c_str());
+    }
+
+    if (action == "LOOT")
+    {
+        const bool triggered = TriggerNpcLoot(response);
+        if (triggered && outTriggeredAction)
+        {
+            *outTriggeredAction = action;
+        }
+        return triggered;
     }
 
     if (action == "ATTACK")
@@ -8986,9 +10253,59 @@ void ReleaseConversationHold(const char* reason)
     }
 }
 
+// Actors mid-journey (movement engine travel_steps arriving every ~3s): the
+// conversation hold must not yank them back to the player while their reply
+// audio still plays - the same exemption combat drives and loot sessions have.
+// Refreshed by each travel_step; expires on its own when the journey stops.
+std::unordered_map<UInt32, ULONGLONG> g_journeyHoldSuppressUntil;
+
+void RefreshJourneyHoldSuppress(UInt32 refId)
+{
+    if (!refId)
+    {
+        return;
+    }
+    g_journeyHoldSuppressUntil[refId] = GetTickCount64() + 12000;
+    // Suppression only fences out NEW engagements - a hold engaged before the
+    // journey's first step is already applying itself and must be RELEASED
+    // (observed live: one yank-back before the walk recovered). Loot/combat
+    // never hit this because their action path releases the hold explicitly.
+    if (g_state.conversationHold.active && g_state.conversationHold.speaker.refId == refId)
+    {
+        ReleaseConversationHold("journey_departure");
+    }
+}
+
+bool JourneySuppressesHold(UInt32 refId)
+{
+    const auto it = g_journeyHoldSuppressUntil.find(refId);
+    return it != g_journeyHoldSuppressUntil.end() && GetTickCount64() < it->second;
+}
+
 void EngageConversationHold(const std::string& npcKey, const std::string& npcName, const SpeakerSnapshot& speaker)
 {
     if (!speaker.refId)
+    {
+        return;
+    }
+
+    // A chasm-ordered fight was JUST issued for this actor: do not re-lock them
+    // into the conversation while the engine is still committing to the combat.
+    if (CombatDriveSuppressesHold(speaker.refId))
+    {
+        return;
+    }
+    // Same for an active loot errand: the reply's TTS keeps playing while the
+    // NPC should already be walking to the container - re-engaging the hold
+    // froze them until the audio finished (the combat-drive lesson again).
+    if (LootSessionSuppressesHold(speaker.refId))
+    {
+        return;
+    }
+    // And for an active movement-engine journey ("go to the saloon..."):
+    // observed live, the hold pulled the traveller straight back to the player
+    // a second after departing, and the follow package kept them there.
+    if (JourneySuppressesHold(speaker.refId))
     {
         return;
     }
@@ -10984,6 +12301,38 @@ std::optional<ResponsePayload> ReadNativeActionCommand(const fs::path& path)
         if (const auto decodedPlayerText = DecodeBase64String(GetField(fields, "player_text"), 16ull * 1024ull); decodedPlayerText.has_value())
         {
             payload.playerText = Trim(*decodedPlayerText);
+        }
+        if (const auto decodedPlan = DecodeBase64String(GetField(fields, "loot_plan_base64"), 16384); decodedPlan.has_value())
+        {
+            std::istringstream planStream(*decodedPlan);
+            std::string planLine;
+            while (std::getline(planStream, planLine))
+            {
+                if (!planLine.empty() && planLine.back() == '\r')
+                {
+                    planLine.pop_back();
+                }
+                const size_t sep = planLine.find('|');
+                if (sep == std::string::npos)
+                {
+                    continue;
+                }
+                const std::string mode = ToLowerAscii(Trim(planLine.substr(0, sep)));
+                const std::string value = Trim(planLine.substr(sep + 1));
+                if (mode == "container" || mode == "items")
+                {
+                    payload.lootPlan.push_back({ mode, value });
+                }
+            }
+        }
+        payload.lootMode = ToLowerAscii(Trim(GetField(fields, "loot_mode")));
+        if (const auto decodedLootTarget = DecodeBase64String(GetField(fields, "loot_target_base64"), 4096); decodedLootTarget.has_value())
+        {
+            payload.lootTarget = Trim(*decodedLootTarget);
+        }
+        if (const auto decodedLootItems = DecodeBase64String(GetField(fields, "loot_items_base64"), 4096); decodedLootItems.has_value())
+        {
+            payload.lootItems = Trim(*decodedLootItems);
         }
         if (const auto decodedScript = DecodeBase64String(GetField(fields, "script_base64"), kMaxTrustedExecutionScriptBytes); decodedScript.has_value())
         {
@@ -13454,7 +14803,59 @@ void UpdateStreamingVoice()
         {
             StopStreamingVoice("played_out");
         }
+        // TIME-BASED drain fallback. The cursor check above is unreliable on a
+        // LOOPING buffer (the play cursor wraps, so playPos >= writeCursor can
+        // silently never hold), which left `streamActive` STUCK TRUE forever after
+        // a reply. Invisible in normal chat - the next input's interrupt force-
+        // stops the stream - but fatal to autonomous ACTION BEATS: with no input
+        // to clear the busy gate, the loot loop just froze until the player tapped
+        // STT. Once generation is done and the clock has passed the last appended
+        // audio (+grace), the reply has played out regardless of the cursor.
+        else if (g_state.activeSpeechUntilTick
+            && now >= g_state.activeSpeechUntilTick
+            && now - g_state.streamLastAppendTick > kStreamingVoiceEndGraceMs)
+        {
+            StopStreamingVoice("drained_by_clock");
+        }
     }
+}
+
+// Autonomous turns (ACTION BEATS) are only delivered when the reply gate
+// (HasQueuedOrPlayingReply) is clear. Several playback flags - streamActive,
+// pendingAudioChunks, activeSounds, pending chunk files - are only RELIABLY
+// cleared by an interrupt, which a player-driven turn always provides (the next
+// input) but an autonomous one never does. So a finished reply can leave the gate
+// stuck TRUE, freezing the loot loop until the player taps STT. Flag-agnostic
+// self-heal: once the reply is DONE generating and the audio's scheduled end has
+// passed (+grace), force-clear ANY residual playback state so the next beat fires
+// on its own. (RecoverStaleReplyState covers the awaitingReply==true hang; this
+// covers the awaitingReply==false-but-gate-still-busy one, which the drain check
+// above misses whenever the stuck flag isn't streamActive.)
+void HealStuckReplyGateIfIdle()
+{
+    if (g_state.awaitingReply || !HasQueuedOrPlayingReply())
+    {
+        return;
+    }
+    const DWORD now = GetTickCount();
+    const bool audioDone = g_state.activeSpeechUntilTick
+        ? now >= g_state.activeSpeechUntilTick + kStreamingVoiceEndGraceMs
+        : (g_state.lastBridgeActivityTick && now - g_state.lastBridgeActivityTick > 3000);
+    if (!audioDone)
+    {
+        return;
+    }
+    StopStreamingVoice("gate_heal");
+    for (auto& sound : g_state.activeSounds)
+    {
+        if (sound.buffer) { sound.buffer->Stop(); sound.buffer->Release(); sound.buffer = nullptr; }
+        if (sound.buffer3d) { sound.buffer3d->Release(); sound.buffer3d = nullptr; }
+    }
+    g_state.activeSounds.clear();
+    g_state.pendingAudioChunks.clear();
+    g_state.activeSpeechUntilTick = 0;
+    ClearOutboxArtifacts("gate_heal");
+    LogLine("voice: healed stuck reply gate (idle, audio finished) so autonomous turns can fire.");
 }
 
 bool StartQueuedAudioPlayback(const QueuedAudioChunk& chunk, const SpeakerSnapshot& speaker)
@@ -17614,6 +19015,8 @@ void OnMainGameLoop()
     LoadHotkeysConfigIfNeeded(false);
     PollNativeActionCommands();
     PollCompanionCommands();
+    PollWorldQueries();
+    UpdateLootSessions();
     UpdateCompanionFaceDesignSession();
     UpdateCompanionHotkey();
     UpdatePersonaCapture();
@@ -17631,6 +19034,7 @@ void OnMainGameLoop()
     s_perfAnimMs = static_cast<double>(_pa1.QuadPart - _pa0.QuadPart) * 1000.0
         / static_cast<double>(s_perfFreq.QuadPart);
     UpdateConversationHold();
+    UpdateCombatDrive();
     PollVoiceCaptureBuffers();
     UpdateVoiceCaptureHotkey();
 
@@ -17673,6 +19077,7 @@ void OnMainGameLoop()
     // Phase 3: drive the single streaming buffer every frame (lip-sync scheduling +
     // end-detection) even after chunk delivery stops, while it plays out.
     UpdateStreamingVoice();
+    HealStuckReplyGateIfIdle();
     LARGE_INTEGER _pc2;
     QueryPerformanceCounter(&_pc2);
     // --- perf instrumentation (temporary): log when any speech phase spikes. ---
@@ -19389,6 +20794,136 @@ void HandleCompanionCommand(const fs::path& path)
     // Movement engine: one journey step — (re)apply the travel package that walks the
     // NPC to its target (a place/building/door, the player, or another NPC), and
     // report position + arrival back to chasm. The engine handles pathing and doors.
+    if (op == "world_event")
+    {
+        // chasm-side engines (movement arrivals) hand the NPC a world-event
+        // TURN through the same queue the loot engine uses in-process.
+        const std::string npcKey = Trim(GetField(fields, "npc_key"));
+        std::string npcName;
+        if (const auto decoded = DecodeBase64String(GetField(fields, "npc_name_base64"), 4096); decoded.has_value())
+        {
+            npcName = Trim(*decoded);
+        }
+        std::string text;
+        if (const auto decoded = DecodeBase64String(GetField(fields, "text_base64"), 8192); decoded.has_value())
+        {
+            text = Trim(*decoded);
+        }
+        if (!text.empty())
+        {
+            QueueWorldEvent(npcKey, npcName, text);
+        }
+        WriteCompanionAck(requestId, !text.empty(), text.empty() ? "missing_text" : "", op, -1, npcKey);
+        return;
+    }
+
+    if (op == "speak_up")
+    {
+        // chasm swept a finished errand's report: give the NPC a voiced turn
+        // to deliver it ("here's your milk") through the NORMAL reply pipeline
+        // - a synthetic request with EMPTY player text; the pending report
+        // directive on the chasm side does the prompting. Politeness guards:
+        // never barge into an active reply, only within earshot, cooldown.
+        const std::string npcKey = Trim(GetField(fields, "npc_key"));
+        std::string npcName;
+        if (const auto decoded = DecodeBase64String(GetField(fields, "npc_name_base64"), 4096); decoded.has_value())
+        {
+            npcName = Trim(*decoded);
+        }
+        static DWORD s_lastSpeakUpTick = 0;
+        const DWORD now = GetTickCount();
+        std::string error;
+        bool ok = false;
+        TESObjectREFR* ref = ResolveAnyNpcRefByIdentity(npcKey, npcName);
+        PlayerCharacter* player = GetPlayer();
+        if (!ref || !player)
+        {
+            error = ref ? "no_player" : "actor_unresolved";
+        }
+        else if (g_state.awaitingReply || HasQueuedOrPlayingReply())
+        {
+            error = "reply_active"; // report stays pending; mentioned next chat
+        }
+        else if (DistanceSquared3D(ref, player) > kMaxAudibleDistance * kMaxAudibleDistance)
+        {
+            error = "out_of_earshot"; // same fallback
+        }
+        else if (s_lastSpeakUpTick && now - s_lastSpeakUpTick < 8000)
+        {
+            error = "cooldown";
+        }
+        else
+        {
+            const LocationSnapshot location = CapturePlayerLocation();
+            SpeakerSnapshot snapshot = CaptureSpeakerSnapshot(ref);
+            std::string metadata = BuildTextRequestMetadata(player, &snapshot, &location);
+            if (!metadata.empty() && metadata.front() == '{')
+            {
+                metadata.insert(1, "\"errand_completion\":1,");
+            }
+            else
+            {
+                metadata = "{\"errand_completion\":1}";
+            }
+            ok = WriteRequest(npcKey, npcName, "", location, metadata);
+            if (ok)
+            {
+                s_lastSpeakUpTick = now;
+            }
+            else
+            {
+                error = "request_write_failed";
+            }
+        }
+        if (!ok)
+        {
+            LogLine("loot: speak_up for '%s' skipped (%s).", npcName.c_str(), error.c_str());
+        }
+        WriteCompanionAck(requestId, ok, error, op, -1, npcKey);
+        return;
+    }
+
+    if (op == "end_travel")
+    {
+        const std::string npcKey = Trim(GetField(fields, "npc_key"));
+        std::string npcName;
+        if (const auto decoded = DecodeBase64String(GetField(fields, "npc_name_base64"), 4096); decoded.has_value())
+        {
+            npcName = Trim(*decoded);
+        }
+        TESObjectREFR* ref = nullptr;
+        for (UInt32 i = 0; i < kCompanionPoolSize; ++i)
+        {
+            if (g_companions.slots[i].claimed && !npcKey.empty() && g_companions.slots[i].npcKey == npcKey)
+            {
+                ref = ResolveCompanionRef(i);
+                break;
+            }
+        }
+        if (!ref)
+        {
+            if (const auto snap = ResolveSpeakerSnapshotForNpc(npcKey, npcName); snap.has_value())
+            {
+                ref = ResolveSpeakerRef(*snap);
+            }
+        }
+        bool ok = false;
+        if (ref)
+        {
+            // Remove the travel package and let the engine re-evaluate: a
+            // companion's follow package brings them back to the player, a
+            // villager's sandbox reclaims them. Without this the package kept
+            // them glued to the destination FOREVER (observed live).
+            RemoveActorScriptPackage(ref, "travel_end");
+            EvaluateActorPackage(ref);
+            g_journeyHoldSuppressUntil.erase(ref->refID);
+            ok = true;
+            LogLine("movement: travel ended for %08X - normal AI resumes.", ref->refID);
+        }
+        WriteCompanionAck(requestId, ok, ok ? "" : "actor_unresolved", op, -1, npcKey);
+        return;
+    }
+
     if (op == "travel_step")
     {
         const std::string npcKey = Trim(GetField(fields, "npc_key"));
@@ -19457,6 +20992,12 @@ void HandleCompanionCommand(const fs::path& path)
         // `hold`=1 means "keep them where they are" (chasm's linger-at-destination):
         // re-apply the travel package but DON'T step them out the front door.
         const bool hold = atoi(GetField(fields, "hold").c_str()) != 0;
+        // Only ACTIVE walking suppresses the conversation hold - a lingering
+        // traveller at their destination should still hold a conversation.
+        if (!hold)
+        {
+            RefreshJourneyHoldSuppress(ref->refID);
+        }
 
         // Scope arrival to THIS journey: a new journey_id clears the previous trip's
         // `arrived` (and throttle) so chasm never reads a stale "arrived=true".
@@ -19492,6 +21033,7 @@ void HandleCompanionCommand(const fs::path& path)
                     StepOutFrontDoor(ref); // logs its own success/failure
                     // The moment they're outside, apply the AlwaysRun travel package so
                     // their AI becomes "go to the destination", not "go back to my store".
+                    RemoveActorScriptPackage(ref, "journey_reassert");
                     ok = TravelViaPackage(ref, target);
                     status.lastWalkIssueMs = nowMs;
                     stepError = ok ? "" : "travel_failed";
@@ -19505,7 +21047,10 @@ void HandleCompanionCommand(const fs::path& path)
             {
                 // Loaded, or indoors WITH the player watching: the engine walks them for
                 // real (to the door, through it, over to the target). Throttled so the
-                // path stays stable rather than re-planning every tick.
+                // path stays stable rather than re-planning every tick. Remove-then-add:
+                // a plain re-add does not re-assert a package that lost an evaluation
+                // (the multi-target loot lesson).
+                RemoveActorScriptPackage(ref, "journey_reassert");
                 ok = TravelViaPackage(ref, target);
                 if (ok) { status.lastWalkIssueMs = nowMs; }
                 else { stepError = "travel_failed"; }
@@ -19645,6 +21190,1569 @@ void HandleCompanionCommand(const fs::path& path)
     }
     SaveCompanionRegistry();
     WriteCompanionAck(requestId, ok, error, op, slot, entry.npcKey);
+}
+
+// ===========================================================================
+// World loot engine
+//
+// Two halves, both generic over ANY NPC (a spawned companion slot or the
+// conversing NPC resolved by its remembered speaker snapshot):
+//
+//  1. World queries (`control/queries/*.txt` -> `control/queries/results/*.json`):
+//     chasm's agent loop asks mid-reply what is lootable around the NPC
+//     (op=lootables) or what a body/container holds (op=container_items). The
+//     result carries a prebuilt natural-language `text` (display names only —
+//     the mod owns presentation, chasm just relays it to the model) plus the
+//     structured `data`.
+//
+//  2. Loot sessions (native action LOOT): a per-frame state machine that walks
+//     the NPC to each loot target with the SAME travel package the movement
+//     engine uses (JIP linked-ref + aaChasmTravel — real pathing, real doors),
+//     then takes items the vanilla way: ground items via `Activate` (a real
+//     engine pickup that persists in saves), bodies/containers via
+//     `RemoveItem` + `AddItem` (the vanilla transfer, also save-persistent).
+//     Multi-target sweeps ("loot all the bottles in this room") queue every
+//     matching ground item nearest-first so the NPC visibly works the room.
+//     A finished session writes `loot_report_<id>.json` for chasm's scheduler,
+//     which turns it into a pending report the NPC mentions on their next line.
+// ===========================================================================
+
+fs::path WorldQueryDir() { return BridgeDir() / "control" / "queries"; }
+fs::path WorldQueryResultDir() { return WorldQueryDir() / "results"; }
+constexpr char kWorldQueryVersion[] = "CHASM_WORLDQ_V1";
+constexpr float kLootScanRadiusMeters = 50.0f;
+constexpr double kLootReachUnits = 170.0;
+constexpr DWORD kLootTargetTimeoutMs = 45000;
+// Fast-fail: give up a pickup after this long WITHOUT getting any closer (stuck
+// walking, or arrived next to the item but not grabbing it). A real pickup keeps
+// closing distance then completes within a second of arriving, so it never trips.
+constexpr DWORD kLootNoProgressMs = 7000;
+constexpr DWORD kLootPackageReassertMs = 6000;
+constexpr size_t kLootMaxListEntries = 20;
+constexpr size_t kLootMaxTransfersPerContainer = 24;
+
+// Resolve an NPC ref for loot/query work: claimed companion slot by key, else
+// the conversing NPC's remembered speaker snapshot (key or display name).
+TESObjectREFR* ResolveAnyNpcRefByIdentity(const std::string& npcKey, const std::string& npcName)
+{
+    for (UInt32 i = 0; i < kCompanionPoolSize; ++i)
+    {
+        if (g_companions.slots[i].claimed && !npcKey.empty() && g_companions.slots[i].npcKey == npcKey)
+        {
+            if (TESObjectREFR* ref = ResolveCompanionRef(i))
+            {
+                return ref;
+            }
+        }
+    }
+    if (const auto snap = ResolveSpeakerSnapshotForNpc(npcKey, npcName); snap.has_value())
+    {
+        return ResolveSpeakerRef(*snap);
+    }
+    return nullptr;
+}
+
+bool IsLootableItemType(UInt8 typeID)
+{
+    switch (typeID)
+    {
+    case kFormType_TESObjectARMO:
+    case kFormType_TESObjectBOOK:
+    case kFormType_TESObjectCLOT:
+    case kFormType_TESObjectMISC:
+    case kFormType_TESObjectWEAP:
+    case kFormType_TESAmmo:
+    case kFormType_TESKey:
+    case kFormType_AlchemyItem:
+        return true;
+    default:
+        return false;
+    }
+}
+
+const char* LootItemCategory(UInt8 typeID)
+{
+    switch (typeID)
+    {
+    case kFormType_TESObjectWEAP: return "weapon";
+    case kFormType_TESObjectARMO:
+    case kFormType_TESObjectCLOT: return "apparel";
+    case kFormType_AlchemyItem: return "aid";
+    case kFormType_TESAmmo: return "ammo";
+    case kFormType_TESObjectBOOK: return "book";
+    case kFormType_TESKey: return "key";
+    default: return "misc";
+    }
+}
+
+bool IsDeadActorRef(TESObjectREFR* ref)
+{
+    Actor* actor = ref ? DYNAMIC_CAST(ref, TESObjectREFR, Actor) : nullptr;
+    // MobileObject::lifeState — 2 is fully dead (1 = still dying, not lootable yet).
+    return actor && actor->lifeState == 2;
+}
+
+SInt32 GetRefStackCount(TESObjectREFR* ref)
+{
+    if (!ref)
+    {
+        return 1;
+    }
+    ExtraCount* extra = static_cast<ExtraCount*>(ref->extraDataList.GetByType(kExtraData_Count));
+    return (extra && extra->count > 0) ? static_cast<SInt32>(extra->count) : 1;
+}
+
+struct LootableHit
+{
+    TESObjectREFR* ref = nullptr;
+    std::string name;   // display name
+    std::string kind;   // "body" | "container" | "item"
+    double distSq = 0.0;
+    SInt32 count = 1;
+    bool locked = false;
+};
+
+// Scan the loaded area (anchor's cell + surrounding exterior grid, exactly like
+// the nearby-NPC scan) for dead actors, containers, and pickupable ground items.
+std::vector<LootableHit> ScanLootablesAround(TESObjectREFR* anchorRef, float maxDistanceMeters)
+{
+    std::vector<LootableHit> hits;
+    if (!anchorRef || !anchorRef->parentCell)
+    {
+        return hits;
+    }
+    const double maxDistanceSquared = std::pow(static_cast<double>(maxDistanceMeters * kGameUnitsPerMeter), 2.0);
+    PlayerCharacter* player = GetPlayer();
+
+    auto collect = [&](TESObjectREFR* ref) {
+        if (!ref || ref == anchorRef || (player && ref == (TESObjectREFR*)player) || !ref->baseForm)
+        {
+            return;
+        }
+        const double distSq = DistanceSquared3D(anchorRef, ref);
+        if (distSq > maxDistanceSquared)
+        {
+            return;
+        }
+        LootableHit hit;
+        hit.ref = ref;
+        hit.distSq = distSq;
+        if (IsDeadActorRef(ref))
+        {
+            hit.kind = "body";
+            hit.name = GetDisplayNameSafe(ref);
+        }
+        else if (ref->baseForm->typeID == kFormType_TESObjectCONT)
+        {
+            hit.kind = "container";
+            hit.name = GetDisplayNameSafe(ref);
+            hit.locked = ref->extraDataList.HasType(kExtraData_Lock);
+        }
+        else if (IsLootableItemType(ref->baseForm->typeID))
+        {
+            hit.kind = "item";
+            const char* display = ref->baseForm->GetTheName();
+            hit.name = display ? display : "";
+            hit.count = GetRefStackCount(ref);
+        }
+        else
+        {
+            return;
+        }
+        if (hit.name.empty())
+        {
+            return;
+        }
+        hits.push_back(std::move(hit));
+    };
+
+    auto scanCell = [&](TESObjectCELL* cell) {
+        if (!cell)
+        {
+            return;
+        }
+        for (auto iter = cell->objectList.Begin(); !iter.End(); ++iter)
+        {
+            collect(*iter);
+        }
+    };
+
+    scanCell(anchorRef->parentCell);
+    TESWorldSpace* worldSpace = anchorRef->parentCell->worldSpace;
+    const auto anchorCellCoordinates = GetWorldCellCoordinates(anchorRef->parentCell);
+    if (worldSpace && worldSpace->cellMap && anchorCellCoordinates.has_value())
+    {
+        for (SInt32 y = anchorCellCoordinates->second - 1; y <= anchorCellCoordinates->second + 1; ++y)
+        {
+            for (SInt32 x = anchorCellCoordinates->first - 1; x <= anchorCellCoordinates->first + 1; ++x)
+            {
+                if (x == anchorCellCoordinates->first && y == anchorCellCoordinates->second)
+                {
+                    continue;
+                }
+                scanCell(worldSpace->cellMap->Lookup(MakeWorldCellKey(x, y)));
+            }
+        }
+    }
+
+    std::sort(hits.begin(), hits.end(), [](const LootableHit& left, const LootableHit& right) {
+        return left.distSq < right.distSq;
+    });
+    return hits;
+}
+
+struct LootInvItem
+{
+    TESForm* form = nullptr;
+    SInt32 count = 0;
+    std::string name;
+    UInt32 value = 0;
+    float weight = 0.0f;
+    const char* category = "misc";
+};
+
+// Full inventory of a container/corpse ref: base TESContainer counts merged
+// with the ExtraContainerChanges deltas (the standard engine layout). Only
+// lootable item types with display names survive.
+std::vector<LootInvItem> EnumerateContainerItems(TESObjectREFR* containerRef)
+{
+    std::vector<LootInvItem> items;
+    if (!containerRef || !containerRef->baseForm)
+    {
+        return items;
+    }
+    std::map<TESForm*, SInt32> counts;
+    if (TESContainer* base = DYNAMIC_CAST(containerRef->baseForm, TESForm, TESContainer))
+    {
+        for (auto iter = base->formCountList.Begin(); !iter.End(); ++iter)
+        {
+            TESContainer::FormCount* entry = *iter;
+            if (entry && entry->form && entry->count > 0)
+            {
+                counts[entry->form] += entry->count;
+            }
+        }
+    }
+    ExtraContainerChanges* changes =
+        static_cast<ExtraContainerChanges*>(containerRef->extraDataList.GetByType(kExtraData_ContainerChanges));
+    if (changes)
+    {
+        if (changes->data && changes->data->objList)
+        {
+            for (auto iter = changes->data->objList->Begin(); !iter.End(); ++iter)
+            {
+                ExtraContainerChanges::EntryData* entry = *iter;
+                if (entry && entry->type)
+                {
+                    counts[entry->type] += entry->countDelta;
+                }
+            }
+        }
+    }
+    for (const auto& [form, count] : counts)
+    {
+        if (count <= 0 || !form || !IsLootableItemType(form->typeID))
+        {
+            continue;
+        }
+        const char* display = form->GetTheName();
+        if (!display || !display[0])
+        {
+            continue;
+        }
+        LootInvItem item;
+        item.form = form;
+        item.count = count;
+        item.name = display;
+        item.category = LootItemCategory(form->typeID);
+        if (TESValueForm* valueForm = DYNAMIC_CAST(form, TESForm, TESValueForm))
+        {
+            item.value = valueForm->value;
+        }
+        if (TESWeightForm* weightForm = DYNAMIC_CAST(form, TESForm, TESWeightForm))
+        {
+            item.weight = weightForm->weight;
+        }
+        items.push_back(std::move(item));
+    }
+    return items;
+}
+
+// --- exact-name matching ------------------------------------------------------
+//
+// No fuzzy phrase heuristics: the model always picks names FROM a listing the
+// game just gave it (search_containers / search_items), so resolution is exact
+// case-insensitive equality after stripping articles and the "body of" prefix.
+
+std::string NormalizeLootName(const std::string& raw)
+{
+    std::string name = ToLowerAscii(Trim(raw));
+    bool stripped = true;
+    while (stripped && !name.empty())
+    {
+        stripped = false;
+        for (const char* prefix : { "the body of ", "body of ", "the ", "a ", "an " })
+        {
+            const size_t len = strlen(prefix);
+            if (name.rfind(prefix, 0) == 0)
+            {
+                name = Trim(name.substr(len));
+                stripped = true;
+            }
+        }
+        // Our own search_items listing groups stacks as "2x Empty Sunset
+        // Sarsaparilla Bottle" - the model dutifully echoes the count prefix
+        // with the "exact name", so normalize it back out (observed live).
+        size_t digits = 0;
+        while (digits < name.size() && std::isdigit(static_cast<unsigned char>(name[digits])))
+        {
+            ++digits;
+        }
+        if (digits > 0 && digits + 1 < name.size() && name[digits] == 'x' && name[digits + 1] == ' ')
+        {
+            name = Trim(name.substr(digits + 2));
+            stripped = true;
+        }
+    }
+    return name;
+}
+
+bool LootNamesEqual(const std::string& left, const std::string& right)
+{
+    return NormalizeLootName(left) == NormalizeLootName(right);
+}
+
+// Comma-separated exact names -> normalized list. "*"/"everything"/"all" ->
+// empty list meaning ALL; "nothing" -> the single sentinel entry "nothing".
+std::vector<std::string> SplitExactLootNames(const std::string& field)
+{
+    std::vector<std::string> names;
+    std::string current;
+    for (char c : field + ",")
+    {
+        if (c == ',')
+        {
+            const std::string name = NormalizeLootName(current);
+            current.clear();
+            if (name.empty())
+            {
+                continue;
+            }
+            if (name == "*" || name == "everything" || name == "all")
+            {
+                return {};
+            }
+            if (name == "nothing")
+            {
+                return { "nothing" };
+            }
+            names.push_back(name);
+        }
+        else
+        {
+            current.push_back(c);
+        }
+    }
+    return names;
+}
+
+// --- world query channel ----------------------------------------------------
+
+void WriteWorldQueryResult(
+    const std::string& requestId,
+    bool ok,
+    const std::string& op,
+    const std::string& text,
+    const std::string& dataJson)
+{
+    if (requestId.empty())
+    {
+        return;
+    }
+    EnsureBridgeDirectories();
+    const fs::path finalPath = WorldQueryResultDir() / (requestId + ".json");
+    const fs::path tempPath = finalPath.string() + ".tmp";
+    {
+        std::ofstream file(tempPath, std::ios::binary | std::ios::trunc);
+        file << "{\"request_id\":" << JsonEscape(requestId)
+             << ",\"ok\":" << (ok ? "true" : "false")
+             << ",\"op\":" << JsonEscape(op)
+             << ",\"text\":" << JsonEscape(text)
+             << ",\"data\":" << (dataJson.empty() ? "[]" : dataJson)
+             << "}";
+    }
+    std::error_code ec;
+    fs::rename(tempPath, finalPath, ec);
+    LogLine("worldq: result %s op=%s ok=%d", requestId.c_str(), op.c_str(), ok ? 1 : 0);
+}
+
+std::string DescribeContainerHits(const std::vector<LootableHit>& hits)
+{
+    std::vector<std::string> parts;
+    for (const LootableHit& hit : hits)
+    {
+        if (hit.kind == "item" || parts.size() >= kLootMaxListEntries)
+        {
+            continue;
+        }
+        const int meters = static_cast<int>(std::sqrt(hit.distSq) / kGameUnitsPerMeter);
+        std::string part = (hit.kind == "body" ? "body of " + hit.name : hit.name)
+            + " (" + std::to_string(meters) + "m";
+        if (hit.locked)
+        {
+            part += ", locked";
+        }
+        part += ")";
+        parts.push_back(std::move(part));
+    }
+    if (parts.empty())
+    {
+        return "There are no containers or bodies around you.";
+    }
+    std::string out = "Containers and bodies around you: ";
+    for (size_t i = 0; i < parts.size(); ++i)
+    {
+        if (i > 0)
+        {
+            out += (i + 1 == parts.size()) ? " and " : ", ";
+        }
+        out += parts[i];
+    }
+    out += ". Use the exact names.";
+    return out;
+}
+
+std::string DescribeItemHits(const std::vector<LootableHit>& hits)
+{
+    // Group loose items by display name so a scattered six-pack reads "6x".
+    std::map<std::string, std::pair<SInt32, double>> byName;
+    for (const LootableHit& hit : hits)
+    {
+        if (hit.kind != "item")
+        {
+            continue;
+        }
+        auto& slot = byName[hit.name];
+        if (slot.first == 0)
+        {
+            slot.second = hit.distSq;
+        }
+        slot.first += hit.count;
+    }
+    if (byName.empty())
+    {
+        return "There are no loose items you can take here.";
+    }
+    std::vector<std::string> parts;
+    for (const auto& [name, info] : byName)
+    {
+        if (parts.size() >= kLootMaxListEntries)
+        {
+            break;
+        }
+        const int meters = static_cast<int>(std::sqrt(info.second) / kGameUnitsPerMeter);
+        parts.push_back((info.first > 1 ? std::to_string(info.first) + "x " : "") + name
+            + " (" + std::to_string(meters) + "m)");
+    }
+    std::string out = "Loose items you can take: ";
+    for (size_t i = 0; i < parts.size(); ++i)
+    {
+        if (i > 0)
+        {
+            out += (i + 1 == parts.size()) ? " and " : ", ";
+        }
+        out += parts[i];
+    }
+    out += ". Use the exact names.";
+    return out;
+}
+
+void HandleWorldQuery(const fs::path& path)
+{
+    std::ifstream in(path, std::ios::binary);
+    if (!in)
+    {
+        return;
+    }
+    std::vector<std::string> lines;
+    std::string line;
+    while (std::getline(in, line))
+    {
+        if (!line.empty() && line.back() == '\r')
+        {
+            line.pop_back();
+        }
+        lines.push_back(line);
+    }
+    in.close();
+    if (lines.empty() || Trim(lines[0]) != kWorldQueryVersion)
+    {
+        LogLine("worldq: ignoring query %s (bad header).", path.filename().string().c_str());
+        return;
+    }
+    const auto fields = ParseKeyValueLines(lines, 1);
+    std::string requestId = Trim(GetField(fields, "request_id"));
+    if (requestId.empty())
+    {
+        requestId = path.stem().string();
+    }
+    const std::string op = ToLowerAscii(Trim(GetField(fields, "op")));
+    const std::string npcKey = Trim(GetField(fields, "npc_key"));
+    std::string npcName;
+    if (const auto decoded = DecodeBase64String(GetField(fields, "npc_name_base64"), 4096); decoded.has_value())
+    {
+        npcName = Trim(*decoded);
+    }
+    if (npcName.empty())
+    {
+        npcName = Trim(GetField(fields, "npc_name"));
+    }
+    std::string target;
+    if (const auto decoded = DecodeBase64String(GetField(fields, "target_base64"), 4096); decoded.has_value())
+    {
+        target = Trim(*decoded);
+    }
+    LogLine("worldq: query %s op=%s npc='%s' target='%s'", requestId.c_str(), op.c_str(), npcName.c_str(), target.c_str());
+
+    // The take decision for an opened container (chasm -> mod; no result file,
+    // the session's final loot report is the answer).
+    TESObjectREFR* npcRef = ResolveAnyNpcRefByIdentity(npcKey, npcName);
+    if (!npcRef)
+    {
+        WriteWorldQueryResult(requestId, false, op,
+            "You can't get a good look around right now.", "");
+        return;
+    }
+    const std::vector<LootableHit> hits = ScanLootablesAround(npcRef, kLootScanRadiusMeters);
+
+    if (op == "search_area")
+    {
+        // Group loose items by display name; containers/bodies stay individual
+        // (duplicates listed once per copy - they are separate containers).
+        std::map<std::string, std::pair<SInt32, double>> groundByName;
+        std::vector<std::string> parts;
+        std::ostringstream data;
+        data << "[";
+        size_t written = 0;
+        for (const LootableHit& hit : hits)
+        {
+            if (hit.kind == "item")
+            {
+                auto& slot = groundByName[hit.name];
+                if (slot.first == 0)
+                {
+                    slot.second = hit.distSq;
+                }
+                slot.first += hit.count;
+                continue;
+            }
+            if (parts.size() >= kLootMaxListEntries)
+            {
+                continue;
+            }
+            const int meters = static_cast<int>(std::sqrt(hit.distSq) / kGameUnitsPerMeter);
+            std::string tag = hit.kind == "body" ? "[body" : "[container";
+            if (hit.locked)
+            {
+                tag += ", locked";
+            }
+            tag += "]";
+            parts.push_back(hit.name + " " + tag + " (" + std::to_string(meters) + "m)");
+            if (written++)
+            {
+                data << ",";
+            }
+            data << "{\"name\":" << JsonEscape(hit.name)
+                 << ",\"kind\":" << JsonEscape(hit.kind)
+                 << ",\"distance_m\":" << meters
+                 << ",\"locked\":" << (hit.locked ? "true" : "false")
+                 << "}";
+        }
+        for (const auto& [name, info] : groundByName)
+        {
+            if (parts.size() >= kLootMaxListEntries * 2)
+            {
+                break;
+            }
+            const int meters = static_cast<int>(std::sqrt(info.second) / kGameUnitsPerMeter);
+            parts.push_back((info.first > 1 ? std::to_string(info.first) + "x " : "") + name
+                + " (" + std::to_string(meters) + "m)");
+            if (written++)
+            {
+                data << ",";
+            }
+            data << "{\"name\":" << JsonEscape(name)
+                 << ",\"kind\":\"item\""
+                 << ",\"count\":" << info.first
+                 << ",\"distance_m\":" << meters
+                 << "}";
+        }
+        data << "]";
+        std::string text;
+        if (parts.empty())
+        {
+            text = "There is nothing lootable around you.";
+        }
+        else
+        {
+            text = "Around you: ";
+            for (size_t i = 0; i < parts.size(); ++i)
+            {
+                if (i > 0)
+                {
+                    text += (i + 1 == parts.size()) ? " and " : ", ";
+                }
+                text += parts[i];
+            }
+            text += ".";
+        }
+        LogLine("loot: search_area found %zu lootable(s): %s", parts.size(), text.c_str());
+        WriteWorldQueryResult(requestId, true, op, text, data.str());
+        return;
+    }
+
+    if (op == "search_containers")
+    {
+        std::ostringstream data;
+        data << "[";
+        size_t written = 0;
+        for (const LootableHit& hit : hits)
+        {
+            if (hit.kind == "item" || written >= kLootMaxListEntries)
+            {
+                continue;
+            }
+            if (written > 0)
+            {
+                data << ",";
+            }
+            data << "{\"name\":" << JsonEscape(hit.name)
+                 << ",\"kind\":" << JsonEscape(hit.kind)
+                 << ",\"distance_m\":" << static_cast<int>(std::sqrt(hit.distSq) / kGameUnitsPerMeter)
+                 << ",\"locked\":" << (hit.locked ? "true" : "false")
+                 << "}";
+            ++written;
+        }
+        data << "]";
+        WriteWorldQueryResult(requestId, true, op, DescribeContainerHits(hits), data.str());
+        return;
+    }
+
+    if (op == "search_items")
+    {
+        std::ostringstream data;
+        data << "[";
+        size_t written = 0;
+        for (const LootableHit& hit : hits)
+        {
+            if (hit.kind != "item" || written >= kLootMaxListEntries)
+            {
+                continue;
+            }
+            if (written > 0)
+            {
+                data << ",";
+            }
+            data << "{\"name\":" << JsonEscape(hit.name)
+                 << ",\"count\":" << hit.count
+                 << ",\"distance_m\":" << static_cast<int>(std::sqrt(hit.distSq) / kGameUnitsPerMeter)
+                 << "}";
+            ++written;
+        }
+        data << "]";
+        WriteWorldQueryResult(requestId, true, op, DescribeItemHits(hits), data.str());
+        return;
+    }
+
+    if (op == "list_places")
+    {
+        struct PlaceHit
+        {
+            std::string name;
+            double distSq = 0.0;
+        };
+        std::vector<PlaceHit> places;
+        PlayerCharacter* player = GetPlayer();
+        TESObjectCELL* exteriorCell = player && player->parentCell && !player->parentCell->IsInterior()
+            ? player->parentCell
+            : (npcRef->parentCell && !npcRef->parentCell->IsInterior() ? npcRef->parentCell : nullptr);
+        TESWorldSpace* world = exteriorCell ? exteriorCell->worldSpace : nullptr;
+        if (world && world->cell)
+        {
+            for (auto iter = world->cell->objectList.Begin(); !iter.End(); ++iter)
+            {
+                TESObjectREFR* markerRef = *iter;
+                if (!markerRef || !IsMapMarkerRef(markerRef))
+                {
+                    continue;
+                }
+                const std::string name = GetMapMarkerDisplayName(markerRef);
+                if (name.empty())
+                {
+                    continue;
+                }
+                const double dx = markerRef->posX - npcRef->posX;
+                const double dy = markerRef->posY - npcRef->posY;
+                places.push_back({ name, dx * dx + dy * dy });
+            }
+        }
+        for (const auto& kv : g_buildingEntrances)
+        {
+            const BuildingEntrance& be = kv.second;
+            const double dx = be.x - npcRef->posX;
+            const double dy = be.y - npcRef->posY;
+            const bool dup = std::any_of(places.begin(), places.end(),
+                [&](const PlaceHit& hit) { return _stricmp(hit.name.c_str(), be.name.c_str()) == 0; });
+            if (!dup)
+            {
+                places.push_back({ be.name, dx * dx + dy * dy });
+            }
+        }
+        std::sort(places.begin(), places.end(),
+            [](const PlaceHit& left, const PlaceHit& right) { return left.distSq < right.distSq; });
+
+        std::ostringstream data;
+        std::string text = "Places you can travel to from here: ";
+        data << "[{\"name\":\"player\"}";
+        for (size_t i = 0; i < places.size() && i < 15; ++i)
+        {
+            const int meters = static_cast<int>(std::sqrt(places[i].distSq) / kGameUnitsPerMeter);
+            if (i > 0)
+            {
+                text += ", ";
+            }
+            text += places[i].name + " (" + std::to_string(meters) + "m)";
+            data << ",{\"name\":" << JsonEscape(places[i].name)
+                 << ",\"distance_m\":" << meters << "}";
+        }
+        data << "]";
+        if (places.empty())
+        {
+            text = "No known places from here";
+        }
+        text += " - and \"player\" to return to the player. Use the exact names.";
+        WriteWorldQueryResult(requestId, true, op, text, data.str());
+        return;
+    }
+
+    if (op == "npc_inventory")
+    {
+        // The NPC's OWN inventory (actors are containers too) - the sense that
+        // stops "what are you carrying?" answers being hallucinated.
+        const std::vector<LootInvItem> items = EnumerateContainerItems(npcRef);
+        if (items.empty())
+        {
+            WriteWorldQueryResult(requestId, true, op, "You are carrying nothing worth mentioning.", "");
+            return;
+        }
+        std::ostringstream data;
+        std::string text = "You are carrying: ";
+        data << "[";
+        for (size_t i = 0; i < items.size() && i < 30; ++i)
+        {
+            const LootInvItem& item = items[i];
+            if (i > 0)
+            {
+                data << ",";
+                text += (i + 1 == items.size() || i + 1 == 30) ? " and " : ", ";
+            }
+            if (item.count > 1)
+            {
+                text += std::to_string(item.count) + "x ";
+            }
+            text += item.name;
+            data << "{\"name\":" << JsonEscape(item.name)
+                 << ",\"count\":" << item.count
+                 << ",\"value\":" << item.value
+                 << ",\"category\":" << JsonEscape(item.category)
+                 << ",\"kind\":\"item\""
+                 << "}";
+        }
+        data << "]";
+        text += ".";
+        WriteWorldQueryResult(requestId, true, op, text, data.str());
+        return;
+    }
+
+    if (op == "give_item")
+    {
+        // give_item step 2: hand the NPC's chosen carried item to the player.
+        // `target` is the exact item name he picked from his own inventory scan.
+        // No walking needed (it is already in his pack), so this rides the query
+        // channel and transfers immediately, mirroring the container take in
+        // reverse (RemoveItem from the NPC, AddItem to the player).
+        PlayerCharacter* player = GetPlayer();
+        const std::vector<LootInvItem> items = EnumerateContainerItems(npcRef);
+        const LootInvItem* match = nullptr;
+        for (const LootInvItem& item : items)
+        {
+            if (LootNamesEqual(item.name, target))
+            {
+                match = &item;
+                break;
+            }
+        }
+        if (!player || !match || !match->form)
+        {
+            WriteWorldQueryResult(requestId, true, op,
+                "You go to hand it over, but you are not carrying that.", "");
+            return;
+        }
+        // Hand over ONE (the player asked for "a" thing; he keeps the rest).
+        if (EnsureLootTransferScript()
+            && g_scriptInterface->CallFunctionAlt(g_lootTransferScript, npcRef, 4,
+                npcRef, player, match->form, 1))
+        {
+            LogLine("worldq: %s gave '%s' to the player.", npcName.c_str(), match->name.c_str());
+            WriteWorldQueryResult(requestId, true, op,
+                "You hand the " + match->name + " to the player.", "");
+        }
+        else
+        {
+            WriteWorldQueryResult(requestId, true, op,
+                "You couldn't hand over the " + match->name + ".", "");
+        }
+        return;
+    }
+
+    WriteWorldQueryResult(requestId, false, op, "(unknown query)", "");
+}
+
+void PollWorldQueries()
+{
+    static DWORD s_nextPollTick = 0;
+    const DWORD now = GetTickCount();
+    if (now < s_nextPollTick)
+    {
+        return;
+    }
+    s_nextPollTick = now + 150;
+    const fs::path directory = WorldQueryDir();
+    std::error_code iterEc;
+    if (!fs::exists(directory, iterEc))
+    {
+        return;
+    }
+    for (const auto& entry : fs::directory_iterator(directory, iterEc))
+    {
+        if (iterEc)
+        {
+            break;
+        }
+        std::error_code fileEc;
+        if (!entry.is_regular_file(fileEc) || ToLowerAscii(entry.path().extension().string()) != ".txt")
+        {
+            continue;
+        }
+        HandleWorldQuery(entry.path());
+        std::error_code removeEc;
+        fs::remove(entry.path(), removeEc);
+    }
+}
+
+// --- loot sessions ------------------------------------------------------------
+//
+// FREEFORM LOOP: one session = ONE interaction. The NPC walks to a single
+// target and interacts; the OUTCOME goes back into his conversation as a
+// world-event turn (same slot as player messages), and HE decides the next
+// call. No queues, no plans, no separate decision calls.
+//
+//  * loose item  -> vanilla Activate pickup -> "You picked up X."
+//  * container   -> open -> "You open X. Inside: ..." (contents in context);
+//                   a following take_items call takes from the open container.
+//  * body        -> same as container.
+
+struct LootTarget
+{
+    UInt32 refId = 0;
+    std::string name;
+    std::string kind; // "item" | "container" | "body"
+};
+
+struct LootSession
+{
+    std::string requestId;
+    std::string npcKey;
+    std::string npcName;
+    UInt32 npcRefId = 0;
+    LootTarget target;
+    /// take_items against an open container: names to take once in reach
+    /// ("" = everything). Only set when kind is container/body and the intent
+    /// is TAKE (the container was already opened this conversation).
+    std::string takeNames;
+    bool isTake = false;
+    std::vector<std::string> taken;
+    DWORD targetStartTick = 0;
+    DWORD lastPackageTick = 0;
+    bool walking = false;
+    /// Closest he's been to the target, and when he last got closer. A pickup
+    /// that stops making progress (stuck walking, or standing next to the item
+    /// unable to grab it) fails fast instead of waiting out the hard cap.
+    double nearestDistSq = 1.0e18;
+    DWORD progressTick = 0;
+};
+
+std::vector<LootSession> g_lootSessions;
+
+/// The container each NPC most recently OPENED (for take_items follow-ups).
+struct OpenContainerMemo
+{
+    UInt32 containerRefId = 0;
+    DWORD openedTick = 0;
+};
+std::unordered_map<UInt32, OpenContainerMemo> g_openContainers;
+
+bool LootSessionSuppressesHold(UInt32 refId)
+{
+    for (const LootSession& session : g_lootSessions)
+    {
+        if (session.npcRefId == refId)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+constexpr UInt32 kChasmFindPackageLocalFormId = 0x00000c50;
+
+// The BASE-GAME pickup: a Find package with a specific-reference target -
+// "the actor will travel to the target and then pick it up if an inventory
+// object" (GECK). The engine owns walking, the pickup animation, and the
+// inventory transfer; we only retarget the package and watch the ref.
+TESForm* ResolveChasmFindPackage()
+{
+    TESForm* form = ResolveModLocalForm(kCompanionsPluginName, kChasmFindPackageLocalFormId);
+    if (!form)
+    {
+        LogLine("loot: aaChasmFind package not found in %s.", kCompanionsPluginName);
+        return nullptr;
+    }
+    if (!DYNAMIC_CAST(form, TESForm, TESPackage))
+    {
+        LogLine("loot: aaChasmFind resolved to %08X but is not a package.", form->refID);
+        return nullptr;
+    }
+    return form;
+}
+
+bool StartFindPickup(TESObjectREFR* npcRef, TESObjectREFR* itemRef)
+{
+    TESForm* pkgForm = ResolveChasmFindPackage();
+    if (!pkgForm)
+    {
+        return false;
+    }
+    TESPackage* pkg = DYNAMIC_CAST(pkgForm, TESForm, TESPackage);
+    pkg->SetTarget(itemRef);
+    SetActorLinkedRef(npcRef, itemRef); // the package location is near-linked-ref
+    // Clear whatever script package holds the slot (travel leftovers etc.) -
+    // adding over an existing one does not re-assert.
+    RemoveActorScriptPackage(npcRef, "loot_find_fresh");
+    const bool added = AddActorScriptPackage(npcRef, pkgForm, "aaChasmFind", "loot_find_pickup");
+    if (added)
+    {
+        EvaluateActorPackage(npcRef);
+    }
+    return added;
+}
+
+Script* g_lootTransferScript = nullptr;
+bool EnsureLootTransferScript()
+{
+    if (g_lootTransferScript)
+    {
+        return true;
+    }
+    if (!g_scriptInterface)
+    {
+        return false;
+    }
+    constexpr char kScript[] = R"(
+ref rSrc
+ref rDst
+ref rItem
+int iCount
+
+Begin Function { rSrc, rDst, rItem, iCount }
+    rSrc.RemoveItem rItem iCount 1
+    rDst.AddItem rItem iCount 1
+End
+)";
+    g_lootTransferScript = g_scriptInterface->CompileScript(kScript);
+    if (!g_lootTransferScript)
+    {
+        LogLine("loot: failed to compile transfer helper.");
+    }
+    return g_lootTransferScript != nullptr;
+}
+
+// --- world-event turns --------------------------------------------------------
+//
+// The world answers the NPC in his own conversation: a synthetic turn request
+// with EMPTY player text and the event in metadata. chasm inserts it where
+// player messages go ("World: [...]") and the NPC replies/acts as himself.
+// Busy or out of earshot -> retried briefly, then dropped.
+
+struct PendingWorldEvent
+{
+    std::string npcKey;
+    std::string npcName;
+    std::string text;
+    DWORD firstTick = 0;
+};
+std::vector<PendingWorldEvent> g_pendingWorldEvents;
+
+bool TrySendWorldEventNow(const std::string& npcKey, const std::string& npcName, const std::string& text)
+{
+    PlayerCharacter* player = GetPlayer();
+    TESObjectREFR* ref = ResolveAnyNpcRefByIdentity(npcKey, npcName);
+    if (!ref || !player)
+    {
+        return true; // unresolvable: drop, do not retry forever
+    }
+    if (g_state.awaitingReply || HasQueuedOrPlayingReply())
+    {
+        return false; // retry
+    }
+    if (DistanceSquared3D(ref, player) > kMaxAudibleDistance * kMaxAudibleDistance)
+    {
+        return false; // retry until in earshot or expiry
+    }
+    const LocationSnapshot location = CapturePlayerLocation();
+    SpeakerSnapshot snapshot = CaptureSpeakerSnapshot(ref);
+    std::string metadata = BuildTextRequestMetadata(player, &snapshot, &location);
+    const std::string extras = "\"world_event\":1,\"world_event_text\":" + JsonEscape(text) + ",";
+    if (!metadata.empty() && metadata.front() == '{')
+    {
+        metadata.insert(1, extras);
+    }
+    else
+    {
+        metadata = "{" + extras.substr(0, extras.size() - 1) + "}";
+    }
+    if (!WriteRequest(npcKey, npcName, "", location, metadata))
+    {
+        return false;
+    }
+    LogLine("loot: world event for '%s': %s", npcName.c_str(), text.substr(0, 120).c_str());
+    return true;
+}
+
+// INSERT-ONLY world memory: a record file chasm sweeps into the chat as a
+// "World:" line. No turn is generated - failures use this so nothing invites
+// an immediate retry loop; he reads it whenever he next speaks.
+void WriteWorldRecord(const std::string& npcKey, const std::string& npcName, const std::string& text)
+{
+    EnsureBridgeDirectories();
+    static DWORD s_recordCounter = 0;
+    const std::string fileId = "world_record_" + std::to_string(GetTickCount()) + "_" + std::to_string(++s_recordCounter);
+    const fs::path finalPath = WorldQueryResultDir() / (fileId + ".json");
+    const fs::path tempPath = finalPath.string() + ".tmp";
+    {
+        std::ofstream file(tempPath, std::ios::binary | std::ios::trunc);
+        file << "{\"kind\":\"world_record\""
+             << ",\"npc_key\":" << JsonEscape(npcKey)
+             << ",\"npc_name\":" << JsonEscape(npcName)
+             << ",\"text\":" << JsonEscape(text)
+             << "}";
+    }
+    std::error_code ec;
+    fs::rename(tempPath, finalPath, ec);
+    LogLine("loot: world record: %s", text.substr(0, 100).c_str());
+}
+
+void QueueWorldEvent(const std::string& npcKey, const std::string& npcName, const std::string& text)
+{
+    if (TrySendWorldEventNow(npcKey, npcName, text))
+    {
+        return;
+    }
+    g_pendingWorldEvents.push_back({ npcKey, npcName, text, GetTickCount() });
+}
+
+void UpdatePendingWorldEvents()
+{
+    if (g_pendingWorldEvents.empty())
+    {
+        return;
+    }
+    const DWORD now = GetTickCount();
+    // Expire only the truly-stale (2 min). A busy NPC frees up shortly; dropping a
+    // loop-driving beat early stalls the whole loot loop (observed: "loot all
+    // liquids" quit after one item because the take beat hit the old 30s cap).
+    for (auto it = g_pendingWorldEvents.begin(); it != g_pendingWorldEvents.end();)
+    {
+        if (now - it->firstTick > 120000)
+        {
+            LogLine("loot: action beat expired after 2m ('%s').", it->text.substr(0, 60).c_str());
+            it = g_pendingWorldEvents.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+    if (g_pendingWorldEvents.empty())
+    {
+        return;
+    }
+    // COALESCE per NPC: when he can finally receive, merge everything queued for
+    // him into ONE beat and send it once, so a burst drains in a single turn
+    // instead of backing up behind serial replies (which overflowed the old cap
+    // and lost the beat that drives the next loot).
+    const std::string key = g_pendingWorldEvents.front().npcKey;
+    const std::string name = g_pendingWorldEvents.front().npcName;
+    std::string merged;
+    for (const PendingWorldEvent& e : g_pendingWorldEvents)
+    {
+        if (e.npcKey != key)
+        {
+            continue;
+        }
+        if (!merged.empty())
+        {
+            merged += " ";
+        }
+        merged += e.text;
+    }
+    if (TrySendWorldEventNow(key, name, merged))
+    {
+        g_pendingWorldEvents.erase(
+            std::remove_if(g_pendingWorldEvents.begin(), g_pendingWorldEvents.end(),
+                [&](const PendingWorldEvent& e) { return e.npcKey == key; }),
+            g_pendingWorldEvents.end());
+    }
+}
+
+// One line per item: "2x Dirty Water (5 caps, aid)".
+std::string DescribeInvItems(const std::vector<LootInvItem>& items)
+{
+    std::string out;
+    for (size_t i = 0; i < items.size() && i < 30; ++i)
+    {
+        if (i > 0)
+        {
+            out += (i + 1 == items.size() || i + 1 == 30) ? " and " : ", ";
+        }
+        if (items[i].count > 1)
+        {
+            out += std::to_string(items[i].count) + "x ";
+        }
+        out += items[i].name + " (" + std::to_string(items[i].value) + " caps, " + items[i].category + ")";
+    }
+    return out;
+}
+
+void ResetLootStateOnLoad()
+{
+    if (!g_lootSessions.empty())
+    {
+        LogLine("loot: %zu session(s) dropped on game load (timeline changed).", g_lootSessions.size());
+        g_lootSessions.clear();
+    }
+    g_pendingWorldEvents.clear();
+    g_openContainers.clear();
+    g_journeyHoldSuppressUntil.clear();
+    std::error_code iterEc;
+    for (const fs::path& dir : { WorldQueryDir(), WorldQueryResultDir() })
+    {
+        if (!fs::exists(dir, iterEc))
+        {
+            continue;
+        }
+        for (const auto& entry : fs::directory_iterator(dir, iterEc))
+        {
+            std::error_code fileEc;
+            if (entry.is_regular_file(fileEc))
+            {
+                fs::remove(entry.path(), fileEc);
+            }
+        }
+    }
+}
+
+// Native action LOOT, freeform: resolve ONE target for this call.
+//   mode container: open the exact-named container/body (or TAKE from it when
+//   it is the one this NPC already opened and items are named).
+//   mode items: take from the OPEN container when one is fresh, else pick up
+//   the nearest matching loose item (one thing per call - see what happens,
+//   decide again).
+bool TriggerNpcLoot(const ResponsePayload& response)
+{
+    const std::string npcKey = !response.actionNpcKey.empty() ? response.actionNpcKey : response.npcKey;
+    const std::string npcName = !response.actionNpcName.empty() ? response.actionNpcName : response.npcName;
+    TESObjectREFR* npcRef = ResolveAnyNpcRefByIdentity(npcKey, npcName);
+    if (!npcRef)
+    {
+        LogLine("loot: NPC unresolved for key='%s' name='%s'.", npcKey.c_str(), npcName.c_str());
+        return false;
+    }
+
+    LootSession session;
+    session.requestId = response.requestId;
+    session.npcKey = npcKey;
+    session.npcName = npcName.empty() ? GetDisplayNameSafe(npcRef) : npcName;
+    session.npcRefId = npcRef->refID;
+
+    std::string mode = response.lootMode;
+    std::string targetName = response.lootTarget;
+    std::string itemNames = response.lootItems;
+    if (!response.lootPlan.empty())
+    {
+        mode = response.lootPlan.front().first;
+        (mode == "container" ? targetName : itemNames) = response.lootPlan.front().second;
+    }
+    if (mode.empty())
+    {
+        mode = targetName.empty() ? "items" : "container";
+    }
+
+    const std::vector<LootableHit> hits = ScanLootablesAround(npcRef, kLootScanRadiusMeters);
+
+    if (mode == "container")
+    {
+        const LootableHit* found = nullptr;
+        for (const LootableHit& hit : hits)
+        {
+            if (hit.kind != "item" && LootNamesEqual(hit.name, targetName))
+            {
+                found = &hit;
+                break;
+            }
+        }
+        if (!found)
+        {
+            QueueWorldEvent(npcKey, session.npcName,
+                "[There is no container or body named \"" + targetName
+                + "\" nearby.]");
+            return true;
+        }
+        session.target = { found->ref->refID, found->name, found->kind };
+    }
+    else
+    {
+        // TAKE from the open container when this NPC has one fresh.
+        const auto memo = g_openContainers.find(npcRef->refID);
+        if (memo != g_openContainers.end() && GetTickCount() - memo->second.openedTick < 120000)
+        {
+            TESForm* form = LookupFormByID(memo->second.containerRefId);
+            TESObjectREFR* ref = form ? DYNAMIC_CAST(form, TESForm, TESObjectREFR) : nullptr;
+            if (ref && ref->parentCell)
+            {
+                session.target = { ref->refID, GetDisplayNameSafe(ref),
+                    IsDeadActorRef(ref) ? std::string("body") : std::string("container") };
+                session.isTake = true;
+                session.takeNames = itemNames;
+            }
+        }
+        if (!session.isTake)
+        {
+            // Ground pickup: the nearest loose item matching any named item
+            // (or the nearest lootable thing for "everything"). ONE per call.
+            const std::vector<std::string> names = SplitExactLootNames(itemNames);
+            const LootableHit* found = nullptr;
+            for (const LootableHit& hit : hits)
+            {
+                if (hit.kind != "item")
+                {
+                    continue;
+                }
+                const bool wanted = names.empty()
+                    || std::any_of(names.begin(), names.end(),
+                        [&](const std::string& n) { return LootNamesEqual(hit.name, n); });
+                if (wanted)
+                {
+                    found = &hit;
+                    break;
+                }
+            }
+            if (!found)
+            {
+                QueueWorldEvent(npcKey, session.npcName,
+                    "[There's nothing like that here to pick up.]");
+                return true;
+            }
+            session.target = { found->ref->refID, found->name, found->kind };
+        }
+    }
+
+    // One interaction at a time: a new call replaces whatever walk is running.
+    for (auto it = g_lootSessions.begin(); it != g_lootSessions.end();)
+    {
+        if (it->npcRefId == session.npcRefId)
+        {
+            it = g_lootSessions.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+
+    // Release a conversation hold already on this actor - his own reply's TTS
+    // keeps playing while he should be walking to the item, and suppression alone
+    // only fences out NEW holds, so a pre-engaged one froze the pickup walk into a
+    // 45s "out of reach". This is the exact release journeys do at departure
+    // (the comment on RefreshJourneyHoldSuppress wrongly assumed loot already did).
+    if (g_state.conversationHold.active
+        && g_state.conversationHold.speaker.refId == session.npcRefId)
+    {
+        ReleaseConversationHold("loot_walk");
+    }
+
+    if (session.target.kind == "item")
+    {
+        // Hand the whole pickup to the engine's Find procedure.
+        TESForm* npcForm2 = LookupFormByID(session.npcRefId);
+        TESObjectREFR* npc2 = npcForm2 ? DYNAMIC_CAST(npcForm2, TESForm, TESObjectREFR) : nullptr;
+        TESForm* itemForm = LookupFormByID(session.target.refId);
+        TESObjectREFR* item2 = itemForm ? DYNAMIC_CAST(itemForm, TESForm, TESObjectREFR) : nullptr;
+        if (!npc2 || !item2 || !StartFindPickup(npc2, item2))
+        {
+            QueueWorldEvent(session.npcKey, session.npcName,
+                "[The " + session.target.name + " was out of your reach.]");
+            return true;
+        }
+        session.walking = true; // engine-driven; we only watch
+        session.targetStartTick = GetTickCount();
+        session.progressTick = GetTickCount(); // fast-fail clock starts now
+    }
+    LogLine("loot: '%s' -> %s '%s'%s.", session.npcName.c_str(), session.target.kind.c_str(),
+        session.target.name.c_str(), session.isTake ? " (take)" : "");
+    g_lootSessions.push_back(std::move(session));
+    return true;
+}
+
+void FinishLootSession(LootSession& session, TESObjectREFR* npcRef)
+{
+    if (npcRef)
+    {
+        RemoveActorScriptPackage(npcRef, "loot_done");
+        EvaluateActorPackage(npcRef);
+    }
+}
+
+// Walk toward the target; true once within reach.
+bool LootWalkTo(LootSession& session, TESObjectREFR* npcRef, TESObjectREFR* targetRef,
+    const std::string& targetName, DWORD now, bool& gaveUp)
+{
+    gaveUp = false;
+    const double distSq = DistanceSquared3D(npcRef, targetRef);
+    if (distSq <= kLootReachUnits * kLootReachUnits)
+    {
+        return true;
+    }
+    if (!session.walking)
+    {
+        RemoveActorScriptPackage(npcRef, "loot_walk_fresh");
+        if (!TravelViaPackage(npcRef, targetRef))
+        {
+            gaveUp = true;
+            return false;
+        }
+        session.walking = true;
+        session.targetStartTick = now;
+        session.lastPackageTick = now;
+        return false;
+    }
+    if (now - session.lastPackageTick > kLootPackageReassertMs)
+    {
+        RemoveActorScriptPackage(npcRef, "loot_walk_reassert");
+        TravelViaPackage(npcRef, targetRef);
+        session.lastPackageTick = now;
+    }
+    if (now - session.targetStartTick > kLootTargetTimeoutMs)
+    {
+        gaveUp = true;
+    }
+    return false;
+}
+
+void UpdateLootSessions()
+{
+    UpdatePendingWorldEvents();
+    if (g_lootSessions.empty())
+    {
+        return;
+    }
+    const DWORD now = GetTickCount();
+    for (size_t index = 0; index < g_lootSessions.size();)
+    {
+        LootSession& session = g_lootSessions[index];
+        TESForm* npcForm = LookupFormByID(session.npcRefId);
+        TESObjectREFR* npcRef = npcForm ? DYNAMIC_CAST(npcForm, TESForm, TESObjectREFR) : nullptr;
+        if (!npcRef)
+        {
+            g_lootSessions.erase(g_lootSessions.begin() + index);
+            continue;
+        }
+
+        // ITEMS: the engine Find package (StartFindPickup) owns the walk AND the
+        // animated pickup - we ONLY WATCH. Watch via a FRESH SCAN every frame (never
+        // a stale list; a multi-item order re-checks the world after each grab) and
+        // track the item BY NAME, because a dropped/dynamic ref's id doesn't
+        // round-trip LookupFormByID (reading that as gone was the old FALSE "picked
+        // up" loop). A matching item no longer scannable = the engine took it. Fail
+        // fast only if he stops closing in / never finishes.
+        if (session.target.kind == "item")
+        {
+            const std::vector<LootableHit> hits = ScanLootablesAround(npcRef, kLootScanRadiusMeters);
+            const LootableHit* item = nullptr;
+            for (const LootableHit& h : hits)
+            {
+                if (h.kind == "item" && LootNamesEqual(h.name, session.target.name)
+                    && (!item || h.distSq < item->distSq))
+                {
+                    item = &h;
+                }
+            }
+            if (!item)
+            {
+                QueueWorldEvent(session.npcKey, session.npcName,
+                    "[You picked up " + session.target.name + ".]");
+                FinishLootSession(session, npcRef);
+                g_lootSessions.erase(g_lootSessions.begin() + index);
+                continue;
+            }
+            if (item->distSq < session.nearestDistSq)
+            {
+                session.nearestDistSq = item->distSq;
+                session.progressTick = now;
+            }
+            // No-progress fast-fail applies only while he is still WALKING toward
+            // the item. Once he's ARRIVED (in reach) the distance naturally plateaus
+            // while the engine plays the pickup animation - do NOT read that as
+            // "stuck": it false-fired "[out of reach]" the instant he reached the
+            // gun, even though the grab then landed. Once in reach, only the hard
+            // cap backstops a pickup that genuinely never completes.
+            const bool inReach = item->distSq <= kLootReachUnits * kLootReachUnits;
+            if ((!inReach && now - session.progressTick > kLootNoProgressMs)
+                || now - session.targetStartTick > kLootTargetTimeoutMs)
+            {
+                WriteWorldRecord(session.npcKey, session.npcName,
+                    "[The " + session.target.name + " was out of your reach.]");
+                FinishLootSession(session, npcRef);
+                g_lootSessions.erase(g_lootSessions.begin() + index);
+                continue;
+            }
+            ++index;
+            continue;
+        }
+
+        // CONTAINERS / BODIES use PERSISTENT refs, so the ref path is reliable here.
+        TESForm* targetForm = LookupFormByID(session.target.refId);
+        TESObjectREFR* targetRef = targetForm ? DYNAMIC_CAST(targetForm, TESForm, TESObjectREFR) : nullptr;
+        if (!targetRef || !targetRef->parentCell)
+        {
+            WriteWorldRecord(session.npcKey, session.npcName,
+                "[" + session.target.name + " is gone.]");
+            FinishLootSession(session, npcRef);
+            g_lootSessions.erase(g_lootSessions.begin() + index);
+            continue;
+        }
+
+        // Walk to the container/body via a Travel package, then open / take.
+        bool gaveUp = false;
+        if (!LootWalkTo(session, npcRef, targetRef, session.target.name, now, gaveUp))
+        {
+            if (gaveUp)
+            {
+                WriteWorldRecord(session.npcKey, session.npcName,
+                    "[The " + session.target.name + " was out of your reach.]");
+                FinishLootSession(session, npcRef);
+                g_lootSessions.erase(g_lootSessions.begin() + index);
+                continue;
+            }
+            ++index;
+            continue;
+        }
+
+        // In reach of the container/body.
+        if (g_faceObjectScript)
+        {
+            g_scriptInterface->CallFunctionAlt(g_faceObjectScript, npcRef, 2, npcRef, targetRef);
+        }
+
+        if (session.isTake)
+        {
+            const std::vector<std::string> names = SplitExactLootNames(session.takeNames);
+            const std::vector<LootInvItem> items = EnumerateContainerItems(targetRef);
+            std::vector<std::string> got;
+            size_t transferred = 0;
+            for (const LootInvItem& item : items)
+            {
+                if (transferred >= kLootMaxTransfersPerContainer)
+                {
+                    break;
+                }
+                const bool wanted = names.empty()
+                    || std::any_of(names.begin(), names.end(),
+                        [&](const std::string& n) { return LootNamesEqual(item.name, n); });
+                if (!wanted)
+                {
+                    continue;
+                }
+                if (EnsureLootTransferScript()
+                    && g_scriptInterface->CallFunctionAlt(g_lootTransferScript, npcRef, 4,
+                        targetRef, npcRef, item.form, item.count))
+                {
+                    got.push_back((item.count > 1 ? std::to_string(item.count) + "x " : "") + item.name);
+                    ++transferred;
+                }
+            }
+            std::string event;
+            if (got.empty())
+            {
+                event = "[Nothing matching that is inside " + session.target.name + ".]";
+            }
+            else
+            {
+                event = "[You took ";
+                for (size_t i = 0; i < got.size(); ++i)
+                {
+                    if (i > 0)
+                    {
+                        event += (i + 1 == got.size()) ? " and " : ", ";
+                    }
+                    event += got[i];
+                }
+                event += " from " + session.target.name + ".]";
+            }
+            QueueWorldEvent(session.npcKey, session.npcName, event);
+            // The open container is CONSUMED by this take: one take_items call
+            // gets everything he named from it. Clearing here stops the memo
+            // from hijacking his next take (a fresh order, or a loose pickup) -
+            // observed live, he stayed glued to one cabinet across orders.
+            g_openContainers.erase(session.npcRefId);
+        }
+        else
+        {
+            // OPEN a container/body: contents into his context; he takes next.
+            std::string event;
+            if (targetRef->extraDataList.HasType(kExtraData_Lock))
+            {
+                event = "[" + session.target.name + " is locked shut.]";
+            }
+            else
+            {
+                const std::vector<LootInvItem> items = EnumerateContainerItems(targetRef);
+                g_openContainers[npcRef->refID] = { targetRef->refID, now };
+                if (items.empty())
+                {
+                    event = "[You open " + session.target.name + ". It is empty.]";
+                }
+                else
+                {
+                    event = "[You open " + session.target.name + ". Inside: "
+                        + DescribeInvItems(items) + ".]";
+                }
+            }
+            QueueWorldEvent(session.npcKey, session.npcName, event);
+        }
+        FinishLootSession(session, npcRef);
+        g_lootSessions.erase(g_lootSessions.begin() + index);
+    }
 }
 
 void PollCompanionCommands(bool force)
@@ -19956,6 +23064,7 @@ void HandleNvseMessage(NVSEMessagingInterface::Message* msg)
         }
 
         g_state.loadedIntoGame = true;
+        ResetLootStateOnLoad();
         ResetRuntimeState();
         ResetGameEventRuntime("post_load_game");
         EnsureBridgeDirectories();
