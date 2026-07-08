@@ -47,6 +47,7 @@
 #include "nvse/GameForms.h"
 #include "nvse/GameObjects.h"
 #include "nvse/GameEffects.h"
+#include "nvse/SafeWrite.h"
 #include "nvse/GameOSDepend.h"
 #include "nvse/GameUI.h"
 
@@ -81,6 +82,9 @@ constexpr float kVoiceMinDistanceMeters = 96.0f / kGameUnitsPerMeter;
 constexpr float kVoiceMaxDistanceMeters = static_cast<float>(kMaxAudibleDistance / kGameUnitsPerMeter);
 constexpr float kChatNpcSearchRadiusMeters = 10.0f;
 constexpr float kGroupChatNearbyRadiusMeters = 10.0f;
+// Witness capture range (task/triggers): slightly wider than chat focus, so an
+// NPC standing just past conversation range still notices what the player does.
+constexpr float kWitnessRadiusMeters = 12.0f;
 constexpr float kGamestateNearbyRadiusMeters = 30.0f;
 constexpr SHORT kChatVirtualKey = VK_RETURN;
 constexpr SHORT kVoiceChatVirtualKey = VK_MENU;
@@ -697,6 +701,14 @@ fs::file_time_type g_hotkeysWriteTime{};
 bool g_hotkeysLoaded = false;
 DWORD g_hotkeysLastPollTick = 0;
 
+// Trigger-enabled event types (control/triggers.cfg, written by chasm's
+// Triggers page + startup seed). These types get INSTANT treatment in the
+// event log; see TriggersConfigPath().
+std::set<std::string> g_triggerEventTypes;
+fs::file_time_type g_triggersCfgWriteTime{};
+bool g_triggersCfgLoaded = false;
+DWORD g_triggersCfgLastPollTick = 0;
+
 constexpr UInt32 kInterfaceManagerSingletonAddress = 0x011D8A80;
 constexpr UInt32 kPlayerSingletonAddress = 0x011DEA3C;
 constexpr UInt32 kOSGlobalsAddress = 0x011DEA0C;
@@ -905,6 +917,8 @@ void ClearTextInputKeyWatcher();
 void PrimeHotkeyEdgeStateFromKeyboard();
 void LoadDebugConfigIfNeeded(bool force = false);
 void LoadHotkeysConfigIfNeeded(bool force = false);
+void LoadTriggersConfigIfNeeded(bool force = false);
+bool IsTriggerEventType(const char* type);
 void WriteRuntimeHeartbeatIfNeeded(bool force = false);
 bool IsPlayerRef(const TESObjectREFR* ref);
 // Dead silence (task/dead-silence): dead NPCs never speak. Live-state helpers +
@@ -1002,12 +1016,37 @@ TESForm* ResolveModLocalForm(const char* modName, UInt32 localFormId);
 fs::path GameEventsDir();
 void RegisterGameEventHandlers();
 void ResetGameEventRuntime(const char* reason);
+// `witnessOverride`: the witness keys captured WHEN the event happened (window
+// aggregates accumulate them as they go); null = capture now (immediate events).
+// `subjectNpcKey`: the event's own NPC subject, excluded from witnesses so an
+// NPC never "witnesses" their own action.
+// `seenOverride` (used with witnessOverride) lists which of those witnesses
+// SAW the player at least once during the event — the rest emit under
+// `hiddenFrom`, so chasm can drop them for sight-gated event types. Null with
+// a witnessOverride = all of them saw it.
+// `noTrigger` marks an aggregate whose FIRST event already fired instantly:
+// chasm keeps it memory-only (no reaction).
 void QueueGameEvent(const char* type, const std::string& summary,
     const std::vector<std::pair<std::string, std::string>>& actors = {},
-    const std::string& locationOverride = std::string());
+    const std::string& locationOverride = std::string(),
+    const std::vector<std::string>* witnessOverride = nullptr,
+    const std::string& subjectNpcKey = std::string(),
+    const std::vector<std::string>* seenOverride = nullptr,
+    bool noTrigger = false);
+std::vector<std::string> CollectEventWitnessKeys();
+const std::vector<std::string>& CollectEventWitnessSeen();
+void UnionWitnessKeys(std::vector<std::string>& target, const std::vector<std::string>& source);
+bool IsPlayerSneakingNow();
+// Player-state sensor script (vanilla IsSneaking), defined next to
+// IsPlayerSneakingNow.
+bool EnsurePlayerStateProbeScripts();
+extern Script* g_playerSneakProbeScript;
+// Direct engine hook for weapon fire (see the WEAPON-FIRE HOOK section).
+void InstallWeaponFireHook();
 void FlushGameEvents(bool force);
 void UpdateGameEventLog();
 void NoteConversationRequestForEventLog(const std::string& npcKey, const std::string& npcName);
+void ProcessReactionDeliveries();
 
 TESForm* LookupFormByIdRuntime(UInt32 refId)
 {
@@ -1280,6 +1319,16 @@ fs::path HotkeysConfigPath()
     // Written by chasm (ui::hotkeys save + bridge startup), read-only here.
     // Lives with the other chasm<->plugin control files under BridgeDir().
     return BridgeDir() / "control" / "hotkeys.cfg";
+}
+
+fs::path TriggersConfigPath()
+{
+    // Written by chasm (witness::triggers_save + startup seed), read-only here:
+    // the trigger-ENABLED event types, one per line after the version header.
+    // Those types get instant treatment (immediate batch flush; the first event
+    // of an aggregation window fires alone, the rest becomes a noTrigger
+    // memory-only aggregate).
+    return BridgeDir() / "control" / "triggers.cfg";
 }
 
 fs::path RuntimeHeartbeatPath()
@@ -3713,6 +3762,94 @@ void LoadHotkeysConfigIfNeeded(bool force)
         // Re-prime edge detection so a key held across the swap doesn't fire.
         PrimeHotkeyEdgeStateFromKeyboard();
     }
+}
+
+// Live-polls chasm's control/triggers.cfg (the hotkeys.cfg pattern): the
+// trigger-ENABLED event types, one per line after a NVBRIDGE_TRIGGERS_V1
+// header. Missing file = no instant types (everything rides the normal
+// aggregation windows + 2.5s batch flush).
+void LoadTriggersConfigIfNeeded(bool force)
+{
+    const DWORD now = GetTickCount();
+    if (!force && g_triggersCfgLastPollTick && (now - g_triggersCfgLastPollTick) < kDebugConfigPollMs)
+    {
+        return;
+    }
+    g_triggersCfgLastPollTick = now;
+
+    std::error_code ec;
+    if (!fs::exists(TriggersConfigPath(), ec))
+    {
+        if (g_triggersCfgLoaded)
+        {
+            g_triggerEventTypes.clear();
+            g_triggersCfgLoaded = false;
+            LogLine("event-log: triggers config removed; no instant trigger types.");
+        }
+        return;
+    }
+
+    const auto writeTime = fs::last_write_time(TriggersConfigPath(), ec);
+    if (!force && g_triggersCfgLoaded && !ec && writeTime == g_triggersCfgWriteTime)
+    {
+        return;
+    }
+
+    std::ifstream in(TriggersConfigPath(), std::ios::binary);
+    if (!in)
+    {
+        return;
+    }
+    std::set<std::string> types;
+    std::string line;
+    bool first = true;
+    while (std::getline(in, line))
+    {
+        if (!line.empty() && line.back() == '\r')
+        {
+            line.pop_back();
+        }
+        line = Trim(line);
+        if (first)
+        {
+            first = false;
+            if (line != "NVBRIDGE_TRIGGERS_V1")
+            {
+                LogLine("event-log: triggers config has unknown header '%s'; ignoring file.", line.c_str());
+                return;
+            }
+            continue;
+        }
+        if (!line.empty() && line[0] != '#')
+        {
+            types.insert(ToLowerAscii(line));
+        }
+    }
+    const bool changed = !g_triggersCfgLoaded || types != g_triggerEventTypes;
+    g_triggerEventTypes.swap(types);
+    g_triggersCfgLoaded = true;
+    if (!ec)
+    {
+        g_triggersCfgWriteTime = writeTime;
+    }
+    if (changed)
+    {
+        std::string joined;
+        for (const std::string& t : g_triggerEventTypes)
+        {
+            if (!joined.empty())
+            {
+                joined += ",";
+            }
+            joined += t;
+        }
+        LogLine("event-log: instant trigger types loaded: [%s].", joined.c_str());
+    }
+}
+
+bool IsTriggerEventType(const char* type)
+{
+    return type && g_triggerEventTypes.count(ToLowerAscii(type)) != 0;
 }
 
 void WriteRuntimeHeartbeatIfNeeded(bool force)
@@ -17437,6 +17574,202 @@ void UpdateActiveSong()
 }
 
 // ===========================================================================
+// WITNESS-TRIGGER REACTIONS (task/triggers) — chasm queues a reaction file in
+// `<bridge>/control/reactions/` when the player does something a nearby NPC
+// has a checked trigger for (see chasm's witness module). The NPC then speaks
+// UNPROMPTED, but through the NORMAL chat request path (WriteRequest →
+// generate → TTS/lip-sync/captions), so playback is identical to a reply.
+// Consumed ONLY while idle: `awaitingReply` (plus queued/playing audio, text
+// input, dialog, save-sync) gates it exactly like a player turn — a reply
+// already in flight is never interrupted; the file waits or ages out. Format:
+//     NVBRIDGE_REACTION_V1
+//     <reactionId>
+//     <npcKey>
+//     <npcName>
+//     <narration, single line>
+//     <event types, comma-separated>
+// ===========================================================================
+
+fs::path ReactionDeliveryDir()
+{
+    return SaveStateControlDir() / "reactions";
+}
+
+void ProcessReactionDeliveries()
+{
+    static DWORD s_scanTick = 0;
+    const DWORD now = GetTickCount();
+    if (s_scanTick != 0 && (now - s_scanTick) < 500)
+    {
+        return; // throttle like the song queue; reactions tolerate ~0.5s
+    }
+    s_scanTick = now;
+
+    const fs::path dir = ReactionDeliveryDir();
+    std::error_code ec;
+    if (!fs::exists(dir, ec))
+    {
+        return;
+    }
+
+    // Gate only on states a reaction must NOT preempt: the player mid-typing
+    // or mid-push-to-talk, a save sync, or a vanilla dialog. An in-flight or
+    // PLAYING reply is deliberately NOT a gate anymore — reactions interrupt
+    // it (see below), so the NPC responds to what just happened instead of
+    // finishing a now-stale sentence.
+    const bool busy = g_state.awaitingInput
+        || g_state.voiceCapture.active
+        || g_state.saveStateSyncPending
+        || IsTextInputMenuActive()
+        || IsMenuVisible(kMenuType_Dialog);
+
+    PlayerCharacter* player = GetPlayer();
+
+    for (const auto& entry : fs::directory_iterator(dir, ec))
+    {
+        std::error_code fileEc;
+        if (!entry.is_regular_file(fileEc))
+        {
+            continue;
+        }
+        const fs::path path = entry.path();
+        if (path.extension() != ".txt")
+        {
+            continue; // skip .tmp files still being written
+        }
+
+        // A reaction is only fresh for a while — but a real conversation plus
+        // its TTS playback easily runs past a minute, and reacting right AFTER
+        // that ("I saw you pocket that…") is exactly the wanted behavior, so
+        // the window is generous. chasm supersedes this file when a newer
+        // trigger fires, so a long wait never blocks fresher reactions.
+        const auto writeTime = fs::last_write_time(path, fileEc);
+        if (!fileEc)
+        {
+            const auto age = decltype(writeTime)::clock::now() - writeTime;
+            if (age > std::chrono::seconds(90))
+            {
+                LogLine("Reaction: %s expired unconsumed; dropping.", path.filename().string().c_str());
+                fs::remove(path, fileEc);
+                continue;
+            }
+        }
+        if (busy || !player)
+        {
+            // Keep the file; say WHY every ~10s so a stall is diagnosable.
+            static DWORD s_waitLogTick = 0;
+            if (!s_waitLogTick || (now - s_waitLogTick) >= 10000)
+            {
+                s_waitLogTick = now;
+                LogLine("Reaction: %s waiting (busy: input=%d voice=%d save=%d menu=%d).",
+                    path.filename().string().c_str(),
+                    g_state.awaitingInput ? 1 : 0,
+                    g_state.voiceCapture.active ? 1 : 0,
+                    g_state.saveStateSyncPending ? 1 : 0,
+                    (IsTextInputMenuActive() || IsMenuVisible(kMenuType_Dialog)) ? 1 : 0);
+            }
+            return; // the staleness cap bounds the wait
+        }
+
+        std::ifstream in(path, std::ios::binary);
+        if (!in)
+        {
+            continue;
+        }
+        std::vector<std::string> lines;
+        std::string line;
+        while (std::getline(in, line))
+        {
+            if (!line.empty() && line.back() == '\r')
+            {
+                line.pop_back();
+            }
+            lines.push_back(line);
+        }
+        in.close();
+
+        if (lines.size() < 5 || lines[0] != "NVBRIDGE_REACTION_V1")
+        {
+            LogLine("Reaction: %s malformed; dropping.", path.filename().string().c_str());
+            fs::remove(path, fileEc);
+            continue;
+        }
+        const std::string npcKey = lines[2];
+        std::string npcName = lines[3];
+        const std::string narration = lines[4];
+        if (npcKey.empty() || narration.empty())
+        {
+            fs::remove(path, fileEc);
+            continue;
+        }
+
+        // The witness must still be in speaking range to speak; otherwise the
+        // file waits (they may wander back) until the staleness cap drops it.
+        TESObjectREFR* npcRef = nullptr;
+        for (const NearbyNpcCandidate& candidate : FindNearbyMappedNpcsAround(player, kWitnessRadiusMeters))
+        {
+            if (candidate.npcKey == npcKey)
+            {
+                npcRef = candidate.ref;
+                if (!candidate.npcName.empty())
+                {
+                    npcName = candidate.npcName;
+                }
+                break;
+            }
+        }
+        if (!npcRef)
+        {
+            static DWORD s_rangeLogTick = 0;
+            if (!s_rangeLogTick || (now - s_rangeLogTick) >= 10000)
+            {
+                s_rangeLogTick = now;
+                LogLine("Reaction: %s waiting (witness '%s' not within %.0fm).",
+                    path.filename().string().c_str(), npcKey.c_str(),
+                    kWitnessRadiusMeters);
+            }
+            return;
+        }
+
+        const LocationSnapshot location = CapturePlayerLocation();
+        const SpeakerSnapshot speaker = CaptureSpeakerSnapshot(npcRef);
+        std::string metadataJson = BuildTextRequestMetadata(player, &speaker, &location);
+        // Splice the reaction block in as the first member; chasm's generate
+        // path reads `metadata.reaction` to run the unprompted reaction turn.
+        const std::string reactionField = "\"reaction\":{\"narration\":" + JsonEscape(narration) + "}";
+        if (metadataJson.size() > 2 && metadataJson.front() == '{')
+        {
+            metadataJson = "{" + reactionField + "," + metadataJson.substr(1);
+        }
+        else
+        {
+            metadataJson = "{" + reactionField + "}";
+        }
+
+        // Preempt: stop any in-flight or still-playing reply so the NPC reacts
+        // NOW ("wait— did you just take that?!") instead of after finishing a
+        // sentence about something else. WriteRequest below resets the reply
+        // state; this stops audio/idles cleanly first.
+        if (g_state.awaitingReply || HasQueuedOrPlayingReply())
+        {
+            InterruptBridgeReplyAndPlayback("reaction_interrupt");
+        }
+        ClearIdleOutboxArtifacts("reaction_idle_stale_response");
+        if (!WriteRequest(npcKey, npcName, "", location, metadataJson))
+        {
+            LogLine("Reaction: request write failed for %s; will retry.", npcKey.c_str());
+            return;
+        }
+        g_state.awaitingReply = true;
+        g_state.awaitingVoiceReply = false;
+        RememberNpcTarget(npcKey, npcName, speaker);
+        fs::remove(path, fileEc);
+        LogLine("Reaction: %s reacting to witnessed event (%s).", npcName.c_str(), lines[1].c_str());
+        return; // one reaction per scan — never stack unprompted turns
+    }
+}
+
+// ===========================================================================
 // GAME EVENT LOG — extract notable gameplay events, aggregate away the noise,
 // and drop JSONL batches into control/gameevents/ for the bridge to relay to
 // chasm's save-aware event store (POST /event-log/events).
@@ -17474,6 +17807,20 @@ constexpr DWORD kShootWindowQuietMs = 3500;       // out-of-combat firing burst
 constexpr double kEventNearbyDistance = 70.0 * kGameUnitsPerMeter; // 70 m
 constexpr UInt32 kFormFlagQuestItem = 0x400;
 constexpr UInt32 kActorValueKarma = 23;
+// Theft / crime extraction (task/triggers round 2).
+constexpr DWORD kTheftWindowQuietMs = 6000;    // aggregate a stealing spree
+constexpr DWORD kTheftActivateGraceMs = 1500;  // steal-activate -> OnAdd correlation
+constexpr DWORD kTradeWindowQuietMs = 6000;    // aggregate a vendor sale
+constexpr DWORD kPickpocketDedupMs = 60 * 1000;
+constexpr DWORD kMurderDeathMergeMs = 2000;    // onmurder + ondeath fire for one kill
+// Social/state polls (all transition-based + heavily deduped).
+constexpr DWORD kWeaponDrawDedupMs = 45 * 1000;
+constexpr DWORD kSneakDedupMs = 60 * 1000;
+// FNV actor values: limb conditions (Perception..Brain) and the rad meter.
+// Aligned with kActorValueKarma = 23 in the same table.
+constexpr UInt32 kActorValueLimbFirst = 25;
+constexpr UInt32 kActorValueLimbLast = 31;
+constexpr UInt32 kActorValueRadLevel = 54;
 // FNV ALCH (AlchemyItem) ENIT flags in the low byte at +0xBC.
 constexpr UInt8 kAlchFlagFood = 0x02;
 constexpr UInt8 kAlchFlagMedicine = 0x04;
@@ -17553,6 +17900,82 @@ struct GameEventLogState
     bool dialogMenuWasOpen = false;
     DWORD dialogMenuOpenTick = 0;
     std::string dialogMenuPartner;
+
+    // Witness capture (task/triggers). The nearby-NPC scan walks up to 9 cells,
+    // and bursty capture sites (every pickup / hit) would rescan per event —
+    // cache the keys for ~1s instead. Window aggregates UNION witnesses as
+    // events accumulate, so the emitted list reflects who was present when
+    // things HAPPENED, not who is present at flush time.
+    DWORD witnessCacheTick = 0;
+    std::vector<std::string> witnessCacheKeys;
+    // The subset of witnessCacheKeys that currently SEE the player (the
+    // engine's detection pair; everyone when not sneaking). A window witness
+    // who saw the player at ANY point during the window counts as having seen.
+    std::vector<std::string> witnessCacheSeen;
+    std::vector<std::string> combatWitnesses;
+    std::vector<std::string> combatSeenWitnesses;
+    std::vector<std::string> lootWitnesses;
+    std::vector<std::string> lootSeenWitnesses;
+    std::vector<std::string> dropWitnesses;
+    std::vector<std::string> dropSeenWitnesses;
+    std::vector<std::string> shootWitnesses;
+    std::vector<std::string> shootSeenWitnesses;
+
+    // Theft (task/triggers round 2): a steal-activated world item awaiting its
+    // OnAdd (so the loot window doesn't double-count it), plus the owned
+    // container / pickpocket session whose takes aggregate into one event.
+    UInt32 theftPendingBaseId = 0;
+    DWORD theftPendingTick = 0;
+    UInt32 theftSourceRefId = 0;          // owned container or pickpocket victim
+    std::string theftSourceName;
+    bool theftSourceIsActor = false;
+    DWORD theftFirstTick = 0;
+    DWORD theftLastTick = 0;
+    std::map<std::string, int> theftCounts;
+    std::vector<std::string> theftWitnesses;
+    std::vector<std::string> theftSeenWitnesses;
+    std::unordered_map<UInt32, DWORD> recentPickpockets; // victim refId -> tick
+
+    // Murder/death merge: one kill fires BOTH onmurder and ondeath; whichever
+    // lands second must not queue a duplicate line.
+    UInt32 recentMurderVictimId = 0;
+    DWORD recentMurderTick = 0;
+    UInt32 recentPlayerKillVictimId = 0;
+    DWORD recentPlayerKillTick = 0;
+
+    // Trade (vendor sale) window aggregation.
+    DWORD sellFirstTick = 0;
+    DWORD sellLastTick = 0;
+    std::map<std::string, int> sellCounts;
+    std::vector<std::string> sellWitnesses;
+    std::vector<std::string> sellSeenWitnesses;
+
+    // Weapon-drawn / sneaking transitions (poll; deduped, non-combat only).
+    bool weaponOutLast = false;
+    DWORD weaponEventTick = 0;
+    bool sneakingLast = false;
+    DWORD sneakEventTick = 0;
+
+    // Limb-cripple + radiation-stage baselines (poll).
+    bool limbCrippled[7] = {};
+    int radStageLast = 0;
+
+    // Instant-first windows (task/triggers): when a window's type is a
+    // trigger, its FIRST event fires alone IMMEDIATELY (instant reaction) and
+    // the rest of the window flushes later as a memory-only aggregate
+    // ("… N more items", noTrigger). Flag + tick per window; the flag clears
+    // at the aggregate emit, or after a quiet window with no follow-ups.
+    bool lootInstantFired = false;
+    DWORD lootInstantTick = 0;
+    bool dropInstantFired = false;
+    DWORD dropInstantTick = 0;
+    bool theftInstantFired = false;
+    DWORD theftInstantTick = 0;
+    bool sellInstantFired = false;
+    DWORD sellInstantTick = 0;
+    bool shootInstantFired = false;
+    DWORD shootInstantTick = 0;
+
 };
 
 GameEventLogState g_eventLog;
@@ -17674,11 +18097,169 @@ void LogHookFirstFire(const char* hook)
     }
 }
 
+// SEH-guarded raw reads, for probing engine structures whose LIFETIME the
+// game controls (detection events, ammo blocks): a pointer that was valid
+// last frame can dangle this frame, and dereferencing it must degrade to
+// "no data" — never to a crash. Plain C bodies (no unwinding) so __try is
+// legal; noinline so the guard actually wraps the read.
+__declspec(noinline) bool SafeReadU32(const void* address, UInt32* out)
+{
+    __try
+    {
+        *out = *reinterpret_cast<const volatile UInt32*>(address);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+__declspec(noinline) bool SafeReadF32(const void* address, float* out)
+{
+    __try
+    {
+        *out = *reinterpret_cast<const volatile float*>(address);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+__declspec(noinline) bool SafeReadS32(const void* address, SInt32* out)
+{
+    __try
+    {
+        *out = *reinterpret_cast<const volatile SInt32*>(address);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+// The engine's own DetectionData (per detecting-actor, per target). The xNVSE
+// SDK only forward-declares the type, so the returned pointer is cast onto
+// this local mirror of JIP LN's published layout (nvse/GameProcess.h) — only
+// the leading fields are read here.
+struct EngineDetectionData
+{
+    Actor* actor;             // 00
+    UInt8 detectionLevel;     // 04  0 Lost, 1 Unseen, 2 Noticed, 3 Seen
+    UInt8 byte05;             // 05
+    UInt8 byte06;             // 06
+    UInt8 byte07;             // 07
+    SInt32 detectionValue;    // 08  >= 0 means the actor has the target
+};
+
+// Does this NPC currently SEE the player? The vanilla [HIDDEN]/[DANGER] sneak
+// machinery, read per NPC: detectionValue >= 0 = they have you (JIP treats a
+// missing pair as -100 = fully hidden). Fast path: when the player is not
+// sneaking, everyone in speaking range trivially sees them — that also avoids
+// trusting stale detection pairs outside sneak mode. Fails OPEN (seen): a
+// wrongly-included witness beats silently blind NPCs.
+bool NpcCurrentlySeesPlayer(TESObjectREFR* npcRef)
+{
+    if (!IsPlayerSneakingNow())
+    {
+        return true;
+    }
+    PlayerCharacter* player = GetPlayer();
+    auto* actor = DYNAMIC_CAST(npcRef, TESObjectREFR, Actor);
+    if (!player || !actor || !actor->baseProcess)
+    {
+        return true;
+    }
+    if (actor->baseProcess->processLevel != 0) // detection pairs live on HighProcess
+    {
+        return true;
+    }
+    auto* data = reinterpret_cast<EngineDetectionData*>(
+        actor->baseProcess->GetDetectionData(player, 0));
+    if (!data)
+    {
+        return false;
+    }
+    SInt32 detectionValue = -100;
+    if (!SafeReadS32(reinterpret_cast<const UInt8*>(data) + 0x08, &detectionValue))
+    {
+        return true; // unreadable pair: fail open (seen)
+    }
+    return detectionValue >= 0;
+}
+
+// Witness capture (task/triggers): the mapped NPC keys within speaking range
+// of the player RIGHT NOW, nearest first (the collector's sort order), plus
+// which of them currently SEE the player. Cached ~1s because capture sites
+// are bursty. MAIN THREAD ONLY (walks cell lists) — off-thread callers of
+// QueueGameEvent must pass an explicit witnessOverride.
+void RefreshEventWitnessCache()
+{
+    const DWORD now = GetTickCount();
+    if (g_eventLog.witnessCacheTick && (now - g_eventLog.witnessCacheTick) <= 1000)
+    {
+        return;
+    }
+    g_eventLog.witnessCacheKeys.clear();
+    g_eventLog.witnessCacheSeen.clear();
+    PlayerCharacter* player = GetPlayer();
+    if (player && g_state.loadedIntoGame)
+    {
+        for (const NearbyNpcCandidate& candidate : FindNearbyMappedNpcsAround(player, kWitnessRadiusMeters))
+        {
+            if (!candidate.npcKey.empty()
+                && std::find(g_eventLog.witnessCacheKeys.begin(), g_eventLog.witnessCacheKeys.end(),
+                    candidate.npcKey) == g_eventLog.witnessCacheKeys.end())
+            {
+                g_eventLog.witnessCacheKeys.push_back(candidate.npcKey);
+                if (NpcCurrentlySeesPlayer(candidate.ref))
+                {
+                    g_eventLog.witnessCacheSeen.push_back(candidate.npcKey);
+                }
+            }
+        }
+    }
+    g_eventLog.witnessCacheTick = now;
+}
+
+std::vector<std::string> CollectEventWitnessKeys()
+{
+    RefreshEventWitnessCache();
+    return g_eventLog.witnessCacheKeys;
+}
+
+const std::vector<std::string>& CollectEventWitnessSeen()
+{
+    RefreshEventWitnessCache();
+    return g_eventLog.witnessCacheSeen;
+}
+
+// Dedup-union for a window aggregate's accumulated witness set (keeps
+// first-seen order, so the earliest/nearest witnesses stay in front).
+void UnionWitnessKeys(std::vector<std::string>& target, const std::vector<std::string>& source)
+{
+    for (const std::string& key : source)
+    {
+        if (std::find(target.begin(), target.end(), key) == target.end())
+        {
+            target.push_back(key);
+        }
+    }
+}
+
 // Queue one event as a serialized JSON line. Thread-safe (WriteRequest can run
-// off the main thread); everything else in the event log is main-thread only.
+// off the main thread — those callers MUST pass witnessOverride, as witness
+// collection walks cell lists); everything else is main-thread only.
 void QueueGameEvent(const char* type, const std::string& summary,
     const std::vector<std::pair<std::string, std::string>>& actors,
-    const std::string& locationOverride)
+    const std::string& locationOverride,
+    const std::vector<std::string>* witnessOverride,
+    const std::string& subjectNpcKey,
+    const std::vector<std::string>* seenOverride,
+    bool noTrigger)
 {
     if (!type || summary.empty())
     {
@@ -17726,6 +18307,55 @@ void QueueGameEvent(const char* type, const std::string& summary,
         }
         json << "]";
     }
+    // Witnesses (task/triggers): the mapped NPC keys in speaking range when the
+    // event happened, minus the event's own NPC subject — plus `hiddenFrom`,
+    // the witnesses who never SAW the player (the engine detection pair), so
+    // chasm can drop them for sight-gated event types. chasm's event store
+    // drops both fields at normalize (store stays byte-compatible); the
+    // witness fan-out reads them from the raw batch.
+    {
+        const std::vector<std::string> collected =
+            witnessOverride ? *witnessOverride : CollectEventWitnessKeys();
+        const std::vector<std::string>& seen = witnessOverride
+            ? (seenOverride ? *seenOverride : collected)
+            : CollectEventWitnessSeen();
+        bool any = false;
+        std::vector<std::string> hidden;
+        for (const std::string& key : collected)
+        {
+            if (key.empty() || (!subjectNpcKey.empty() && key == subjectNpcKey))
+            {
+                continue;
+            }
+            json << (any ? "," : ",\"witnesses\":[") << JsonEscape(key);
+            any = true;
+            if (std::find(seen.begin(), seen.end(), key) == seen.end())
+            {
+                hidden.push_back(key);
+            }
+        }
+        if (any)
+        {
+            json << "]";
+        }
+        if (!hidden.empty())
+        {
+            json << ",\"hiddenFrom\":[";
+            for (size_t i = 0; i < hidden.size(); ++i)
+            {
+                json << (i ? "," : "") << JsonEscape(hidden[i]);
+            }
+            json << "]";
+        }
+        if (!subjectNpcKey.empty())
+        {
+            json << ",\"subjectNpcKey\":" << JsonEscape(subjectNpcKey);
+        }
+        if (noTrigger)
+        {
+            json << ",\"noTrigger\":true";
+        }
+    }
     // Structured major/minor place, for the future Gamemaster (the row shows the
     // combined `location` above; these keep the parts machine-readable).
     if (!place.major.empty() || !place.minor.empty())
@@ -17758,6 +18388,15 @@ void QueueGameEvent(const char* type, const std::string& summary,
         g_eventLog.pending.push_back(json.str());
     }
     LogLine("event-log: [%s] %s", type, summary.c_str());
+
+    // Instant path (task/triggers): a trigger-enabled event skips the 2.5s
+    // batch cadence — flush NOW so the reaction fires as close to the moment
+    // as generation allows. (The bridge watches control/gameevents, so relay
+    // is near-immediate.) noTrigger aggregates ride the normal cadence.
+    if (!noTrigger && IsTriggerEventType(type))
+    {
+        FlushGameEvents(true);
+    }
 }
 
 void FlushGameEvents(bool force)
@@ -17864,6 +18503,288 @@ bool IsKnownTeammateRefId(UInt32 refId)
     return g_eventLog.knownTeammates.find(refId) != g_eventLog.knownTeammates.end();
 }
 
+// ---------------------------------------------------------------------------
+// Theft detection (task/triggers round 2) — the same ownership signal behind
+// the HUD's red "Steal" prompt: an explicit ExtraOwnership on the reference,
+// else the owner of the cell it sits in.
+// ---------------------------------------------------------------------------
+
+TESForm* ResolveRefOwner(TESObjectREFR* ref)
+{
+    if (!ref)
+    {
+        return nullptr;
+    }
+    if (auto* refOwner = GetByTypeCast(ref->extraDataList, Ownership))
+    {
+        if (refOwner->owner)
+        {
+            return refOwner->owner;
+        }
+    }
+    if (ref->parentCell)
+    {
+        if (auto* cellOwner = GetByTypeCast(ref->parentCell->extraDataList, Ownership))
+        {
+            if (cellOwner->owner)
+            {
+                return cellOwner->owner;
+            }
+        }
+    }
+    return nullptr;
+}
+
+// Ownership by the player themselves, or by a faction the player belongs to,
+// is not theft (mirrors the engine's off-limits check closely enough for the
+// event log; edge cases like required faction RANKS read as theft, which is
+// how the HUD colors them anyway).
+bool PlayerOwnsOrIsMemberOf(TESForm* owner)
+{
+    PlayerCharacter* player = GetPlayer();
+    if (!player || !owner)
+    {
+        return true; // no owner = free to take
+    }
+    if (owner == player->baseForm)
+    {
+        return true;
+    }
+    if (owner->typeID == kFormType_TESFaction)
+    {
+        auto* playerBase = DYNAMIC_CAST(player->baseForm, TESForm, TESNPC);
+        if (playerBase)
+        {
+            for (auto iter = playerBase->baseData.factionList.Begin(); !iter.End(); ++iter)
+            {
+                if (*iter && (*iter)->faction == reinterpret_cast<TESFaction*>(owner))
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+bool IsTheftToTakeFrom(TESObjectREFR* ref)
+{
+    TESForm* owner = ResolveRefOwner(ref);
+    return owner && !PlayerOwnsOrIsMemberOf(owner);
+}
+
+// One stolen item into the theft window (mirrors the loot window, but as its
+// own event type so the narration reads "stole", not "picked up").
+void RecordStolenItem(TESForm* itemForm)
+{
+    const std::string name = GetDisplayNameSafe(itemForm);
+    if (name.empty())
+    {
+        return;
+    }
+    const DWORD now = GetTickCount();
+    // Instant-first: a trigger-enabled steal fires the FIRST item alone.
+    if (!g_eventLog.theftFirstTick && !g_eventLog.theftInstantFired && IsTriggerEventType("theft"))
+    {
+        g_eventLog.theftInstantFired = true;
+        g_eventLog.theftInstantTick = now;
+        std::string summary = "Stole " + name;
+        if (!g_eventLog.theftSourceName.empty())
+        {
+            summary += " from " + g_eventLog.theftSourceName;
+            if (g_eventLog.theftSourceIsActor)
+            {
+                summary += "'s pockets";
+            }
+        }
+        QueueGameEvent("theft", summary);
+        return;
+    }
+    if (!g_eventLog.theftFirstTick)
+    {
+        g_eventLog.theftFirstTick = now;
+        g_eventLog.theftWitnesses.clear();
+        g_eventLog.theftSeenWitnesses.clear();
+    }
+    g_eventLog.theftLastTick = now;
+    g_eventLog.theftCounts[name] += 1;
+    UnionWitnessKeys(g_eventLog.theftWitnesses, CollectEventWitnessKeys());
+    UnionWitnessKeys(g_eventLog.theftSeenWitnesses, CollectEventWitnessSeen());
+}
+
+void EmitTheftWindowEvent()
+{
+    if (!g_eventLog.theftFirstTick)
+    {
+        return;
+    }
+    int total = 0;
+    for (const auto& entry : g_eventLog.theftCounts)
+    {
+        total += entry.second;
+    }
+    const bool theftAfterInstant = g_eventLog.theftInstantFired;
+    g_eventLog.theftInstantFired = false;
+    std::string what;
+    if (total == 1)
+    {
+        what = g_eventLog.theftCounts.begin()->first;
+    }
+    else
+    {
+        char head[48]{};
+        std::snprintf(head, sizeof(head), "%d%s items", total,
+            theftAfterInstant ? " more" : "");
+        what = head;
+        int shown = 0;
+        for (const auto& entry : g_eventLog.theftCounts)
+        {
+            if (shown == 3)
+            {
+                break;
+            }
+            what += (shown == 0) ? " incl. " : ", ";
+            what += entry.first;
+            if (entry.second > 1)
+            {
+                char suffix[16]{};
+                std::snprintf(suffix, sizeof(suffix), " x%d", entry.second);
+                what += suffix;
+            }
+            ++shown;
+        }
+    }
+    std::string summary = (theftAfterInstant && total == 1 ? "Also stole " : "Stole ") + what;
+    if (!g_eventLog.theftSourceName.empty())
+    {
+        summary += " from " + g_eventLog.theftSourceName;
+        if (g_eventLog.theftSourceIsActor)
+        {
+            summary += "'s pockets";
+        }
+    }
+    g_eventLog.theftFirstTick = 0;
+    g_eventLog.theftLastTick = 0;
+    g_eventLog.theftCounts.clear();
+    g_eventLog.theftSourceName.clear();
+    g_eventLog.theftSourceIsActor = false;
+    const std::vector<std::string> witnesses = std::move(g_eventLog.theftWitnesses);
+    g_eventLog.theftWitnesses.clear();
+    const std::vector<std::string> seenWitnesses = std::move(g_eventLog.theftSeenWitnesses);
+    g_eventLog.theftSeenWitnesses.clear();
+    QueueGameEvent("theft", summary, {}, std::string(), &witnesses, std::string(),
+        &seenWitnesses, theftAfterInstant);
+}
+
+// Routes a player pickup that is actually a STEAL away from the loot window.
+// Returns true when the pickup was consumed by the theft machinery.
+bool RouteTheftPickup(TESForm* itemForm)
+{
+    if (!itemForm)
+    {
+        return false;
+    }
+    const DWORD now = GetTickCount();
+    // A world item taken via a steal-activate: already recorded at activation.
+    if (g_eventLog.theftPendingBaseId
+        && itemForm->refID == g_eventLog.theftPendingBaseId
+        && (now - g_eventLog.theftPendingTick) <= kTheftActivateGraceMs)
+    {
+        g_eventLog.theftPendingBaseId = 0;
+        return true;
+    }
+    // Items taken while an owned container / pickpocket session is open.
+    if (g_eventLog.theftSourceRefId && IsMenuVisible(kMenuType_Container))
+    {
+        RecordStolenItem(itemForm);
+        return true;
+    }
+    return false;
+}
+
+// One sold item into the trade window (selling a stack of junk to a vendor
+// must not spam one event per item).
+void RecordSoldItem(TESForm* itemForm)
+{
+    const std::string name = GetDisplayNameSafe(itemForm);
+    if (name.empty())
+    {
+        return;
+    }
+    const DWORD now = GetTickCount();
+    if (!g_eventLog.sellFirstTick && !g_eventLog.sellInstantFired && IsTriggerEventType("trade"))
+    {
+        g_eventLog.sellInstantFired = true;
+        g_eventLog.sellInstantTick = now;
+        QueueGameEvent("trade", "Sold " + name);
+        return;
+    }
+    if (!g_eventLog.sellFirstTick)
+    {
+        g_eventLog.sellFirstTick = now;
+        g_eventLog.sellWitnesses.clear();
+        g_eventLog.sellSeenWitnesses.clear();
+    }
+    g_eventLog.sellLastTick = now;
+    g_eventLog.sellCounts[name] += 1;
+    UnionWitnessKeys(g_eventLog.sellWitnesses, CollectEventWitnessKeys());
+    UnionWitnessKeys(g_eventLog.sellSeenWitnesses, CollectEventWitnessSeen());
+}
+
+void EmitTradeWindowEvent()
+{
+    if (!g_eventLog.sellFirstTick)
+    {
+        return;
+    }
+    int total = 0;
+    for (const auto& entry : g_eventLog.sellCounts)
+    {
+        total += entry.second;
+    }
+    const bool sellAfterInstant = g_eventLog.sellInstantFired;
+    g_eventLog.sellInstantFired = false;
+    std::string summary;
+    if (total == 1)
+    {
+        summary = (sellAfterInstant ? "Also sold " : "Sold ")
+            + g_eventLog.sellCounts.begin()->first;
+    }
+    else
+    {
+        char head[48]{};
+        std::snprintf(head, sizeof(head), "Sold %d%s items", total,
+            sellAfterInstant ? " more" : "");
+        summary = head;
+        int shown = 0;
+        for (const auto& entry : g_eventLog.sellCounts)
+        {
+            if (shown == 3)
+            {
+                break;
+            }
+            summary += (shown == 0) ? " incl. " : ", ";
+            summary += entry.first;
+            if (entry.second > 1)
+            {
+                char suffix[16]{};
+                std::snprintf(suffix, sizeof(suffix), " x%d", entry.second);
+                summary += suffix;
+            }
+            ++shown;
+        }
+    }
+    g_eventLog.sellFirstTick = 0;
+    g_eventLog.sellLastTick = 0;
+    g_eventLog.sellCounts.clear();
+    const std::vector<std::string> witnesses = std::move(g_eventLog.sellWitnesses);
+    g_eventLog.sellWitnesses.clear();
+    const std::vector<std::string> seenWitnesses = std::move(g_eventLog.sellSeenWitnesses);
+    g_eventLog.sellSeenWitnesses.clear();
+    QueueGameEvent("trade", summary, {}, std::string(), &witnesses, std::string(),
+        &seenWitnesses, sellAfterInstant);
+}
+
 void TouchCombatEncounter(TESObjectREFR* actorRef)
 {
     const DWORD now = GetTickCount();
@@ -17877,15 +18798,23 @@ void TouchCombatEncounter(TESObjectREFR* actorRef)
         g_eventLog.combatKills.clear();
         g_eventLog.combatHits = 0;
         g_eventLog.combatPlayerInvolved = false;
+        g_eventLog.combatWitnesses.clear();
+        g_eventLog.combatSeenWitnesses.clear();
         // Any in-flight "shooting" burst was the opening of this fight, not
         // idle plinking — discard it so it never double-logs alongside combat.
         g_eventLog.shootFirstTick = 0;
         g_eventLog.shootLastTick = 0;
         g_eventLog.shootShots = 0;
         g_eventLog.shootWeapon.clear();
+        g_eventLog.shootWitnesses.clear();
+        g_eventLog.shootSeenWitnesses.clear();
         LogHookFirstFire("combat_encounter_open");
     }
     g_eventLog.combatLastActivityTick = now;
+    // Witnesses accumulate over the whole encounter (the ~1s collection cache
+    // keeps this cheap even though hits touch every swing).
+    UnionWitnessKeys(g_eventLog.combatWitnesses, CollectEventWitnessKeys());
+    UnionWitnessKeys(g_eventLog.combatSeenWitnesses, CollectEventWitnessSeen());
     if (!actorRef)
     {
         return;
@@ -17915,6 +18844,10 @@ void EmitCombatEncounterEvent()
         return;
     }
     g_eventLog.combatActive = false;
+    const std::vector<std::string> witnesses = std::move(g_eventLog.combatWitnesses);
+    g_eventLog.combatWitnesses.clear();
+    const std::vector<std::string> seenWitnesses = std::move(g_eventLog.combatSeenWitnesses);
+    g_eventLog.combatSeenWitnesses.clear();
 
     // Ignore encounters the player never touched (distant NPC squabbles).
     if (!g_eventLog.combatPlayerInvolved && g_eventLog.combatKills.empty())
@@ -18004,7 +18937,8 @@ void EmitCombatEncounterEvent()
         }
         actors.emplace_back(entry.second, FormIdHex(entry.first));
     }
-    QueueGameEvent("combat", summary, actors, g_eventLog.combatPlace);
+    QueueGameEvent("combat", summary, actors, g_eventLog.combatPlace, &witnesses,
+        std::string(), &seenWitnesses);
 }
 
 // --- xNVSE EventManager native handlers (params = void*[2] {source, object},
@@ -18077,8 +19011,12 @@ void OnDeathEventHandler(TESObjectREFR* /*thisObj*/, void* parameters)
     }
     if (victimIsTeammate)
     {
+        // The dying companion never "witnesses" their own death.
+        const auto victimMapped = ResolveMappedNpcImpl(dying, false);
         QueueGameEvent("death", "Companion " + victimName + " was killed"
-            + (killerName.empty() ? "" : (" by " + killerName)));
+            + (killerName.empty() ? "" : (" by " + killerName)),
+            {}, std::string(), nullptr,
+            victimMapped ? victimMapped->first : std::string());
         TouchCombatEncounter(dying);
         return;
     }
@@ -18093,8 +19031,21 @@ void OnDeathEventHandler(TESObjectREFR* /*thisObj*/, void* parameters)
     }
     if (killerIsPlayer)
     {
+        const DWORD deathNow = GetTickCount();
+        g_eventLog.recentPlayerKillVictimId = dying->refID;
+        g_eventLog.recentPlayerKillTick = deathNow;
+        // The same kill classified as MURDER (onmurder fires alongside
+        // ondeath for non-hostile victims): the murder line supersedes this.
+        if (g_eventLog.recentMurderVictimId == dying->refID
+            && (deathNow - g_eventLog.recentMurderTick) <= kMurderDeathMergeMs)
+        {
+            return;
+        }
+        const auto victimMapped = ResolveMappedNpcImpl(dying, false);
         QueueGameEvent("death", kill,
-            { { victimName, FormIdHex(dying->refID) } });
+            { { victimName, FormIdHex(dying->refID) } },
+            std::string(), nullptr,
+            victimMapped ? victimMapped->first : std::string());
     }
 }
 
@@ -18181,12 +19132,25 @@ void RecordPlayerItemPickup(TESForm* itemForm)
         return;
     }
     const DWORD now = GetTickCount();
+    // Instant-first (task/triggers): when "item" is a trigger, the FIRST
+    // pickup fires alone immediately; follow-ups aggregate as memory-only.
+    if (!g_eventLog.lootFirstTick && !g_eventLog.lootInstantFired && IsTriggerEventType("item"))
+    {
+        g_eventLog.lootInstantFired = true;
+        g_eventLog.lootInstantTick = now;
+        QueueGameEvent("item", "Picked up " + name);
+        return;
+    }
     if (!g_eventLog.lootFirstTick)
     {
         g_eventLog.lootFirstTick = now;
+        g_eventLog.lootWitnesses.clear();
+        g_eventLog.lootSeenWitnesses.clear();
     }
     g_eventLog.lootLastTick = now;
     g_eventLog.lootCounts[name] += 1;
+    UnionWitnessKeys(g_eventLog.lootWitnesses, CollectEventWitnessKeys());
+    UnionWitnessKeys(g_eventLog.lootSeenWitnesses, CollectEventWitnessSeen());
     if (IsNotableInventoryForm(itemForm)
         && std::find(g_eventLog.lootNotables.begin(), g_eventLog.lootNotables.end(), name)
             == g_eventLog.lootNotables.end())
@@ -18206,10 +19170,13 @@ void EmitLootWindowEvent()
     {
         total += entry.second;
     }
+    const bool lootAfterInstant = g_eventLog.lootInstantFired;
+    g_eventLog.lootInstantFired = false;
     std::string summary;
     if (total == 1)
     {
-        summary = "Picked up " + g_eventLog.lootCounts.begin()->first;
+        summary = (lootAfterInstant ? "Also picked up " : "Picked up ")
+            + g_eventLog.lootCounts.begin()->first;
     }
     else
     {
@@ -18227,7 +19194,8 @@ void EmitLootWindowEvent()
             }
         }
         char head[48]{};
-        std::snprintf(head, sizeof(head), "Picked up %d items", total);
+        std::snprintf(head, sizeof(head), "Picked up %d%s items", total,
+            lootAfterInstant ? " more" : "");
         summary = head;
         if (!highlights.empty())
         {
@@ -18253,7 +19221,12 @@ void EmitLootWindowEvent()
     g_eventLog.lootLastTick = 0;
     g_eventLog.lootCounts.clear();
     g_eventLog.lootNotables.clear();
-    QueueGameEvent("item", summary);
+    const std::vector<std::string> witnesses = std::move(g_eventLog.lootWitnesses);
+    g_eventLog.lootWitnesses.clear();
+    const std::vector<std::string> seenWitnesses = std::move(g_eventLog.lootSeenWitnesses);
+    g_eventLog.lootSeenWitnesses.clear();
+    QueueGameEvent("item", summary, {}, std::string(), &witnesses, std::string(),
+        &seenWitnesses, lootAfterInstant);
 }
 
 void OnAddEventHandler(TESObjectREFR* /*thisObj*/, void* parameters)
@@ -18279,14 +19252,21 @@ void OnAddEventHandler(TESObjectREFR* /*thisObj*/, void* parameters)
         return;
     }
     // Classic OnAdd marks the ITEM ref with the container as the object, but
-    // accept the swapped orientation too.
+    // accept the swapped orientation too. A pickup that is actually a STEAL
+    // (flagged by the activate handler / an open owned-container session) is
+    // consumed by the theft window instead of the loot window.
+    TESForm* item = nullptr;
     if (second == static_cast<TESForm*>(player) && first && first->baseForm)
     {
-        RecordPlayerItemPickup(first->baseForm);
+        item = first->baseForm;
     }
     else if (first == static_cast<TESObjectREFR*>(player) && second)
     {
-        RecordPlayerItemPickup(second);
+        item = second;
+    }
+    if (item && !RouteTheftPickup(item))
+    {
+        RecordPlayerItemPickup(item);
     }
 }
 
@@ -18427,12 +19407,23 @@ void RecordPlayerItemDrop(TESForm* itemForm)
         return;
     }
     const DWORD now = GetTickCount();
+    if (!g_eventLog.dropFirstTick && !g_eventLog.dropInstantFired && IsTriggerEventType("item"))
+    {
+        g_eventLog.dropInstantFired = true;
+        g_eventLog.dropInstantTick = now;
+        QueueGameEvent("item", "Dropped " + name);
+        return;
+    }
     if (!g_eventLog.dropFirstTick)
     {
         g_eventLog.dropFirstTick = now;
+        g_eventLog.dropWitnesses.clear();
+        g_eventLog.dropSeenWitnesses.clear();
     }
     g_eventLog.dropLastTick = now;
     g_eventLog.dropCounts[name] += 1;
+    UnionWitnessKeys(g_eventLog.dropWitnesses, CollectEventWitnessKeys());
+    UnionWitnessKeys(g_eventLog.dropSeenWitnesses, CollectEventWitnessSeen());
 }
 
 void EmitDropWindowEvent()
@@ -18446,15 +19437,19 @@ void EmitDropWindowEvent()
     {
         total += entry.second;
     }
+    const bool dropAfterInstant = g_eventLog.dropInstantFired;
+    g_eventLog.dropInstantFired = false;
     std::string summary;
     if (total == 1)
     {
-        summary = "Dropped " + g_eventLog.dropCounts.begin()->first;
+        summary = (dropAfterInstant ? "Also dropped " : "Dropped ")
+            + g_eventLog.dropCounts.begin()->first;
     }
     else
     {
         char head[48]{};
-        std::snprintf(head, sizeof(head), "Dropped %d items", total);
+        std::snprintf(head, sizeof(head), "Dropped %d%s items", total,
+            dropAfterInstant ? " more" : "");
         summary = head;
         int shown = 0;
         for (const auto& entry : g_eventLog.dropCounts)
@@ -18477,7 +19472,12 @@ void EmitDropWindowEvent()
     g_eventLog.dropFirstTick = 0;
     g_eventLog.dropLastTick = 0;
     g_eventLog.dropCounts.clear();
-    QueueGameEvent("item", summary);
+    const std::vector<std::string> witnesses = std::move(g_eventLog.dropWitnesses);
+    g_eventLog.dropWitnesses.clear();
+    const std::vector<std::string> seenWitnesses = std::move(g_eventLog.dropSeenWitnesses);
+    g_eventLog.dropSeenWitnesses.clear();
+    QueueGameEvent("item", summary, {}, std::string(), &witnesses, std::string(),
+        &seenWitnesses, dropAfterInstant);
 }
 
 // Out-of-combat shooting: an isolated shot or burst (hunting, target practice,
@@ -18489,6 +19489,8 @@ void EmitShootingEvent()
     {
         return;
     }
+    const bool shootAfterInstant = g_eventLog.shootInstantFired;
+    g_eventLog.shootInstantFired = false;
     const int shots = g_eventLog.shootShots;
     const std::string weapon = g_eventLog.shootWeapon;
     g_eventLog.shootFirstTick = 0;
@@ -18499,19 +19501,27 @@ void EmitShootingEvent()
     std::string summary;
     if (shots <= 1)
     {
-        summary = weapon.empty() ? "Took a shot" : ("Fired a shot from your " + weapon);
+        summary = shootAfterInstant
+            ? "Fired another shot"
+            : (weapon.empty() ? "Took a shot" : ("Fired a shot from your " + weapon));
     }
     else
     {
         char head[96]{};
-        std::snprintf(head, sizeof(head), "Fired %d rounds", shots);
+        std::snprintf(head, sizeof(head), "Fired %d%s rounds", shots,
+            shootAfterInstant ? " more" : "");
         summary = head;
         if (!weapon.empty())
         {
             summary += " from your " + weapon;
         }
     }
-    QueueGameEvent("shooting", summary);
+    const std::vector<std::string> witnesses = std::move(g_eventLog.shootWitnesses);
+    g_eventLog.shootWitnesses.clear();
+    const std::vector<std::string> seenWitnesses = std::move(g_eventLog.shootSeenWitnesses);
+    g_eventLog.shootSeenWitnesses.clear();
+    QueueGameEvent("shooting", summary, {}, std::string(), &witnesses, std::string(),
+        &seenWitnesses, shootAfterInstant);
 }
 
 void OnDropEventHandler(TESObjectREFR* /*thisObj*/, void* parameters)
@@ -18546,7 +19556,390 @@ void OnDropEventHandler(TESObjectREFR* /*thisObj*/, void* parameters)
     }
 }
 
-void OnFireEventHandler(TESObjectREFR* /*thisObj*/, void* parameters)
+// One out-of-combat shot into the shooting burst (or an instant-first single
+// event when "shooting" is a trigger type).
+void RecordOutOfCombatShot()
+{
+    PlayerCharacter* player = GetPlayer();
+    if (!player || g_eventLog.combatActive || player->unk104)
+    {
+        return; // in a fight the shots belong to the combat encounter
+    }
+    const DWORD now = GetTickCount();
+    if (!g_eventLog.shootFirstTick && !g_eventLog.shootInstantFired && IsTriggerEventType("shooting"))
+    {
+        TESObjectWEAP* weapon = player->GetEquippedWeapon();
+        const std::string weaponName = weapon ? GetDisplayNameSafe(weapon) : "";
+        g_eventLog.shootInstantFired = true;
+        g_eventLog.shootInstantTick = now;
+        QueueGameEvent("shooting", weaponName.empty()
+            ? std::string("Fired a shot")
+            : ("Fired a shot from your " + weaponName));
+        return;
+    }
+    if (!g_eventLog.shootFirstTick)
+    {
+        g_eventLog.shootFirstTick = now;
+        g_eventLog.shootShots = 0;
+        g_eventLog.shootWitnesses.clear();
+        g_eventLog.shootSeenWitnesses.clear();
+        TESObjectWEAP* weapon = player->GetEquippedWeapon();
+        g_eventLog.shootWeapon = weapon ? GetDisplayNameSafe(weapon) : "";
+    }
+    g_eventLog.shootLastTick = now;
+    g_eventLog.shootShots += 1;
+    UnionWitnessKeys(g_eventLog.shootWitnesses, CollectEventWitnessKeys());
+    UnionWitnessKeys(g_eventLog.shootSeenWitnesses, CollectEventWitnessSeen());
+}
+
+// The engine's DetectionEvent (noise) layout — read by the diagnostic probe.
+struct EngineDetectionEvent
+{
+    UInt32 soundLevel;        // 00
+    float posX;               // 04
+    float posY;               // 08
+    float posZ;               // 0C
+    float timeStamp;          // 10
+    UInt32 unk14;             // 14
+    TESObjectREFR* locationRef; // 18
+};
+
+// ===========================================================================
+// DIRECT WEAPON-FIRE HOOK (task/triggers) — the engine consumes a round on
+// every trigger pull via `bool __fastcall RemoveAmmoOnFire(Actor* this,
+// TESObjectWEAP* weapon)` at 0x8A8DD0 (the same routine JIP LN's
+// OnFireWeapon event instruments). JIP jump-hooks the FUNCTION HEAD, so to
+// coexist we instrument the CALL SITES instead: at DeferredInit the
+// decrypted in-memory .text is scanned (the Steam exe is SteamStub-packed on
+// disk, so this cannot be precomputed) and every pristine `call 0x8A8DD0` is
+// redirected through an observer thunk that forwards to whatever currently
+// lives at 0x8A8DD0 — ours the original, JIP's replacement if it hooked —
+// and then reports the shot. The call at 0x8A86B0 is the engine's own
+// can-fire QUERY (JIP's handler excludes that return address too) and is
+// deliberately left alone.
+// ===========================================================================
+
+constexpr UInt32 kRemoveAmmoOnFireFnAddr = 0x8A8DD0;
+constexpr UInt32 kRemoveAmmoQueryCallSite = 0x8A86B0;
+
+void __fastcall OnWeaponFiredNotify(Actor* actor, TESObjectWEAP* weapon)
+{
+    if (!actor || actor != static_cast<Actor*>(GetPlayer()))
+    {
+        return; // NPC fire — their shots ride the combat encounter instead
+    }
+    (void)weapon;
+    RecordOutOfCombatShot();
+}
+
+__declspec(naked) bool __fastcall RemoveAmmoObserverThunk(Actor* /*actor*/, int, TESObjectWEAP* /*weapon*/)
+{
+    __asm
+    {
+        push	esi
+        push	edi
+        mov		esi, ecx                 // firing actor
+        mov		edi, [esp + 12]          // weapon ([esp]=edi, +4=esi, +8=ret, +12=arg)
+        push	edi                      // original consumes it (retn 4)
+        mov		ecx, esi
+        mov		eax, 0x8A8DD0
+        call	eax                      // original / JIP replacement; result in al
+        push	eax                      // preserve the engine's answer
+        mov		ecx, esi
+        mov		edx, edi
+        call	OnWeaponFiredNotify
+        pop		eax
+        pop		edi
+        pop		esi
+        retn	4
+    }
+}
+
+void InstallWeaponFireHook()
+{
+    static bool s_attempted = false;
+    if (s_attempted)
+    {
+        return;
+    }
+    s_attempted = true;
+
+    // .text bounds from the loaded module's PE headers (decrypted in memory).
+    const UInt8* base = reinterpret_cast<const UInt8*>(GetModuleHandleA(nullptr));
+    if (!base)
+    {
+        return;
+    }
+    const UInt32 lfanew = *reinterpret_cast<const UInt32*>(base + 0x3C);
+    const UInt8* nt = base + lfanew;
+    const UInt16 sectionCount = *reinterpret_cast<const UInt16*>(nt + 6);
+    const UInt16 optSize = *reinterpret_cast<const UInt16*>(nt + 20);
+    const UInt8* section = nt + 24 + optSize;
+    const UInt8* textStart = nullptr;
+    UInt32 textSize = 0;
+    for (UInt16 i = 0; i < sectionCount; ++i, section += 40)
+    {
+        if (std::memcmp(section, ".text", 6) == 0)
+        {
+            const UInt32 vaddr = *reinterpret_cast<const UInt32*>(section + 12);
+            textSize = *reinterpret_cast<const UInt32*>(section + 8);
+            textStart = base + vaddr;
+            break;
+        }
+    }
+    if (!textStart || !textSize)
+    {
+        LogLine("event-log: weapon-fire hook NOT installed (.text section not found).");
+        return;
+    }
+
+    int patched = 0;
+    const UInt8* end = textStart + textSize - 5;
+    for (const UInt8* p = textStart; p < end; ++p)
+    {
+        if (*p != 0xE8)
+        {
+            continue;
+        }
+        const UInt32 siteVA = static_cast<UInt32>(reinterpret_cast<uintptr_t>(p));
+        const SInt32 rel = *reinterpret_cast<const SInt32*>(p + 1);
+        if (siteVA + 5 + rel != kRemoveAmmoOnFireFnAddr)
+        {
+            continue;
+        }
+        if (siteVA == kRemoveAmmoQueryCallSite)
+        {
+            continue; // the engine's can-fire query, not an actual shot
+        }
+        WriteRelCall(siteVA, reinterpret_cast<UInt32>(RemoveAmmoObserverThunk));
+        ++patched;
+        LogLine("event-log: weapon-fire hook installed at %08X.", siteVA);
+    }
+    if (!patched)
+    {
+        LogLine("event-log: weapon-fire hook found NO call sites (unexpected exe layout?); shooting events disabled.");
+    }
+}
+
+// ===========================================================================
+// DIAGNOSTIC PROBE (task/triggers) — enabled by the PRESENCE of
+// control/diag_probe.on. Samples candidate engine signals every frame and
+// appends a line to bridge/diag_probe.log whenever any of them changes:
+// "spam the action in game, read the log" debugging for event sources.
+// Zero cost when the flag file is absent (existence re-checked at 1 Hz).
+// ===========================================================================
+
+fs::path DiagProbeFlagPath() { return BridgeDir() / "control" / "diag_probe.on"; }
+fs::path DiagProbeLogPath() { return BridgeDir() / "diag_probe.log"; }
+
+struct DiagProbeState
+{
+    DWORD flagPollTick = 0;
+    bool enabled = false;
+    bool sessionMarked = false;
+    UInt32 moveFlags = 0xFFFFFFFF;
+    int weaponOut = -1;
+    int aiming = -1;
+    SInt32 ammoCount = -2;
+    UInt32 weaponFormId = 0xFFFFFFFF;
+    UInt32 detSound = 0xFFFFFFFF;
+    float detStamp = -999.0f;
+    int witnesses = -1;
+    DWORD lastLogTick = 0;
+};
+DiagProbeState g_diagProbe;
+
+void UpdateDiagProbe()
+{
+    const DWORD now = GetTickCount();
+    if (!g_diagProbe.flagPollTick || (now - g_diagProbe.flagPollTick) >= 1000)
+    {
+        g_diagProbe.flagPollTick = now;
+        std::error_code ec;
+        g_diagProbe.enabled = fs::exists(DiagProbeFlagPath(), ec);
+    }
+    if (!g_diagProbe.enabled)
+    {
+        return;
+    }
+    PlayerCharacter* player = GetPlayer();
+    if (!player || !player->baseProcess)
+    {
+        return;
+    }
+
+    const UInt32 moveFlags = player->actorMover ? player->GetMovementFlags() : 0xDEADDEAD;
+    const int weaponOut = player->IsWeaponOut() ? 1 : 0;
+    auto* process = static_cast<MiddleHighProcess*>(player->baseProcess);
+    const int aiming = process->isAiming ? 1 : 0;
+    // Everything below reaches through pointers the engine can invalidate
+    // between frames — SEH-guarded reads only.
+    SInt32 ammoCount = -1;
+    UInt32 weaponFormId = 0;
+    if (BaseProcess::AmmoInfo* info = process->ammoInfo)
+    {
+        UInt32 raw = 0;
+        if (SafeReadU32(reinterpret_cast<const UInt8*>(info) + 0x04, &raw))
+        {
+            ammoCount = static_cast<SInt32>(raw);
+        }
+        UInt32 weaponPtr = 0;
+        if (SafeReadU32(reinterpret_cast<const UInt8*>(info) + 0x44, &weaponPtr) && weaponPtr)
+        {
+            UInt32 refId = 0;
+            if (SafeReadU32(reinterpret_cast<const UInt8*>(static_cast<uintptr_t>(weaponPtr)) + 0x0C, &refId))
+            {
+                weaponFormId = refId;
+            }
+        }
+    }
+    UInt32 detSound = 0;
+    float detStamp = -1.0f;
+    if (player->baseProcess->processLevel == 0)
+    {
+        auto* high = static_cast<HighProcess*>(player->baseProcess);
+        if (auto* noise = reinterpret_cast<EngineDetectionEvent*>(high->detectionEvent))
+        {
+            SafeReadU32(reinterpret_cast<const UInt8*>(noise) + 0x00, &detSound);
+            SafeReadF32(reinterpret_cast<const UInt8*>(noise) + 0x10, &detStamp);
+        }
+    }
+    const int witnesses = static_cast<int>(CollectEventWitnessKeys().size());
+
+    // Ignore the frame-churny movement bits (keep-moving etc.) for CHANGE
+    // detection, or moving writes a line every frame; log the full value.
+    const UInt32 moveMask = (1u << 7) | (1u << 8) | (1u << 9) | (1u << 11);
+    const bool changed = (moveFlags & moveMask) != (g_diagProbe.moveFlags & moveMask)
+        || weaponOut != g_diagProbe.weaponOut
+        || aiming != g_diagProbe.aiming
+        || ammoCount != g_diagProbe.ammoCount
+        || weaponFormId != g_diagProbe.weaponFormId
+        || detSound != g_diagProbe.detSound
+        || detStamp != g_diagProbe.detStamp
+        || witnesses != g_diagProbe.witnesses;
+    if (!changed || (g_diagProbe.lastLogTick && (now - g_diagProbe.lastLogTick) < 30))
+    {
+        return;
+    }
+    g_diagProbe.moveFlags = moveFlags;
+    g_diagProbe.weaponOut = weaponOut;
+    g_diagProbe.aiming = aiming;
+    g_diagProbe.ammoCount = ammoCount;
+    g_diagProbe.weaponFormId = weaponFormId;
+    g_diagProbe.detSound = detSound;
+    g_diagProbe.detStamp = detStamp;
+    g_diagProbe.witnesses = witnesses;
+    g_diagProbe.lastLogTick = now;
+
+    std::ofstream out(DiagProbeLogPath(), std::ios::binary | std::ios::app);
+    if (!out)
+    {
+        return;
+    }
+    if (!g_diagProbe.sessionMarked)
+    {
+        g_diagProbe.sessionMarked = true;
+        out << "=== probe session (build " << __DATE__ << " " << __TIME__ << ") ===\n";
+    }
+    char line[240]{};
+    std::snprintf(line, sizeof(line),
+        "t=%lu move=%08X sneakBit=%u wepOut=%d aim=%d ammo=%d wep=%08X sound=%u stamp=%.3f wit=%d\n",
+        static_cast<unsigned long>(now), moveFlags, (moveFlags >> 10) & 1,
+        weaponOut, aiming, static_cast<int>(ammoCount), weaponFormId,
+        detSound, detStamp, witnesses);
+    out << line;
+}
+
+// Player-state sensor via the GAME'S OWN script function (the same call every
+// GECK script relies on) instead of reverse-engineered field offsets: vanilla
+// IsSneaking. Compiled once, read through the existing CallFunction machinery.
+Script* g_playerSneakProbeScript = nullptr;
+
+bool EnsurePlayerStateProbeScripts()
+{
+    if (g_playerSneakProbeScript)
+    {
+        return true;
+    }
+    if (!g_scriptInterface)
+    {
+        return false;
+    }
+    constexpr char kSneakScript[] = R"(
+ref rActor
+float fOut
+
+Begin Function { rActor }
+    let fOut := 0
+    if rActor
+        let fOut := rActor.IsSneaking
+    endif
+    SetFunctionValue fOut
+End
+)";
+    g_playerSneakProbeScript = g_scriptInterface->CompileScript(kSneakScript);
+    if (!g_playerSneakProbeScript)
+    {
+        LogLine("event-log: failed to compile IsSneaking helper script.");
+    }
+    return g_playerSneakProbeScript != nullptr;
+}
+
+bool IsPlayerSneakingNow()
+{
+    PlayerCharacter* player = GetPlayer();
+    if (!player)
+    {
+        return false;
+    }
+    // The engine's own answer, when available...
+    if (EnsurePlayerStateProbeScripts() && g_playerSneakProbeScript)
+    {
+        NVSEArrayVarInterface::Element result;
+        if (g_scriptInterface->CallFunction(g_playerSneakProbeScript, player, nullptr, &result, 1, player))
+        {
+            return result.GetType() == NVSEArrayVarInterface::Element::kType_Numeric
+                && result.GetNumber() != 0.0;
+        }
+    }
+    // ...else the probe-calibrated movement-flag bit (bit 10; the SDK's
+    // "bit 9 = sneaking" comment is off by one and permanently set for the
+    // player, per the 2026-07-05 diag_probe capture).
+    if (!player->actorMover)
+    {
+        return false;
+    }
+    return (player->GetMovementFlags() >> 10) & 1;
+}
+
+// Inventory-object form types the player can TAKE by activating (the shapes
+// the red "Steal" prompt applies to).
+bool IsTakeableItemType(UInt8 typeId)
+{
+    switch (typeId)
+    {
+    case kFormType_TESObjectWEAP:
+    case kFormType_TESObjectARMO:
+    case kFormType_TESObjectBOOK:
+    case kFormType_AlchemyItem:
+    case kFormType_TESObjectMISC:
+    case kFormType_TESAmmo:
+    case kFormType_TESKey:
+    case kFormType_TESCasinoChips:
+    case kFormType_TESCaravanCard:
+    case kFormType_TESCaravanMoney:
+        return true;
+    default:
+        return false;
+    }
+}
+
+// Classic onactivate: one param is the activated reference, the other the
+// activator; orientation is resolved by finding the player (logged on first
+// fire). This is where taking becomes STEALING — the same ownership signal
+// that turns the HUD prompt red — and where sneaking up on someone's pockets
+// becomes a pickpocket.
+void OnActivateEventHandler(TESObjectREFR* /*thisObj*/, void* parameters)
 {
     if (!parameters)
     {
@@ -18554,36 +19947,206 @@ void OnFireEventHandler(TESObjectREFR* /*thisObj*/, void* parameters)
     }
     void** params = static_cast<void**>(parameters);
     auto* first = static_cast<TESObjectREFR*>(params[0]);
-    auto* second = static_cast<TESForm*>(params[1]);
-    if (g_eventLog.loggedHookFirstFire.insert("onfire").second)
+    auto* second = reinterpret_cast<TESObjectREFR*>(static_cast<TESForm*>(params[1]));
+    if (g_eventLog.loggedHookFirstFire.insert("onactivate").second)
     {
-        LogLine("event-log: hook onfire fired for the first time this session (p0 type=%u, p1 type=%u).",
+        LogLine("event-log: hook onactivate fired for the first time this session (p0 type=%u, p1 type=%u).",
             first ? static_cast<unsigned>(first->typeID) : 0,
             second ? static_cast<unsigned>(second->typeID) : 0);
     }
-    // Only the PLAYER firing, and only while NOT in a combat encounter (in
-    // combat the shots are part of the fight and would be pure noise).
     PlayerCharacter* player = GetPlayer();
     if (!player)
     {
         return;
     }
-    const bool playerFired = (first == static_cast<TESObjectREFR*>(player))
-        || (second == static_cast<TESForm*>(player));
-    if (!playerFired || g_eventLog.combatActive || player->unk104)
+    TESObjectREFR* activated = nullptr;
+    if (second == static_cast<TESObjectREFR*>(player))
+    {
+        activated = first;
+    }
+    else if (first == static_cast<TESObjectREFR*>(player))
+    {
+        activated = second;
+    }
+    if (!activated || activated == static_cast<TESObjectREFR*>(player) || !activated->baseForm)
+    {
+        return;
+    }
+
+    const UInt8 typeId = activated->baseForm->typeID;
+    const DWORD now = GetTickCount();
+
+    // Pickpocket: activating a LIVING actor while sneaking opens their pockets.
+    if (typeId == kFormType_TESNPC || typeId == kFormType_TESCreature)
+    {
+        auto* actor = DYNAMIC_CAST(activated, TESObjectREFR, Actor);
+        if (actor && actor->lifeState == 0 && IsPlayerSneakingNow())
+        {
+            const std::string name = EventActorName(activated);
+            g_eventLog.theftSourceRefId = activated->refID;
+            g_eventLog.theftSourceName = name;
+            g_eventLog.theftSourceIsActor = true;
+            const auto recent = g_eventLog.recentPickpockets.find(activated->refID);
+            if (recent == g_eventLog.recentPickpockets.end()
+                || (now - recent->second) >= kPickpocketDedupMs)
+            {
+                g_eventLog.recentPickpockets[activated->refID] = now;
+                const auto mapped = ResolveMappedNpcImpl(activated, false);
+                QueueGameEvent("pickpocket", "Went through " + name + "'s pockets",
+                    { { name, FormIdHex(activated->refID) } }, std::string(), nullptr,
+                    mapped ? mapped->first : std::string());
+            }
+        }
+        return;
+    }
+
+    // Owned container: everything taken while it is open is a steal (the
+    // session is closed by the slow poll when the container menu closes).
+    if (typeId == kFormType_TESObjectCONT)
+    {
+        if (IsTheftToTakeFrom(activated))
+        {
+            g_eventLog.theftSourceRefId = activated->refID;
+            g_eventLog.theftSourceName = EventDisplayName(activated);
+            g_eventLog.theftSourceIsActor = false;
+            LogHookFirstFire("theft_container");
+        }
+        return;
+    }
+
+    // Owned world item: activating it takes it — record the steal now and let
+    // RouteTheftPickup keep the following OnAdd out of the loot window.
+    if (IsTakeableItemType(typeId) && IsTheftToTakeFrom(activated))
+    {
+        g_eventLog.theftPendingBaseId = activated->baseForm->refID;
+        g_eventLog.theftPendingTick = now;
+        RecordStolenItem(activated->baseForm);
+        LogHookFirstFire("theft_item");
+    }
+}
+
+// Classic onmurder (killing a non-hostile): the same kill also fires ondeath,
+// so the two handlers cross-check and only ONE line survives — this one wins,
+// it carries the guilt.
+void OnMurderEventHandler(TESObjectREFR* /*thisObj*/, void* parameters)
+{
+    LogHookFirstFire("onmurder");
+    if (!parameters)
+    {
+        return;
+    }
+    void** params = static_cast<void**>(parameters);
+    auto* dying = static_cast<TESObjectREFR*>(params[0]);
+    auto* killerRef = reinterpret_cast<TESObjectREFR*>(static_cast<TESForm*>(params[1]));
+    if (!dying)
+    {
+        return;
+    }
+    const bool killerIsPlayer = killerRef == static_cast<TESObjectREFR*>(GetPlayer());
+    if (!killerIsPlayer || IsPlayerRef(dying))
     {
         return;
     }
     const DWORD now = GetTickCount();
-    if (!g_eventLog.shootFirstTick)
+    g_eventLog.recentMurderVictimId = dying->refID;
+    g_eventLog.recentMurderTick = now;
+    // ondeath got there first with a plain "You killed X"? The murder
+    // classification supersedes it — retract that pending line.
+    if (g_eventLog.recentPlayerKillVictimId == dying->refID
+        && (now - g_eventLog.recentPlayerKillTick) <= kMurderDeathMergeMs)
     {
-        g_eventLog.shootFirstTick = now;
-        g_eventLog.shootShots = 0;
-        TESObjectWEAP* weapon = player->GetEquippedWeapon();
-        g_eventLog.shootWeapon = weapon ? GetDisplayNameSafe(weapon) : "";
+        std::lock_guard<std::mutex> lock(g_eventLog.pendingMutex);
+        if (!g_eventLog.pending.empty()
+            && g_eventLog.pending.back().find("\"type\":\"death\"") != std::string::npos)
+        {
+            g_eventLog.pending.pop_back();
+        }
     }
-    g_eventLog.shootLastTick = now;
-    g_eventLog.shootShots += 1;
+    const std::string victimName = EventActorName(dying);
+    const auto mapped = ResolveMappedNpcImpl(dying, false);
+    QueueGameEvent("murder", "Murdered " + victimName,
+        { { victimName, FormIdHex(dying->refID) } }, std::string(), nullptr,
+        mapped ? mapped->first : std::string());
+}
+
+// Classic onsell: one param is the sold item's inventory reference, the other
+// the selling actor. Sales aggregate into ONE trade event per spree.
+void OnSellEventHandler(TESObjectREFR* /*thisObj*/, void* parameters)
+{
+    if (!parameters)
+    {
+        return;
+    }
+    void** params = static_cast<void**>(parameters);
+    auto* first = static_cast<TESObjectREFR*>(params[0]);
+    auto* second = reinterpret_cast<TESObjectREFR*>(static_cast<TESForm*>(params[1]));
+    if (g_eventLog.loggedHookFirstFire.insert("onsell").second)
+    {
+        LogLine("event-log: hook onsell fired for the first time this session (p0 type=%u, p1 type=%u).",
+            first ? static_cast<unsigned>(first->typeID) : 0,
+            second ? static_cast<unsigned>(second->typeID) : 0);
+    }
+    PlayerCharacter* player = GetPlayer();
+    if (!player)
+    {
+        return;
+    }
+    auto isItemRef = [player](TESObjectREFR* ref) {
+        return ref && ref != static_cast<TESObjectREFR*>(player) && ref->baseForm
+            && ref->baseForm->typeID != kFormType_TESNPC
+            && ref->baseForm->typeID != kFormType_TESCreature;
+    };
+    TESObjectREFR* itemRef = isItemRef(first) ? first : (isItemRef(second) ? second : nullptr);
+    if (itemRef)
+    {
+        RecordSoldItem(itemRef->baseForm);
+    }
+}
+
+// --- xNVSE new-style events (params = void*[N] matching the event's types) --
+
+// Small shared shape for the one-ref crime/skill beats.
+void QueueOneRefEvent(const char* hook, void* parameters, const char* type,
+    const char* withName, const char* withoutName)
+{
+    LogHookFirstFire(hook);
+    TESObjectREFR* ref = nullptr;
+    if (parameters)
+    {
+        ref = static_cast<TESObjectREFR*>(static_cast<void**>(parameters)[0]);
+    }
+    const std::string name = ref ? EventDisplayName(ref) : std::string();
+    QueueGameEvent(type, name.empty() ? std::string(withoutName) : (withName + name));
+}
+
+void OnLockpickSuccessEventHandler(TESObjectREFR* /*thisObj*/, void* parameters)
+{
+    QueueOneRefEvent("onlockpicksuccess", parameters, "lockpick",
+        "Picked the lock on ", "Picked a lock");
+}
+
+void OnLockBrokenEventHandler(TESObjectREFR* /*thisObj*/, void* parameters)
+{
+    QueueOneRefEvent("onlockbroken", parameters, "lockpick",
+        "Broke the lock on ", "Broke a lock open");
+}
+
+void OnTerminalHackedEventHandler(TESObjectREFR* /*thisObj*/, void* parameters)
+{
+    QueueOneRefEvent("onterminalhacked", parameters, "hacking",
+        "Hacked ", "Hacked a terminal");
+}
+
+void OnTerminalHackFailedEventHandler(TESObjectREFR* /*thisObj*/, void* parameters)
+{
+    QueueOneRefEvent("onterminalhackfailed", parameters, "hacking",
+        "Got locked out of ", "Got locked out of a terminal");
+}
+
+void OnRepairEventHandler(TESObjectREFR* /*thisObj*/, void* parameters)
+{
+    // TwoRefs_OneInt: the repaired item ref rides first; fall back gracefully.
+    QueueOneRefEvent("onrepair", parameters, "repair", "Repaired ", "Repaired an item");
 }
 
 void RegisterGameEventHandlers()
@@ -18611,7 +20174,15 @@ void RegisterGameEventHandlers()
         { "onactorequip", OnActorEquipEventHandler },
         { "onactorunequip", OnActorUnequipEventHandler },
         { "ondrop", OnDropEventHandler },
-        { "onfire", OnFireEventHandler },
+        // Crime + skill beats (task/triggers round 2).
+        { "onactivate", OnActivateEventHandler },
+        { "onmurder", OnMurderEventHandler },
+        { "onsell", OnSellEventHandler },
+        { "onlockpicksuccess", OnLockpickSuccessEventHandler },
+        { "onlockbroken", OnLockBrokenEventHandler },
+        { "onterminalhacked", OnTerminalHackedEventHandler },
+        { "onterminalhackfailed", OnTerminalHackFailedEventHandler },
+        { "onrepair", OnRepairEventHandler },
     };
     for (const HookSpec& hook : hooks)
     {
@@ -18653,6 +20224,49 @@ void ResetGameEventRuntime(const char* reason)
     g_eventLog.lastConversationTick = 0;
     g_eventLog.dialogMenuWasOpen = false;
     g_eventLog.dialogMenuPartner.clear();
+    g_eventLog.witnessCacheTick = 0;
+    g_eventLog.witnessCacheKeys.clear();
+    g_eventLog.witnessCacheSeen.clear();
+    g_eventLog.combatWitnesses.clear();
+    g_eventLog.combatSeenWitnesses.clear();
+    g_eventLog.lootWitnesses.clear();
+    g_eventLog.lootSeenWitnesses.clear();
+    g_eventLog.dropWitnesses.clear();
+    g_eventLog.dropSeenWitnesses.clear();
+    g_eventLog.shootWitnesses.clear();
+    g_eventLog.shootSeenWitnesses.clear();
+    g_eventLog.theftPendingBaseId = 0;
+    g_eventLog.theftPendingTick = 0;
+    g_eventLog.theftSourceRefId = 0;
+    g_eventLog.theftSourceName.clear();
+    g_eventLog.theftSourceIsActor = false;
+    g_eventLog.theftFirstTick = 0;
+    g_eventLog.theftLastTick = 0;
+    g_eventLog.theftCounts.clear();
+    g_eventLog.theftWitnesses.clear();
+    g_eventLog.theftSeenWitnesses.clear();
+    g_eventLog.recentPickpockets.clear();
+    g_eventLog.recentMurderVictimId = 0;
+    g_eventLog.recentPlayerKillVictimId = 0;
+    g_eventLog.sellFirstTick = 0;
+    g_eventLog.sellLastTick = 0;
+    g_eventLog.sellCounts.clear();
+    g_eventLog.sellWitnesses.clear();
+    g_eventLog.sellSeenWitnesses.clear();
+    g_eventLog.weaponOutLast = false;
+    g_eventLog.weaponEventTick = 0;
+    g_eventLog.sneakingLast = false;
+    g_eventLog.sneakEventTick = 0;
+    for (bool& crippled : g_eventLog.limbCrippled)
+    {
+        crippled = false;
+    }
+    g_eventLog.radStageLast = 0;
+    g_eventLog.lootInstantFired = false;
+    g_eventLog.dropInstantFired = false;
+    g_eventLog.theftInstantFired = false;
+    g_eventLog.sellInstantFired = false;
+    g_eventLog.shootInstantFired = false;
     LogLine("event-log: runtime reset (%s).", reason ? reason : "");
 }
 
@@ -18672,7 +20286,12 @@ void NoteConversationRequestForEventLog(const std::string& npcKey, const std::st
     }
     g_eventLog.lastConversationNpcKey = npcKey;
     g_eventLog.lastConversationTick = now;
-    QueueGameEvent("conversation", "Talked with " + npcName, { { npcName, "" } });
+    // Explicit empty witnesses: this runs from WriteRequest, which can be OFF
+    // the main thread — witness collection walks cell lists and must not run
+    // here. (Conversation events are excluded from witness fan-out anyway.)
+    static const std::vector<std::string> kNoWitnesses;
+    QueueGameEvent("conversation", "Talked with " + npcName, { { npcName, "" } },
+        std::string(), &kNoWitnesses, npcKey);
 }
 
 int KarmaClassOf(float karma)
@@ -18903,6 +20522,121 @@ void UpdateGameEventLog()
         g_eventLog.dialogMenuWasOpen = dialogOpen;
     }
 
+    // --- weapon drawn / sneaking (social beats — transition + dedup + only when
+    // someone is around to see it, and never inside a real fight) ---------------
+    {
+        const bool inCombat = player->unk104 != 0;
+        const bool weaponOut = player->IsWeaponOut();
+        if (weaponOut && !g_eventLog.weaponOutLast && g_diagProbe.enabled)
+        {
+            LogLine("probe: weapon-draw transition (priming=%d inCombat=%d dedupLeftMs=%ld witnesses=%zu).",
+                priming ? 1 : 0, inCombat ? 1 : 0,
+                g_eventLog.weaponEventTick
+                    ? static_cast<long>(kWeaponDrawDedupMs) - static_cast<long>(now - g_eventLog.weaponEventTick)
+                    : 0L,
+                CollectEventWitnessKeys().size());
+        }
+        if (!priming && weaponOut && !g_eventLog.weaponOutLast && !inCombat
+            && (!g_eventLog.weaponEventTick || (now - g_eventLog.weaponEventTick) >= kWeaponDrawDedupMs)
+            && !CollectEventWitnessKeys().empty())
+        {
+            g_eventLog.weaponEventTick = now;
+            QueueGameEvent("weapon", "Drew a weapon");
+        }
+        g_eventLog.weaponOutLast = weaponOut;
+
+        const bool sneaking = IsPlayerSneakingNow();
+        if (sneaking && !g_eventLog.sneakingLast && g_diagProbe.enabled)
+        {
+            // Probe: show WHY a sneak transition did or didn't emit.
+            LogLine("probe: sneak transition (priming=%d inCombat=%d dedupLeftMs=%ld witnesses=%zu).",
+                priming ? 1 : 0, inCombat ? 1 : 0,
+                g_eventLog.sneakEventTick
+                    ? static_cast<long>(kSneakDedupMs) - static_cast<long>(now - g_eventLog.sneakEventTick)
+                    : 0L,
+                CollectEventWitnessKeys().size());
+        }
+        if (!priming && sneaking && !g_eventLog.sneakingLast && !inCombat
+            && (!g_eventLog.sneakEventTick || (now - g_eventLog.sneakEventTick) >= kSneakDedupMs)
+            && !CollectEventWitnessKeys().empty())
+        {
+            g_eventLog.sneakEventTick = now;
+            QueueGameEvent("sneak", "Started sneaking around");
+        }
+        g_eventLog.sneakingLast = sneaking;
+    }
+
+    // --- crippled limbs + radiation stage (condition polls) --------------------
+    {
+        static const char* kLimbNames[7] = {
+            "head", "torso", "left arm", "right arm", "left leg", "right leg", "head",
+        };
+        for (UInt32 code = kActorValueLimbFirst; code <= kActorValueLimbLast; ++code)
+        {
+            const size_t index = code - kActorValueLimbFirst;
+            const bool crippled = player->avOwner.Fn_03(code) <= 0.0f;
+            if (!priming && crippled && !g_eventLog.limbCrippled[index])
+            {
+                QueueGameEvent("injury",
+                    std::string("Got their ") + kLimbNames[index] + " crippled");
+            }
+            g_eventLog.limbCrippled[index] = crippled;
+        }
+
+        const float rads = player->avOwner.Fn_03(kActorValueRadLevel);
+        const int radStage = rads >= 800.0f ? 4 : rads >= 600.0f ? 3 : rads >= 400.0f ? 2 : rads >= 200.0f ? 1 : 0;
+        if (!priming && radStage > g_eventLog.radStageLast)
+        {
+            static const char* kRadStages[5] = {
+                "", "minor", "advanced", "critical", "deadly",
+            };
+            QueueGameEvent("rads",
+                std::string("Developed ") + kRadStages[radStage] + " radiation poisoning");
+        }
+        g_eventLog.radStageLast = radStage;
+    }
+
+    // --- theft session upkeep (owned container / pickpocket menu closed) -------
+    if (g_eventLog.theftSourceRefId && !IsMenuVisible(kMenuType_Container))
+    {
+        g_eventLog.theftSourceRefId = 0;
+        // Name/isActor stay for the window emit below.
+    }
+    // A steal-activate whose OnAdd never came (blocked?): expire the marker.
+    if (g_eventLog.theftPendingBaseId
+        && (now - g_eventLog.theftPendingTick) > kTheftActivateGraceMs)
+    {
+        g_eventLog.theftPendingBaseId = 0;
+    }
+
+    // Instant-first flags age out when no follow-up window formed, so the
+    // NEXT event of that type can be instant again.
+    if (g_eventLog.lootInstantFired && !g_eventLog.lootFirstTick
+        && (now - g_eventLog.lootInstantTick) >= kLootWindowQuietMs)
+    {
+        g_eventLog.lootInstantFired = false;
+    }
+    if (g_eventLog.dropInstantFired && !g_eventLog.dropFirstTick
+        && (now - g_eventLog.dropInstantTick) >= kDropWindowQuietMs)
+    {
+        g_eventLog.dropInstantFired = false;
+    }
+    if (g_eventLog.theftInstantFired && !g_eventLog.theftFirstTick
+        && (now - g_eventLog.theftInstantTick) >= kTheftWindowQuietMs)
+    {
+        g_eventLog.theftInstantFired = false;
+    }
+    if (g_eventLog.sellInstantFired && !g_eventLog.sellFirstTick
+        && (now - g_eventLog.sellInstantTick) >= kTradeWindowQuietMs)
+    {
+        g_eventLog.sellInstantFired = false;
+    }
+    if (g_eventLog.shootInstantFired && !g_eventLog.shootFirstTick
+        && (now - g_eventLog.shootInstantTick) >= kShootWindowQuietMs)
+    {
+        g_eventLog.shootInstantFired = false;
+    }
+
     if (priming)
     {
         g_eventLog.primed = true;
@@ -18937,6 +20671,21 @@ void UpdateGameEventLog()
         && (now - g_eventLog.shootLastTick) >= kShootWindowQuietMs)
     {
         EmitShootingEvent();
+    }
+    // Theft window: emit once the spree is quiet AND any container/pickpocket
+    // session is closed (so the source name rides the summary).
+    if (g_eventLog.theftFirstTick
+        && g_eventLog.theftLastTick
+        && !g_eventLog.theftSourceRefId
+        && (now - g_eventLog.theftLastTick) >= kTheftWindowQuietMs)
+    {
+        EmitTheftWindowEvent();
+    }
+    if (g_eventLog.sellFirstTick
+        && g_eventLog.sellLastTick
+        && (now - g_eventLog.sellLastTick) >= kTradeWindowQuietMs)
+    {
+        EmitTradeWindowEvent();
     }
     FlushGameEvents(false);
 }
@@ -19013,6 +20762,7 @@ void OnMainGameLoop()
     UpdateVoiceBootstrapStatus();
     LoadDebugConfigIfNeeded(false);
     LoadHotkeysConfigIfNeeded(false);
+    LoadTriggersConfigIfNeeded(false);
     PollNativeActionCommands();
     PollCompanionCommands();
     PollWorldQueries();
@@ -19020,6 +20770,7 @@ void OnMainGameLoop()
     UpdateCompanionFaceDesignSession();
     UpdateCompanionHotkey();
     UpdatePersonaCapture();
+    UpdateDiagProbe();
     UpdateGameEventLog();
     // --- perf instrumentation (temporary): time the lip-sync + streaming phases to
     // locate the in-game speech lag, logged via "frame_perf_slow" trace events. ---
@@ -19121,6 +20872,10 @@ void OnMainGameLoop()
     // performance's guitar idle is maintained every frame.
     ProcessSongDeliveries();
     UpdateActiveSong();
+
+    // Witness triggers (task/triggers): consume a queued NPC reaction, but only
+    // while no reply is in flight/playing (the poller gates itself).
+    ProcessReactionDeliveries();
 
     if (g_state.ignoreHotkeysUntilTick && GetTickCount() < g_state.ignoreHotkeysUntilTick)
     {
@@ -22992,6 +24747,7 @@ void HandleNvseMessage(NVSEMessagingInterface::Message* msg)
         CompanionsOnDeferredInit();
         RegisterGameEventHandlers();
         RegisterCombatEventHandlers();
+        InstallWeaponFireHook();
         LogLine("FNV bridge native plugin initialized.");
         break;
 
