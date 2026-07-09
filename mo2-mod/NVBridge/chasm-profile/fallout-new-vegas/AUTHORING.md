@@ -75,7 +75,7 @@ Goodsprings). You do **not** need generic location triggers like `town` or `here
 surface local lore - it is contextually present already. Reserve lorebook keys for
 things the scenario does *not* already supply.
 
-## Card format & RP style (SillyTavern best practices, adapted for chasm)
+## Card format & RP style (character-card best practices, adapted for chasm)
 
 We write cards in a **PList + Ali:Chat hybrid**, the community best practice for
 smaller local models (most reliable + token-efficient). Two rules above still bind
@@ -99,7 +99,7 @@ smaller local models (most reliable + token-efficient). Two rules above still bi
   `<START>` then `{{user}}:` / `{{char}}:` lines. Demonstrate voice, diction, and
   what they know through how they talk. Vary your verbs; never narrate what the
   *user* does.
-- **Two chasm-specific divergences from generic SillyTavern RP advice:**
+- **Two chasm-specific divergences from generic character-card RP advice:**
   1. **No `*asterisk actions*`.** These NPCs are TTS-voiced and told not to narrate
      actions - example dialogue is pure spoken lines, no stage directions, no
      quotation marks.
@@ -143,7 +143,7 @@ dead weight:
 ## Card mechanics (so edits stay valid)
 
 - Cards are PNGs with the character JSON stored (base64) in **two** tEXt chunks,
-  keyword `chara` (SillyTavern V2) and `ccv3` (V3). **Keep both chunks in sync.**
+  keyword `chara` (card spec V2) and `ccv3` (V3). **Keep both chunks in sync.**
 - Each card mirrors its fields at the **top level** and inside a nested `data`
   object. When you edit `description` / `personality` / `scenario` / `first_mes` /
   `mes_example`, update **both** copies.

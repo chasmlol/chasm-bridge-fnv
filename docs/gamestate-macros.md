@@ -5,7 +5,7 @@ chasm as `metadata.macros` — a flat **string → string** map of **full displa
 values** (`Goodsprings`, never a form id). chasm records the table on the
 persisted turn (`message.extra.chasm.macros`), shows the latest snapshot on the
 **Gamestate** page (left sidebar), and resolves `{{key}}` placeholders against
-it — SillyTavern-style plain substitution.
+it — plain string substitution.
 
 The **mod is the source of truth**: whatever keys it sends that turn are
 exactly the macros available that turn. This file is the vocabulary contract

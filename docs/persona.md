@@ -8,10 +8,10 @@ records (sex, race, hair style/color/length, eye color, facial hair, worn
 apparel). Nothing is rendered or screenshotted; the old offscreen portrait +
 vision-LLM path is fully retired (it depended on the engine's lazily built
 3rd-person head and produced garbage faces in first-person sessions). chasm
-turns the capture into a SillyTavern-style **user persona**: the main text LLM
+turns the capture into a **user persona**: the main text LLM
 writes a two-paragraph third-person description — looks from the appearance
 facts, manner from the attribute/skill magnitudes — which is injected into
-every NPC prompt at SillyTavern's story-string persona slot and shown on the
+every NPC prompt at the persona slot in the prompt story-string and shown on the
 chasm UI's **Persona** page.
 
 This file is the **frozen contract** between the plugin
@@ -153,7 +153,7 @@ key. All are ignored if present in an old cfg.)
   **Persona** page (below Gamestate): description, provenance, the
   character-data snapshot, the generation prompt, manual Regenerate.
 - Prompt assembly injects `Player persona:\n<description>` directly after the
-  character card's scenario slot (SillyTavern's default persona position);
+  character card's scenario slot (the conventional persona position);
   nothing is injected before the first generation.
 
 ## Verifying in-game

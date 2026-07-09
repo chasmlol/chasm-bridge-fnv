@@ -36,11 +36,11 @@ imported bundle loads **as-is** with no transformation:
 ```
 fallout-new-vegas/
   profile.json                                  # manifest (see below)
-  characters/                                   # SillyTavern PNG character cards (V2/V3)
+  characters/                                   # character-card PNGs (V2/V3)
     Easy Pete.png
     Doc Mitchell.png
     … (one .png per NPC; Todd = admin/director card)
-  worlds/                                        # lorebooks (SillyTavern "World Info" JSON)
+  worlds/                                        # lorebooks (World Info JSON)
     Fallout New Vegas.json
   headless/
     action-books/                                # NPC/GM action allowlists
@@ -50,7 +50,7 @@ fallout-new-vegas/
     action-catalogs/                             # generated spawnable-record catalogs
       fallout-new-vegas.entities.json
       fallout-new-vegas.items.json
-  groups/                                        # optional: SillyTavern group definition
+  groups/                                        # optional: multi-NPC group definition
     fnv-goodsprings.json
 ```
 

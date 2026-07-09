@@ -2,11 +2,11 @@
 
 The in-game bridge that connects **Fallout: New Vegas** NPCs to the **chasm** AI backend — live AI dialogue, voice, and actions, in your own playthrough.
 
-Walk up to an NPC, hold a key, and **talk to them with your own voice**. Chasm transcribes what you said, decides who you're addressing, generates an in-character reply with a local LLM, speaks it back in that character's **own cloned voice**, and — when the moment calls for it — has the NPC **act in the world** (follow you, draw a weapon, start combat, hand something over, and more). All of it runs locally on your machine.
+Walk up to an NPC, hold a key, and **talk to them with your own voice**. Chasm transcribes what you said, decides who you're addressing, generates an in-character reply with a local LLM, speaks it back in that character's **own cloned voice**, and — when the moment calls for it — has the NPC **act in the world**: follow you, travel across town to meet you, loot a body and hand you the spoils, draw on someone, start (or stop) a fight, play a song, and more. Over a playthrough the characters remember what they personally witnessed, form opinions about you, and even start developing habits of their own. All of it runs locally on your machine.
 
 ```
-Fallout: New Vegas  ──►  Chasm Bridge FNV  ──►  chasm  ──►  LLM · TTS · STT · actions
-   (xNVSE plugin)        (this repo)          (backend)        (local models)
+Fallout: New Vegas  ──►  Chasm Bridge FNV  ──►  chasm  ──►  LLM · TTS · STT · music · actions
+   (xNVSE plugin)        (this repo)          (backend)          (local models, offline)
 ```
 
 This repository is the **game side** of that loop: a native xNVSE plugin plus a Mod Organizer 2 mod folder. It is deliberately thin — New Vegas captures game state (who's nearby, who you're looking at, distance, microphone audio, playback position) and exchanges it with chasm over a local bridge channel. **Chasm owns the brains** — characters, prompts, LLM/TTS/STT settings, voices, lore, quests, and the catalogue of actions an NPC may take.
@@ -96,7 +96,10 @@ The mod also ships the **Fallout: New Vegas chasm profile** (characters, loreboo
 
 - **Voice in, voice out.** Hold a key while looking at a nearby NPC to speak to them. Your mic audio is transcribed by chasm; the reply is synthesised in the character's cloned voice and played back in-game as **3D positional audio** with range falloff, subtitles, and lip/speech animation.
 - **Picks the right speaker.** The bridge reports every nearby, audible NPC (within range) to chasm's Live Chat, and chasm chooses who responds. A separate push-to-talk key routes to an admin/director character ("Todd") for out-of-world / debug requests.
-- **Agentic actions.** Alongside the spoken line, chasm can emit structured actions from its **Action Book**. The bridge resolves the trusted binding for each action and runs it in-game via xNVSE, so new actions can be added by editing an Action Book entry — no new C++ handler per action.
+- **Agentic actions.** Alongside the spoken line, chasm can emit structured actions from its **Action Book**. The bridge resolves the trusted binding for each action and runs it in-game via xNVSE, so new actions can be added by editing an Action Book entry — no new C++ handler per action. What NPCs can actually do today: **follow / stop**, **travel** to a named place, **loot / take / give** real items, **attack** the player or another NPC and **stop fighting**, **gestures** (wave, dance, …), and **play a generated song**.
+- **Travel, schedules & companions.** NPCs walk to real map markers and arrive on time (offscreen legs simulated), can be told to do something *at* a game time or *when* a condition is met, and chasm-authored characters can be spawned as named, face-designed, voiced **companions** (ships `NVCompanions.esp`; enable it once in MO2).
+- **Events, memory & reactions.** The plugin streams game events (shots, deaths, thefts, trades, location changes, …) to chasm with the list of NPCs in range to witness them. Those NPCs build a **personal memory** of what they saw, can **react unprompted** to it, and — after saves — privately reflect and form their own automatic habits. All of it **rolls back with your saves**.
+- **Player persona from real game data.** Every save, the plugin sends chasm a pure data snapshot (stats, appearance, gear); chasm turns it into a natural-language description of *you* that every NPC is aware of. No screenshots.
 - **Low latency.** TTS is streamed sentence-by-sentence so an NPC can start talking before the whole line is synthesised; streamed audio/commands are staged outside MO2's virtual filesystem for native-speed reads.
 
 ## How it relates to chasm
@@ -124,9 +127,14 @@ By default the plugin exchanges turns with chasm through a **local bridge folder
 
 ## Repository layout
 
-- `mo2-mod/NVBridge/` — the Mod Organizer 2 mod folder (the packaged plugin DLL, the NVSE bootstrap scripts, and the bundled `chasm-profile/` FNV game content).
+- `mo2-mod/NVBridge/` — the Mod Organizer 2 mod folder (the packaged plugin DLL, the NVSE bootstrap scripts, `NVCompanions.esp`, and the bundled `chasm-profile/` FNV game content).
 - `native/nvse-plugin/` — C++ source and the Visual Studio project for the native xNVSE bridge DLL. See `native/README.md` for build instructions (the xNVSE SDK is expected at `native/xnvse-sdk/` and is kept local / git-ignored).
-- `docs/PROFILES.md` — the portable chasm-profile format and how chasm imports it.
+- `docs/` — design & contract docs:
+  - `PROFILES.md` — the portable chasm-profile bundle format and how chasm imports it.
+  - `companions-architecture.md` — how chasm characters become spawned, face-designed, voiced followers.
+  - `scheduler-architecture.md` — the NPC scheduler + travel/movement engine.
+  - `persona.md` — the save-driven player-persona capture contract.
+  - `gamestate-macros.md` — the live `{{macro}}` vocabulary and `npc_state` dynamic-scenario flags.
 - `config/native_debug.example.cfg` — native DirectSound/runtime debug config template.
 
 ## Building the plugin
