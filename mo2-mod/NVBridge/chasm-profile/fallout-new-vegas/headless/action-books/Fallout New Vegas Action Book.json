@@ -6098,7 +6098,7 @@
     "destination": "string: the place to travel to (a named location on the map)",
     "when": "string (optional): a natural in-game time like '1am', 'tonight', 'in an hour'"
    },
-   "vectorizableText": "npc travels goes walks heads runs to a place location building person or back to the player returns come back",
+   "vectorizableText": "npc travels goes walks heads runs to a place location building person or back to the player returns come back, comes to MEET the player or someone, meets them somewhere, keeps a MEETING or rendezvous, shows up at a place, arrives at a location, comes to meet at a spot, sets up or schedules a MEETING to be somewhere later at a set time",
    "verbs": [
     "travel",
     "travel to",
@@ -6109,7 +6109,13 @@
     "move to",
     "come back",
     "return",
-    "go back"
+    "go back",
+    "meet",
+    "meet me",
+    "come meet",
+    "come and meet",
+    "meet at",
+    "show up"
    ]
   },
   "632": {

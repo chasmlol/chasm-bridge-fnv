@@ -24271,6 +24271,7 @@ bool TriggerNpcLoot(const ResponsePayload& response)
         session.walking = true; // engine-driven; we only watch
         session.targetStartTick = GetTickCount();
         session.progressTick = GetTickCount(); // fast-fail clock starts now
+        session.lastPackageTick = GetTickCount(); // Find package re-assert clock
     }
     LogLine("loot: '%s' -> %s '%s'%s.", session.npcName.c_str(), session.target.kind.c_str(),
         session.target.name.c_str(), session.isTake ? " (take)" : "");
@@ -24453,6 +24454,31 @@ void UpdateLootSessions()
             // gun, even though the grab then landed. Once in reach, only the hard
             // cap backstops a pickup that genuinely never completes.
             const bool inReach = item->distSq <= kLootReachUnits * kLootReachUnits;
+            // Re-assert the engine Find package while he still hasn't reached the
+            // item. AddScriptPackage does not reliably re-evaluate when it lands
+            // over a busy actor - mid-dialogue, or a conversation hold still
+            // pinning him (restrained / no-move from the turn he just spoke) - so
+            // the one-shot add at dispatch can leave him standing frozen until a
+            // cell reload forces a package re-eval (the "he only picked it up
+            // after I left and came back" report). The container/give walk already
+            // re-asserts its Travel package every kLootPackageReassertMs for the
+            // same reason (LootWalkTo); the ground-item pickup was the one path
+            // that added once and never re-kicked. Drop any hold still on him and
+            // re-issue the Find package, then reset the stall clock so the re-kick
+            // gets a full no-progress window before we call it stuck.
+            if (!inReach && now - session.lastPackageTick > kLootPackageReassertMs)
+            {
+                if (g_state.conversationHold.active
+                    && g_state.conversationHold.speaker.refId == session.npcRefId)
+                {
+                    ReleaseConversationHold("loot_find_reassert");
+                }
+                StartFindPickup(npcRef, item->ref);
+                session.lastPackageTick = now;
+                session.progressTick = now;
+                LogLine("loot: re-asserted Find pickup for '%s' -> '%s' (not in reach yet).",
+                    session.npcName.c_str(), session.target.name.c_str());
+            }
             if ((!inReach && now - session.progressTick > kLootNoProgressMs)
                 || now - session.targetStartTick > kLootTargetTimeoutMs)
             {
